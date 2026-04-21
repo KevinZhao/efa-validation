@@ -1,0 +1,10 @@
+{
+  "commands": [
+    "echo === revert to auto ===",
+    "sed -i 's/^mode = \"legacy\"/mode = \"auto\"/' /etc/nvidia-container-runtime/config.toml",
+    "grep -E '^mode' /etc/nvidia-container-runtime/config.toml",
+    "systemctl restart containerd && echo restarted",
+    "sleep 5",
+    "systemctl is-active containerd"
+  ]
+}

@@ -1,0 +1,5 @@
+{"commands":[
+"sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods -n efa-validation -o wide 2>&1 | grep -E \"prefetch|NAME\"'",
+"echo ---",
+"sudo -iu ec2-user bash -lc 'kubectl --context ohio describe pod model-prefetch-1-jnfnm -n efa-validation 2>&1 | tail -25'"
+]}

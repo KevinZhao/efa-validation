@@ -1,0 +1,11 @@
+{"commands":[
+  "# Same template as bastion-push-env-ohio.json (second region).",
+  "sudo -iu ec2-user bash -lc 'echo <BASE64_ENV_BLOB> | base64 -d > ~/workspace/cluster-deployment/.env.oregon'",
+  "sudo -iu ec2-user bash -lc 'cp -f ~/workspace/cluster-deployment/.env.oregon ~/workspace/cluster-deployment/.env && grep -E \"^(CLUSTER_NAME|AWS_REGION|VPC_ID)\" ~/workspace/cluster-deployment/.env'",
+  "sudo -iu ec2-user bash -lc 'aws eks update-kubeconfig --name <EKS_CLUSTER_NAME> --region <AWS_REGION> --alias oregon 2>&1'",
+  "sudo -iu ec2-user bash -lc 'kubectl --context oregon get nodes -o wide 2>&1'",
+  "echo --- ns ---",
+  "sudo -iu ec2-user bash -lc 'kubectl --context oregon get ns 2>&1'",
+  "echo --- nodegroups ---",
+  "sudo -iu ec2-user bash -lc 'aws eks list-nodegroups --cluster-name <EKS_CLUSTER_NAME> --region <AWS_REGION>'"
+]}

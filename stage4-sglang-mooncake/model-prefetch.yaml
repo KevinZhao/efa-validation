@@ -1,0 +1,90 @@
+# Pre-pull model to hostPath on *every* p5 node, so both baseline and
+# disaggregation Pods can mount locally without a shared filesystem.
+# We use a DaemonSet-style Job with `completions=N parallelism=N` + podAntiAffinity
+# so each p5 node gets one prefetch pod. In a real deployment replace with FSx.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: model-prefetch-script
+  namespace: efa-validation
+data:
+  prefetch.sh: |
+    #!/usr/bin/env bash
+    set -eux
+    MODEL_ID="${MODEL_ID:-HuggingFaceTB/SmolLM2-1.7B-Instruct}"
+    DEST="${DEST:-/models/current}"
+    # Clean any stale shards from previous models (e.g. 7B 4-shard scheme).
+    # We detect by presence of config.json that doesn't match this model.
+    if [ -f "$DEST/config.json" ]; then
+      # If the on-disk config mentions a different model, wipe.
+      CUR=$(grep -E '"_name_or_path"|"model_type"' "$DEST/config.json" || true)
+      echo "existing config snippet: $CUR"
+    fi
+    mkdir -p "$DEST"
+    # Wipe any stale shards + index from previous model runs.
+    find "$DEST" -maxdepth 1 -name '*.safetensors' -delete || true
+    find "$DEST" -maxdepth 1 -name '*.safetensors.index.json' -delete || true
+    rm -rf "$DEST/.cache" || true
+    rm -rf /models/.hf-cache || true
+    export HF_HUB_ENABLE_HF_TRANSFER=1
+    export HF_HOME=/models/.hf-cache
+    huggingface-cli download "$MODEL_ID" --local-dir "$DEST" --local-dir-use-symlinks False --max-workers 8
+    ls -la "$DEST" | head -20
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: model-prefetch
+  namespace: efa-validation
+spec:
+  backoffLimit: 0
+  completions: 2
+  parallelism: 2
+  completionMode: Indexed
+  template:
+    metadata:
+      labels:
+        app: efa-validation-model-prefetch
+    spec:
+      restartPolicy: Never
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      nodeSelector:
+        node.kubernetes.io/instance-type: p5.48xlarge
+      # Use topologySpreadConstraints (hard maxSkew=1) so the scheduler
+      # guarantees one pod per node, even when pods terminate quickly and
+      # would otherwise re-land on the same node.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: efa-validation-model-prefetch
+      containers:
+        - name: prefetch
+          image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/sglang-mooncake:v1
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MODEL_ID
+              value: "HuggingFaceTB/SmolLM2-1.7B-Instruct"
+            - name: DEST
+              value: "/models/current"
+          command: ["/bin/bash", "/scripts/prefetch.sh"]
+          volumeMounts:
+            - name: models
+              mountPath: /models
+            - name: scripts
+              mountPath: /scripts
+      volumes:
+        - name: models
+          hostPath:
+            path: /var/lib/efa-models
+            type: DirectoryOrCreate
+        - name: scripts
+          configMap:
+            name: model-prefetch-script
+            defaultMode: 0755

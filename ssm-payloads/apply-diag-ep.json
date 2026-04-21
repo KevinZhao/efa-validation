@@ -1,0 +1,11 @@
+{
+  "commands": [
+    "sudo -iu ec2-user bash -lc 'aws s3 cp s3://efa-validation-<AWS_ACCOUNT_ID>/manifests/diag-ep-import.yaml /tmp/diag-ep-import.yaml --region us-east-2'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete pod uccl-ep-diag -n efa-validation --ignore-not-found --grace-period=0 --force 2>&1'",
+    "sleep 5",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio apply -f /tmp/diag-ep-import.yaml 2>&1'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio wait pod/uccl-ep-diag -n efa-validation --for=condition=Ready --timeout=180s 2>&1 || true'",
+    "echo === diag pod created, rebuild takes ~5 min; follow with fetch-diag-logs ===",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pod -n efa-validation uccl-ep-diag 2>&1'"
+  ]
+}

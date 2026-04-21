@@ -1,0 +1,223 @@
+# =============================================================================
+# Stage 4 (b) — SGLang PD 分离 · Prefill 实例 · TP=8 单节点
+# 1 Leader + 0 Worker（LWS size=1）；独占 1 × p5.48xlarge。
+# KV 发布端：Mooncake EfaTransport。Decode 实例从此处拉 KV。
+#
+# 参考：https://github.com/kubernetes-sigs/lws/tree/main/docs/examples
+# 部署顺序：先部署 Prefill（本文件），再部署 Decode（lws-decode.yaml）。
+# =============================================================================
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: sglang-prefill
+  namespace: efa-validation
+  labels:
+    app: sglang
+    role: prefill
+    stage: stage4-e2e
+spec:
+  replicas: 1
+  leaderWorkerTemplate:
+    size: 1                          # 单节点 TP=8；不需要跨机聚合
+    restartPolicy: RecreateGroupOnPodRestart
+    leaderTemplate:
+      metadata:
+        labels:
+          app: sglang
+          role: prefill
+      spec:
+        serviceAccountName: efa-runner
+        restartPolicy: Never
+        terminationGracePeriodSeconds: 60
+        hostIPC: true
+        tolerations:
+          - key: nvidia.com/gpu
+            operator: Equal
+            value: "true"
+            effect: NoSchedule
+        # 避免 Prefill / Decode 落到同一节点（PD 分离的基本要求）
+        affinity:
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values: ["sglang"]
+                topologyKey: kubernetes.io/hostname
+        containers:
+          - name: prefill
+            # TODO: 阶段开始前确认 tag 已推到 ECR
+            image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/sglang-mooncake:v1
+            imagePullPolicy: IfNotPresent
+            securityContext:
+              capabilities:
+                add: [IPC_LOCK]
+            ports:
+              - name: http
+                containerPort: 30000
+              - name: mooncake
+                containerPort: 18000       # Mooncake transfer engine
+              - name: bootstrap
+                containerPort: 8998        # SGLang disaggregation bootstrap
+            env:
+              - name: MODEL
+                value: "<MODEL_ID>"
+              - name: ROLE
+                value: "prefill"
+              - name: TP_SIZE
+                value: "8"
+              # ---- EFA + NCCL + OMPI ----
+              - name: FI_PROVIDER
+                value: "efa"
+              - name: FI_EFA_USE_DEVICE_RDMA
+                value: "1"
+              - name: FI_EFA_FORK_SAFE
+                value: "1"
+              - name: NCCL_NET_PLUGIN
+                value: "/opt/aws-ofi-nccl/lib/libnccl-net.so"
+              - name: NCCL_DEBUG
+                value: "WARN"
+              - name: NCCL_PROTO
+                value: "simple"
+              - name: NCCL_ALGO
+                value: "ring"
+              - name: NCCL_IB_DISABLE
+                value: "0"
+              - name: NCCL_SOCKET_IFNAME
+                value: "eth0"
+              - name: OMPI_ALLOW_RUN_AS_ROOT
+                value: "1"
+              - name: OMPI_ALLOW_RUN_AS_ROOT_CONFIRM
+                value: "1"
+              - name: LD_LIBRARY_PATH
+                value: "/opt/mooncake/install/lib:/opt/amazon/efa/lib:/opt/amazon/openmpi/lib:/opt/aws-ofi-nccl/lib:/usr/local/cuda/lib64:/usr/local/lib:/usr/lib"
+              - name: PATH
+                value: "/opt/amazon/efa/bin:/opt/amazon/openmpi/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin"
+              # ---- Mooncake EfaTransport ----
+              - name: MOONCAKE_TRANSPORT
+                value: "efa"
+              - name: MOONCAKE_DEVICE_NAME
+                value: "efa"
+              - name: MOONCAKE_LOCAL_HOSTNAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: status.podIP
+              - name: MOONCAKE_MASTER_SERVER
+                # Decode 也能发现 Prefill 的 mooncake 端点
+                value: "sglang-prefill-svc.efa-validation.svc.cluster.local:18000"
+              # ---- SGLang disaggregation handshake ----
+              - name: DISAGG_BOOTSTRAP_HOST
+                valueFrom:
+                  fieldRef:
+                    fieldPath: status.podIP
+              - name: DISAGG_BOOTSTRAP_PORT
+                value: "8998"
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: HF_HUB_ENABLE_HF_TRANSFER
+                value: "1"
+            command:
+              - /bin/bash
+              - -lc
+              - |
+                set -euxo pipefail
+                nvidia-smi
+                fi_info -p efa || true
+                echo "MODEL=$MODEL  ROLE=$ROLE  TP=$TP_SIZE"
+
+                # TODO: 若预热 FSx PVC，此处改为 --model-path /models/generic-model
+                # TODO: SGLang disaggregation CLI 以当前 main 为准，下列参数名需对齐：
+                #   --disaggregation-mode prefill
+                #   --disaggregation-transfer-backend mooncake
+                #   --disaggregation-bootstrap-port
+                python3 -m sglang.launch_server \
+                  --model-path "$MODEL" \
+                  --trust-remote-code \
+                  --host 0.0.0.0 \
+                  --port 30000 \
+                  --tp-size "$TP_SIZE" \
+                  --disaggregation-mode prefill \
+                  --disaggregation-transfer-backend mooncake \
+                  --disaggregation-bootstrap-port "$DISAGG_BOOTSTRAP_PORT" \
+                  --mem-fraction-static 0.85 \
+                  --enable-metrics \
+                  --log-level info \
+                  2>&1 | tee /results/prefill.log
+            resources:
+              limits:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 1Ti
+              requests:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 1Ti
+            readinessProbe:
+              httpGet:
+                path: /health
+                port: http
+              initialDelaySeconds: 180
+              periodSeconds: 10
+              failureThreshold: 60
+            livenessProbe:
+              httpGet:
+                path: /health
+                port: http
+              initialDelaySeconds: 600
+              periodSeconds: 30
+              failureThreshold: 5
+            volumeMounts:
+              - name: shm
+                mountPath: /dev/shm
+              - name: hugepage
+                mountPath: /hugepages-2Mi
+              - name: models
+                mountPath: /models
+              - name: results
+                mountPath: /results
+        volumes:
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 32Gi
+          - name: hugepage
+            emptyDir:
+              medium: HugePages-2Mi
+          # TODO: 阶段开始前换 FSx PVC（ReadWriteMany），预热 <MODEL_ID>
+          - name: models
+            emptyDir:
+              sizeLimit: 200Gi
+          # TODO: 阶段开始前换 PVC 以便跨 Pod 收集日志 + 指标
+          - name: results
+            emptyDir:
+              sizeLimit: 50Gi
+---
+# Prefill 暴露：Mooncake 端点供 Decode 拉 KV；HTTP 仅作健康检查/调试
+apiVersion: v1
+kind: Service
+metadata:
+  name: sglang-prefill-svc
+  namespace: efa-validation
+  labels:
+    app: sglang
+    role: prefill
+spec:
+  type: ClusterIP
+  clusterIP: None        # headless，LWS 内部用 DNS 发现
+  selector:
+    app: sglang
+    role: prefill
+    leaderworkerset.sigs.k8s.io/worker-index: "0"
+  ports:
+    - name: http
+      port: 30000
+      targetPort: http
+    - name: mooncake
+      port: 18000
+      targetPort: mooncake
+    - name: bootstrap
+      port: 8998
+      targetPort: bootstrap

@@ -1,0 +1,1 @@
+{"commands":["sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods -n efa-validation | grep clean'","echo ---","sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n efa-validation -l job-name=clean-model-dir --tail=40 2>&1'"]}

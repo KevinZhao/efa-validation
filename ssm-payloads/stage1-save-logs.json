@@ -1,0 +1,13 @@
+{
+  "commands": [
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n efa-validation nccl-tests-efa-launcher-8qz8z > /tmp/stage1-full.log 2>&1'",
+    "sudo -iu ec2-user bash -lc 'wc -l /tmp/stage1-full.log'",
+    "sudo -iu ec2-user bash -lc 'aws s3 cp /tmp/stage1-full.log s3://efa-validation-<AWS_ACCOUNT_ID>/logs/stage1-full.log'",
+    "echo === all_reduce avg bus bandwidth ===",
+    "sudo -iu ec2-user bash -lc 'grep -E \"Avg bus bandwidth\" /tmp/stage1-full.log 2>&1'",
+    "echo === all_reduce table tail ===",
+    "sudo -iu ec2-user bash -lc 'grep -A 2 \"Out of bounds\" /tmp/stage1-full.log | head -20'",
+    "echo === last 300 lines ===",
+    "sudo -iu ec2-user bash -lc 'tail -150 /tmp/stage1-full.log'"
+  ]
+}

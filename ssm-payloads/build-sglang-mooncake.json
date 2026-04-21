@@ -1,0 +1,16 @@
+{
+  "commands": [
+    "set -eux",
+    "cd /root/build",
+    "STAMP=$(date -u +%Y%m%dT%H%M%SZ)",
+    "DIR=/root/build/sglang-mooncake-${STAMP}",
+    "mkdir -p $DIR && cd $DIR",
+    "aws s3 cp s3://efa-validation-<AWS_ACCOUNT_ID>/dockerfiles/Dockerfile.sglang-mooncake Dockerfile --region us-east-2",
+    "aws s3 cp s3://efa-validation-<AWS_ACCOUNT_ID>/dockerfiles/sglang-launcher.sh sglang-launcher.sh --region us-east-2",
+    "aws ecr get-login-password --region us-east-2 | docker login --username AWS --password-stdin <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com",
+    "nohup bash -c 'docker build --progress=plain --build-arg BASE_IMAGE=<AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/mooncake-nixl:v1 -t <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/sglang-mooncake:v1 -f Dockerfile . 2>&1 | tee build.log; docker tag <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/sglang-mooncake:v1 <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/sglang-mooncake:latest 2>&1; docker push <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/sglang-mooncake:v1 2>&1 | tee push.log; docker push <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/sglang-mooncake:latest 2>&1 | tee -a push.log' > orch.log 2>&1 &",
+    "echo started=$DIR",
+    "sleep 5",
+    "ps -ef | grep 'docker build' | grep -v grep | head -3"
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "commands": [
+    "sudo -iu ec2-user bash -lc 'aws s3 cp s3://efa-validation-<AWS_ACCOUNT_ID>/manifests/stage4/disagg-1p1d.yaml /tmp/disagg-1p1d.yaml --region us-east-2'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete deploy sglang-baseline -n efa-validation --ignore-not-found 2>&1 || true'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete svc sglang-baseline -n efa-validation --ignore-not-found 2>&1 || true'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete -f /tmp/disagg-1p1d.yaml --ignore-not-found 2>&1 || true'",
+    "sleep 10",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio apply -f /tmp/disagg-1p1d.yaml 2>&1'",
+    "sleep 15",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods,svc -n efa-validation -o wide 2>&1 | grep -E sglang'"
+  ]
+}

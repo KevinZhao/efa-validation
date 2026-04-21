@@ -1,0 +1,77 @@
+# -----------------------------------------------------------------------------
+# Stage-2 image: UCCL-EP + DeepEP built against the common base.
+#
+# Layout:
+#   /opt/uccl       UCCL repo (root); UCCL-EP source lives at /opt/uccl/ep
+#   /opt/deepep     DeepEP repo; DeepEP bench lives at /opt/deepep/tests
+#
+# Base provides: CUDA 12.6 devel + cuDNN, EFA installer 1.47, libfabric,
+# OpenMPI (/opt/amazon/openmpi), NCCL v2.23.4, aws-ofi-nccl v1.19.0.
+# -----------------------------------------------------------------------------
+ARG BASE_IMAGE=<AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/base-cuda-efa:v1
+FROM ${BASE_IMAGE}
+
+# UCCL main ships ep/ subpackage; pin a recent commit once validated.
+ARG UCCL_REPO=https://github.com/uccl-project/uccl.git
+ARG UCCL_REF=main
+
+# DeepEP has a v1.2.1 release tag; use it for reproducibility.
+ARG DEEPEP_REPO=https://github.com/deepseek-ai/DeepEP.git
+ARG DEEPEP_REF=v1.2.1
+
+# PyTorch CU124 wheel (forward compatible with CUDA 12.6 runtime, H100 sm_90).
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu124
+ARG TORCH_VERSION=2.5.1
+ARG TORCHVISION_VERSION=0.20.1
+
+ARG TORCH_CUDA_ARCH_LIST="9.0"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
+    MAX_JOBS=16
+
+# ---- python + build tools ----
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3-setuptools python3-wheel python3-venv \
+      cmake ninja-build \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3 /usr/local/bin/python
+
+RUN python -m pip install --upgrade pip setuptools wheel
+
+# ---- PyTorch ----
+RUN pip install \
+      --index-url ${TORCH_INDEX_URL} \
+      torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION}
+
+RUN pip install numpy pybind11 ninja packaging nanobind
+
+# ---- DeepEP (NCCL-EP baseline reference) ----
+# DeepEP has its own build script. NVSHMEM is optional for the internode tests;
+# we build without it initially (low_latency path still works).
+RUN git clone --depth 1 -b ${DEEPEP_REF} ${DEEPEP_REPO} /opt/deepep && \
+    cd /opt/deepep && \
+    NCCL_HOME=/usr/local/cuda \
+    CUDA_HOME=/usr/local/cuda \
+    pip install -v --no-build-isolation . || \
+    (echo "DeepEP install failed; keeping source at /opt/deepep for manual build" && true)
+
+# ---- UCCL-EP ----
+# Source: github.com/uccl-project/uccl, subpackage 'ep'.
+# Exposes Python package `uccl.ep` after install.
+RUN git clone --recursive --depth 1 -b ${UCCL_REF} ${UCCL_REPO} /opt/uccl && \
+    cd /opt/uccl/ep && \
+    NCCL_HOME=/usr/local/cuda \
+    MPI_HOME=/opt/amazon/openmpi \
+    CUDA_HOME=/usr/local/cuda \
+    python setup.py install
+
+# ---- sanity imports ----
+RUN python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)" && \
+    (python -c "import uccl.ep; print('uccl.ep ok')" || echo "WARN: uccl.ep import failed (non-fatal at build time)") && \
+    (python -c "import deep_ep; print('deep_ep ok')" || echo "WARN: deep_ep import failed (non-fatal at build time)")
+
+WORKDIR /workspace
+CMD ["/bin/bash"]

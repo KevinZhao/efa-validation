@@ -1,0 +1,7 @@
+{
+  "commands": [
+    "systemctl restart kubelet && echo kubelet_restarted",
+    "sleep 10",
+    "systemctl is-active kubelet containerd"
+  ]
+}

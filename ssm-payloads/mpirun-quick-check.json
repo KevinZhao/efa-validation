@@ -1,0 +1,5 @@
+{
+  "commands": [
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio exec -n efa-validation nccl-tests-efa-launcher-jwht9 -- timeout 20 mpirun --allow-run-as-root --hostfile /tmp/hostfile -np 2 --mca plm_base_verbose 10 hostname 2>&1 | tail -40'"
+  ]
+}

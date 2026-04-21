@@ -1,0 +1,9 @@
+{
+  "commands": [
+    "tail -80 /root/build/uccl-ep-20260421T092134Z/build.log 2>&1",
+    "echo === grep BUILD_DONE ===",
+    "grep -c BUILD_DONE /root/build/uccl-ep-20260421T092134Z/build.log 2>/dev/null",
+    "echo === processes ===",
+    "ps -ef | grep -E 'docker build|docker push' | grep -v grep || echo no docker running"
+  ]
+}

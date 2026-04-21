@@ -1,0 +1,94 @@
+# Baseline: single-node SGLang TP=8 on one p5.48xlarge.
+# Gives us the comparison point for the 1P:1D deployment (target: 1P:1D ≤ 1.3x).
+apiVersion: v1
+kind: Service
+metadata:
+  name: sglang-baseline
+  namespace: efa-validation
+spec:
+  selector:
+    app: sglang-baseline
+  ports:
+    - name: http
+      port: 30000
+      targetPort: 30000
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sglang-baseline
+  namespace: efa-validation
+  labels:
+    app: sglang-baseline
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sglang-baseline
+  template:
+    metadata:
+      labels:
+        app: sglang-baseline
+    spec:
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      nodeSelector:
+        node.kubernetes.io/instance-type: p5.48xlarge
+      containers:
+        - name: server
+          image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/sglang-mooncake:v1
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: ROLE
+              value: "baseline"
+            - name: MODEL_PATH
+              value: "/models/current"
+            - name: TP
+              value: "8"
+            - name: PORT
+              value: "30000"
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              exec /usr/local/bin/sglang-launcher.sh
+          readinessProbe:
+            httpGet:
+              path: /get_model_info
+              port: 30000
+            initialDelaySeconds: 60
+            periodSeconds: 5
+            failureThreshold: 120
+          ports:
+            - containerPort: 30000
+          securityContext:
+            capabilities:
+              add: [IPC_LOCK]
+          resources:
+            limits:
+              nvidia.com/gpu: 8
+              vpc.amazonaws.com/efa: 32
+              hugepages-2Mi: 5120Mi
+              memory: 256Gi
+            requests:
+              nvidia.com/gpu: 8
+              vpc.amazonaws.com/efa: 32
+              hugepages-2Mi: 5120Mi
+              memory: 256Gi
+          volumeMounts:
+            - name: models
+              mountPath: /models
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: models
+          hostPath:
+            path: /var/lib/efa-models
+            type: Directory
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi

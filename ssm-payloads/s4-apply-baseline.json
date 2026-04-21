@@ -1,0 +1,12 @@
+{
+  "commands": [
+    "sudo -iu ec2-user bash -lc 'aws s3 cp s3://efa-validation-<AWS_ACCOUNT_ID>/manifests/stage4/baseline-tp8.yaml /tmp/baseline-tp8.yaml --region us-east-2'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete -f /tmp/baseline-tp8.yaml --ignore-not-found 2>&1 || true'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete pod mooncake-initiator -n efa-validation --ignore-not-found --grace-period=0 --force 2>&1 || true'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete pod mooncake-target -n efa-validation --ignore-not-found --grace-period=0 --force 2>&1 || true'",
+    "sleep 5",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio apply -f /tmp/baseline-tp8.yaml 2>&1'",
+    "sleep 10",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods -n efa-validation 2>&1'"
+  ]
+}

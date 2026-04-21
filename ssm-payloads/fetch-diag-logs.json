@@ -1,0 +1,5 @@
+{
+  "commands": [
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n efa-validation uccl-ep-diag 2>&1 | tail -120'"
+  ]
+}

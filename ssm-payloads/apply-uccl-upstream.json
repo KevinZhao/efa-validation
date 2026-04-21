@@ -1,0 +1,12 @@
+{
+  "commands": [
+    "sudo -iu ec2-user bash -lc 'aws s3 cp s3://efa-validation-<AWS_ACCOUNT_ID>/manifests/mpijob-uccl-upstream.yaml /tmp/mpijob-uccl-upstream.yaml --region us-east-2'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete mpijob uccl-ep-upstream -n efa-validation --ignore-not-found 2>&1'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete mpijob uccl-ep-correctness -n efa-validation --ignore-not-found 2>&1'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete cm uccl-ep-upstream-script -n efa-validation --ignore-not-found 2>&1'",
+    "sleep 3",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio apply -f /tmp/mpijob-uccl-upstream.yaml 2>&1'",
+    "sleep 5",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods -n efa-validation 2>&1'"
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "commands": [
+    "set -eux",
+    "aws ecr get-login-password --region us-east-2 | docker login --username AWS --password-stdin <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com",
+    "docker images | grep efa-validation/base-cuda-efa || true",
+    "docker push <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/base-cuda-efa:v1 2>&1 | tail -15",
+    "docker push <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/base-cuda-efa:latest 2>&1 | tail -5",
+    "echo BUILD_DONE"
+  ]
+}

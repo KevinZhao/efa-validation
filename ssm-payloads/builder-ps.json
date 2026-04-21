@@ -1,0 +1,6 @@
+{
+  "commands": [
+    "ps -ef | grep -E 'docker build|docker push' | grep -v grep || echo no docker",
+    "ls -la /root/build/ | tail -6"
+  ]
+}

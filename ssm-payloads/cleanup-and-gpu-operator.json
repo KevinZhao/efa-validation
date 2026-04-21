@@ -1,0 +1,18 @@
+{
+  "commands": [
+    "echo === delete existing nvidia-device-plugin DaemonSet ===",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio -n kube-system delete daemonset nvidia-device-plugin-daemonset --ignore-not-found=true'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio -n kube-system delete pod -l name=nvidia-device-plugin-ds --force --grace-period=0 --ignore-not-found=true 2>&1 | tail -5'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio -n efa-validation delete pod gpu-smoke gpu-smoke-cdi --force --grace-period=0 --ignore-not-found=true 2>&1 | tail -3'",
+    "sleep 5",
+    "echo === verify cleanup ===",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio -n kube-system get pods -l name=nvidia-device-plugin-ds 2>&1'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get nodes -l workload-type=gpu -o custom-columns=NAME:.metadata.name,GPU:.status.allocatable.nvidia\\\\.com/gpu'",
+    "echo === helm add nvidia repo ===",
+    "sudo -iu ec2-user bash -lc 'helm repo add nvidia https://helm.ngc.nvidia.com/nvidia 2>&1 | tail -3'",
+    "sudo -iu ec2-user bash -lc 'helm repo update 2>&1 | tail -5'",
+    "echo === install GPU Operator ===",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio create ns gpu-operator --dry-run=client -o yaml | kubectl --context ohio apply -f -'",
+    "sudo -iu ec2-user bash -lc 'helm --kube-context ohio upgrade --install --wait gpu-operator nvidia/gpu-operator -n gpu-operator --version v24.9.2 --set driver.enabled=false --set toolkit.enabled=false --set devicePlugin.config.create=true --set cdi.enabled=true --set cdi.default=true --timeout 10m 2>&1 | tail -20'"
+  ]
+}

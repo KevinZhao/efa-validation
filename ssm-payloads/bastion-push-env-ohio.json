@@ -1,0 +1,21 @@
+{"commands":[
+  "# Push an EKS cluster .env to the bastion, then configure kubeconfig.",
+  "# Template of the .env content:",
+  "#   CLUSTER_NAME=<EKS_CLUSTER_NAME>",
+  "#   AWS_REGION=<AWS_REGION>",
+  "#   VPC_ID=<VPC_ID>",
+  "#   PRIVATE_SUBNET_{A,B,C}=<SUBNET_ID>",
+  "#   PUBLIC_SUBNET_{A,B,C}=<SUBNET_ID>",
+  "#   AZ_{A,B,C}=<AWS_AZ>",
+  "#   SYSTEM_NODE_INSTANCE_TYPE=m7g.large",
+  "#   K8S_VERSION=1.35",
+  "# Replace <BASE64_ENV_BLOB> with: base64 -w0 .env.ohio",
+  "sudo -iu ec2-user bash -lc 'echo <BASE64_ENV_BLOB> | base64 -d > ~/workspace/cluster-deployment/.env.ohio'",
+  "sudo -iu ec2-user bash -lc 'cp -f ~/workspace/cluster-deployment/.env.ohio ~/workspace/cluster-deployment/.env && grep -E \"^(CLUSTER_NAME|AWS_REGION|VPC_ID)\" ~/workspace/cluster-deployment/.env'",
+  "sudo -iu ec2-user bash -lc 'aws eks update-kubeconfig --name <EKS_CLUSTER_NAME> --region <AWS_REGION> --alias ohio 2>&1'",
+  "sudo -iu ec2-user bash -lc 'kubectl --context ohio get nodes -o wide 2>&1'",
+  "echo --- ns ---",
+  "sudo -iu ec2-user bash -lc 'kubectl --context ohio get ns 2>&1'",
+  "echo --- nodegroups ---",
+  "sudo -iu ec2-user bash -lc 'aws eks list-nodegroups --cluster-name <EKS_CLUSTER_NAME> --region <AWS_REGION>'"
+]}

@@ -1,0 +1,236 @@
+# -----------------------------------------------------------------------------
+# Stage 2.0 (v2) - UCCL-EP 正确性 + 低时延烟囱
+# 变化（相对于旧 mpijob-correctness.yaml）：
+#   * 不再自己写 inline compare_ep.py；直接跑 upstream 脚本
+#     /opt/uccl/ep/bench/test_low_latency.py（和 DeepEP test_low_latency.py 同源）。
+#   * 不再与 DeepEP 做元素级对比（DeepEP v1.2.1 的 cpp extension 是 cu124 构建的，
+#     我们镜像里 CUDA 12.6 + torch 2.5.1+cu124 组合下会报 __cudaRegisterLinkedBinary
+#     undefined symbol；当前阶段只验证 UCCL-EP on EFA 本身跑通 + 内部一致性。）
+#   * wrapper.sh 把 OMPI_COMM_WORLD_* 翻成 torchrun 约定的 RANK / LOCAL_RANK /
+#     LOCAL_WORLD_SIZE / WORLD_SIZE / MASTER_ADDR / MASTER_PORT，并把
+#     torch/lib 加到 LD_LIBRARY_PATH（否则 import uccl.ep 找不到 libc10.so）。
+# 其它结构（tolerations / nodeSelector / hostfile loop / ssh validation /
+# MCA flags）沿用 stage1 已打通的模板。
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: uccl-ep-upstream-script
+  namespace: efa-validation
+data:
+  wrapper.sh: |
+    #!/usr/bin/env bash
+    # Translate OMPI env -> torchrun env expected by upstream UCCL-EP tests.
+    set -eu
+    : "${OMPI_COMM_WORLD_RANK:?need OMPI_COMM_WORLD_RANK}"
+    : "${OMPI_COMM_WORLD_SIZE:?need OMPI_COMM_WORLD_SIZE}"
+    : "${OMPI_COMM_WORLD_LOCAL_RANK:?need OMPI_COMM_WORLD_LOCAL_RANK}"
+    : "${OMPI_COMM_WORLD_LOCAL_SIZE:?need OMPI_COMM_WORLD_LOCAL_SIZE}"
+    export RANK="${OMPI_COMM_WORLD_RANK}"
+    export WORLD_SIZE="${OMPI_COMM_WORLD_SIZE}"
+    export LOCAL_RANK="${OMPI_COMM_WORLD_LOCAL_RANK}"
+    export LOCAL_WORLD_SIZE="${OMPI_COMM_WORLD_LOCAL_SIZE}"
+    export MASTER_ADDR="${MASTER_HOST:-127.0.0.1}"
+    export MASTER_PORT="${MASTER_PORT:-29500}"
+    # libc10.so / libtorch.so live under torch/lib and are not on default
+    # LD_LIBRARY_PATH; add them so `import uccl.ep` can resolve.
+    TORCH_LIB=$(python3 -c "import torch, os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))")
+    export LD_LIBRARY_PATH="${TORCH_LIB}:${LD_LIBRARY_PATH:-}"
+    # nvshmem / uccl defaults.
+    cd /opt/uccl/ep/bench
+    # Slight defaults for a smoke run. Caller can override argv through mpirun.
+    exec python3 test_low_latency.py "$@"
+---
+apiVersion: kubeflow.org/v2beta1
+kind: MPIJob
+metadata:
+  name: uccl-ep-upstream
+  namespace: efa-validation
+spec:
+  slotsPerWorker: 8
+  runPolicy:
+    cleanPodPolicy: Running
+    ttlSecondsAfterFinished: 3600
+  sshAuthMountPath: /root/.ssh
+  mpiReplicaSpecs:
+    Launcher:
+      replicas: 1
+      template:
+        spec:
+          serviceAccountName: efa-runner
+          restartPolicy: Never
+          tolerations:
+            - key: nvidia.com/gpu
+              operator: Equal
+              value: "true"
+              effect: NoSchedule
+          nodeSelector:
+            node.kubernetes.io/instance-type: p5.48xlarge
+          containers:
+            - name: launcher
+              image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/uccl-ep:v2
+              imagePullPolicy: IfNotPresent
+              env: &commonEnv
+                - name: OMPI_ALLOW_RUN_AS_ROOT
+                  value: "1"
+                - name: OMPI_ALLOW_RUN_AS_ROOT_CONFIRM
+                  value: "1"
+                - name: NCCL_DEBUG
+                  value: "INFO"
+                - name: NCCL_DEBUG_SUBSYS
+                  value: "INIT,NET,ENV"
+                - name: FI_PROVIDER
+                  value: "efa"
+                - name: FI_EFA_USE_DEVICE_RDMA
+                  value: "1"
+                - name: FI_EFA_FORK_SAFE
+                  value: "1"
+                - name: NCCL_NET_PLUGIN
+                  value: "/opt/aws-ofi-nccl/lib/libnccl-net.so"
+                - name: PATH
+                  value: "/opt/amazon/efa/bin:/opt/amazon/openmpi/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin"
+                - name: LD_LIBRARY_PATH
+                  value: "/opt/amazon/efa/lib:/opt/amazon/openmpi/lib:/opt/aws-ofi-nccl/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64:/usr/local/lib:/usr/lib"
+                - name: PYTHONUNBUFFERED
+                  value: "1"
+                - name: OMP_NUM_THREADS
+                  value: "8"
+              command:
+                - /bin/bash
+                - -lc
+                - |
+                  set -eux
+                  echo "===== uccl-ep upstream launcher ready ====="
+                  # discover workers
+                  for i in $(seq 1 60); do
+                    NH=$(/etc/mpi/discover_hosts.sh 2>/dev/null | wc -l)
+                    echo "attempt=$i hosts_count=$NH"
+                    [ "$NH" -ge 2 ] && break
+                    sleep 5
+                  done
+                  [ "$NH" -ge 2 ] || { echo FATAL no workers; exit 1; }
+
+                  HOSTFILE=/tmp/hostfile
+                  : > $HOSTFILE
+                  for h in $(/etc/mpi/discover_hosts.sh); do
+                    echo "$h slots=8" >> $HOSTFILE
+                  done
+                  echo "--- hostfile ---"
+                  cat $HOSTFILE
+
+                  # ssh warmup
+                  for h in $(/etc/mpi/discover_hosts.sh); do
+                    for i in $(seq 1 30); do
+                      ssh -o StrictHostKeyChecking=no -o ConnectTimeout=2 "$h" hostname 2>/dev/null \
+                        && { echo ssh OK $h; break; }
+                      sleep 2
+                    done
+                  done
+
+                  MASTER_HOST=$(head -1 "$HOSTFILE" | awk '{print $1}')
+                  export MASTER_HOST
+                  export MASTER_PORT=29500
+
+                  mkdir -p /workspace/out
+
+                  ENV_ARGS=(
+                    -x PATH -x LD_LIBRARY_PATH
+                    -x NCCL_DEBUG -x NCCL_DEBUG_SUBSYS
+                    -x FI_PROVIDER -x FI_EFA_USE_DEVICE_RDMA -x FI_EFA_FORK_SAFE
+                    -x NCCL_NET_PLUGIN
+                    -x PYTHONUNBUFFERED -x OMP_NUM_THREADS
+                    -x OMPI_ALLOW_RUN_AS_ROOT -x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM
+                    -x MASTER_HOST -x MASTER_PORT
+                  )
+                  MPI_COMMON=(
+                    --allow-run-as-root
+                    --hostfile "$HOSTFILE"
+                    -np 16 -N 8
+                    --mca pml ^ucx --mca btl ^openib
+                    --mca plm_rsh_no_tree_spawn 1
+                    --mca orte_keep_fqdn_hostnames 1
+                    --mca oob_tcp_if_include eth0
+                    --mca btl_tcp_if_include eth0
+                    --bind-to none
+                    "${ENV_ARGS[@]}"
+                  )
+
+                  echo "===== run UCCL-EP upstream test_low_latency.py on EFA ====="
+                  mpirun "${MPI_COMMON[@]}" \
+                    bash /scripts/wrapper.sh \
+                      --num-processes 16 \
+                      --num-tokens 128 --hidden 7168 \
+                      --num-topk 8 --num-experts 288 \
+                      --no-dispatch-use-fp8 \
+                    2>&1 | tee /workspace/out/uccl-upstream.log
+
+                  echo "===== DONE ====="
+              volumeMounts:
+                - name: scripts
+                  mountPath: /scripts
+                - name: workspace
+                  mountPath: /workspace
+          volumes:
+            - name: scripts
+              configMap:
+                name: uccl-ep-upstream-script
+                defaultMode: 0755
+            - name: workspace
+              emptyDir: {}
+    Worker:
+      replicas: 2
+      template:
+        spec:
+          restartPolicy: OnFailure
+          hostNetwork: false
+          dnsPolicy: ClusterFirstWithHostNet
+          tolerations:
+            - key: nvidia.com/gpu
+              operator: Equal
+              value: "true"
+              effect: NoSchedule
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      training.kubeflow.org/job-name: uccl-ep-upstream
+                      training.kubeflow.org/job-role: worker
+                  topologyKey: kubernetes.io/hostname
+          containers:
+            - name: worker
+              image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/uccl-ep:v2
+              imagePullPolicy: IfNotPresent
+              env: *commonEnv
+              securityContext:
+                capabilities:
+                  add: [IPC_LOCK]
+              resources:
+                limits:
+                  nvidia.com/gpu: 8
+                  vpc.amazonaws.com/efa: 32
+                  hugepages-2Mi: 5120Mi
+                  memory: 256Gi
+                requests:
+                  nvidia.com/gpu: 8
+                  vpc.amazonaws.com/efa: 32
+                  hugepages-2Mi: 5120Mi
+                  memory: 256Gi
+              volumeMounts:
+                - name: shm
+                  mountPath: /dev/shm
+                - name: scripts
+                  mountPath: /scripts
+                - name: workspace
+                  mountPath: /workspace
+          volumes:
+            - name: shm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 32Gi
+            - name: scripts
+              configMap:
+                name: uccl-ep-upstream-script
+                defaultMode: 0755
+            - name: workspace
+              emptyDir: {}

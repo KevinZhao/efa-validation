@@ -1,0 +1,309 @@
+# -----------------------------------------------------------------------------
+# Stage 3.1 - Mooncake transfer_engine_bench on EFA
+# -----------------------------------------------------------------------------
+# 架构：
+#   * 1 × metadata server Pod（http-metadata-server-python，无需 etcd，
+#     Mooncake 官方 example 自带；通过 Service 暴露 :8080）
+#   * 1 × target Pod（占用 p5 + EFA，跑 transfer_engine_bench --mode=target）
+#   * 1 × initiator Pod（占用第二张 p5 + EFA，跑 transfer_engine_bench --mode=initiator
+#     --protocol=efa --operation=write --segment_id=<target local_server_name>）
+# 结果在 initiator stdout 里（带宽 / 延迟），被 tee 到 S3。
+#
+# 参考：/opt/mooncake/mooncake-transfer-engine/example/efa_latency_bench.py
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: mooncake-metadata
+  namespace: efa-validation
+spec:
+  selector:
+    app: mooncake-metadata
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+  type: ClusterIP
+---
+# Headless service so mooncake-target / mooncake-initiator pods are
+# resolvable at <pod-hostname>.mooncake-bench.efa-validation.svc
+apiVersion: v1
+kind: Service
+metadata:
+  name: mooncake-bench
+  namespace: efa-validation
+spec:
+  clusterIP: None
+  selector:
+    app: mooncake-bench
+  publishNotReadyAddresses: true
+  ports:
+    - name: dummy
+      port: 12345
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mooncake-metadata
+  namespace: efa-validation
+  labels:
+    app: mooncake-metadata
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mooncake-metadata
+  template:
+    metadata:
+      labels:
+        app: mooncake-metadata
+    spec:
+      # metadata server 不需 GPU / EFA；在普通节点上（eks-utils ARM）也可能不行
+      # 因为 image 是 amd64，所以强制挑 p5（与 workers 同节点池，避免跨 pool）。
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      nodeSelector:
+        node.kubernetes.io/instance-type: p5.48xlarge
+      containers:
+        - name: metadata
+          image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/mooncake-nixl:v1
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -eux
+              # Mooncake ships a Go-based http metadata server under
+              # example/http-metadata-server (main.go, uses gin). Compile + run.
+              # Work in a writable copy so `go mod tidy` can create go.sum.
+              mkdir -p /workspace/metadata-build
+              cp -r /opt/mooncake/mooncake-transfer-engine/example/http-metadata-server/. /workspace/metadata-build/
+              cd /workspace/metadata-build
+              export PATH="/usr/local/go/bin:${PATH}"
+              export GOCACHE=/workspace/.gocache
+              export GOMODCACHE=/workspace/.gomodcache
+              go mod tidy
+              go build -o /usr/local/bin/mooncake-metadata-server . 2>&1
+              exec /usr/local/bin/mooncake-metadata-server --addr=:8080
+          ports:
+            - containerPort: 8080
+          resources:
+            limits:
+              cpu: "2"
+              memory: 4Gi
+            requests:
+              cpu: "500m"
+              memory: 1Gi
+      volumes:
+        - name: workspace
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mooncake-target
+  namespace: efa-validation
+  labels:
+    app: mooncake-bench
+    role: target
+spec:
+  restartPolicy: Never
+  hostname: mooncake-target
+  subdomain: mooncake-bench
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values: [mooncake-bench]
+          topologyKey: kubernetes.io/hostname
+  nodeSelector:
+    node.kubernetes.io/instance-type: p5.48xlarge
+  containers:
+    - name: target
+      image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/mooncake-nixl:v1
+      imagePullPolicy: IfNotPresent
+      env:
+        - name: FI_PROVIDER
+          value: "efa"
+        - name: FI_EFA_USE_DEVICE_RDMA
+          value: "1"
+        - name: FI_EFA_FORK_SAFE
+          value: "1"
+      command: ["/bin/bash", "-lc"]
+      args:
+        - |
+          set -eux
+          # Wait for metadata server
+          for i in $(seq 1 120); do
+            # Gin only registers /metadata; hitting it returns 404 without ?key
+            # which is fine as a reachability probe.
+            CODE=$(curl -o /dev/null -s -w "%{http_code}" http://mooncake-metadata.efa-validation.svc:8080/metadata 2>/dev/null || echo 000)
+            if [ "$CODE" = "404" ] || [ "$CODE" = "200" ]; then
+              echo "metadata server reachable (code=$CODE)"; break
+            fi
+            echo "attempt=$i code=$CODE"; sleep 2
+          done
+          MY_IP=$(hostname -i | awk '{print $1}')
+          echo "target IP=$MY_IP"
+          cd /opt/mooncake/build/mooncake-transfer-engine/example
+          exec ./transfer_engine_bench \
+            --mode=target \
+            --protocol=efa \
+            --local_server_name="${MY_IP}:12345" \
+            --metadata_server="http://mooncake-metadata.efa-validation.svc:8080/metadata" \
+            --use_vram=false \
+            --gpu_id=0 \
+            --buffer_size=$((4<<30)) \
+            --duration=180
+      securityContext:
+        capabilities:
+          add: [IPC_LOCK]
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+          vpc.amazonaws.com/efa: 32
+          hugepages-2Mi: 5120Mi
+          memory: 128Gi
+        requests:
+          nvidia.com/gpu: 1
+          vpc.amazonaws.com/efa: 32
+          hugepages-2Mi: 5120Mi
+          memory: 128Gi
+      volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+  volumes:
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 32Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mooncake-initiator
+  namespace: efa-validation
+  labels:
+    app: mooncake-bench
+    role: initiator
+spec:
+  restartPolicy: Never
+  hostname: mooncake-initiator
+  subdomain: mooncake-bench
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values: [mooncake-bench]
+          topologyKey: kubernetes.io/hostname
+  nodeSelector:
+    node.kubernetes.io/instance-type: p5.48xlarge
+  containers:
+    - name: initiator
+      image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/mooncake-nixl:v1
+      imagePullPolicy: IfNotPresent
+      env:
+        - name: FI_PROVIDER
+          value: "efa"
+        - name: FI_EFA_USE_DEVICE_RDMA
+          value: "1"
+        - name: FI_EFA_FORK_SAFE
+          value: "1"
+      command: ["/bin/bash", "-lc"]
+      args:
+        - |
+          set -eux
+          # Wait for metadata server
+          for i in $(seq 1 120); do
+            # Gin only registers /metadata; hitting it returns 404 without ?key
+            # which is fine as a reachability probe.
+            CODE=$(curl -o /dev/null -s -w "%{http_code}" http://mooncake-metadata.efa-validation.svc:8080/metadata 2>/dev/null || echo 000)
+            if [ "$CODE" = "404" ] || [ "$CODE" = "200" ]; then
+              echo "metadata server reachable (code=$CODE)"; break
+            fi
+            echo "attempt=$i code=$CODE"; sleep 2
+          done
+          # Wait for target to register itself with metadata server.
+          # Resolve target pod IP via headless service (subdomain=mooncake-bench).
+          for i in $(seq 1 60); do
+            TARGET_IP=$(getent hosts mooncake-target.mooncake-bench.efa-validation.svc 2>/dev/null | awk '{print $1}' || true)
+            [ -n "$TARGET_IP" ] && break
+            sleep 3
+          done
+          if [ -z "$TARGET_IP" ]; then
+            # Fallback: scrape metadata server for any registered segment id
+            echo "target DNS not resolvable; querying metadata server"
+            curl -s http://mooncake-metadata.efa-validation.svc:8080/ | head -100
+            exit 1
+          fi
+          echo "target_ip=$TARGET_IP"
+          # Give target a few more seconds to bind.
+          sleep 10
+          MY_IP=$(hostname -i | awk '{print $1}')
+          cd /opt/mooncake/build/mooncake-transfer-engine/example
+          # Stick to efa_latency_bench.py defaults: threads=12 (upstream),
+          # block_size=64KB default bumped to 4 MiB for throughput-friendly run,
+          # buffer=4GB (must fit batch_size * block_size * threads * 2).
+          ./transfer_engine_bench \
+            --mode=initiator \
+            --protocol=efa \
+            --local_server_name="${MY_IP}:12346" \
+            --segment_id="${TARGET_IP}:12345" \
+            --metadata_server="http://mooncake-metadata.efa-validation.svc:8080/metadata" \
+            --operation=write \
+            --use_vram=false \
+            --gpu_id=0 \
+            --buffer_size=$((4<<30)) \
+            --block_size=$((4<<20)) \
+            --batch_size=64 \
+            --threads=12 \
+            --duration=60 \
+            2>&1 | tee /workspace/out/mooncake-efa-write.log
+          echo "=== DONE ==="
+      securityContext:
+        capabilities:
+          add: [IPC_LOCK]
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+          vpc.amazonaws.com/efa: 32
+          hugepages-2Mi: 5120Mi
+          memory: 128Gi
+        requests:
+          nvidia.com/gpu: 1
+          vpc.amazonaws.com/efa: 32
+          hugepages-2Mi: 5120Mi
+          memory: 128Gi
+      volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+        - name: workspace
+          mountPath: /workspace
+  volumes:
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 32Gi
+    - name: workspace
+      emptyDir: {}

@@ -1,0 +1,7 @@
+{
+  "commands": [
+    "sudo -iu ec2-user bash -lc 'grep -i -E \"dispatch|combine|PASS|FAIL|hash|avg.*lat|num_tokens|test_loop|rank=0\" /tmp/s2-full.log | grep -v -i nccl | head -80'",
+    "echo === last 60 non-nccl lines ===",
+    "sudo -iu ec2-user bash -lc 'grep -v -E \"NCCL INFO|\\\\[Service thread\\\\]|Abort COMPLETE|NET/OFI MR cache\" /tmp/s2-full.log | tail -80'"
+  ]
+}

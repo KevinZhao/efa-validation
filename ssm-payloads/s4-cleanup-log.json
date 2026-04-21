@@ -1,0 +1,5 @@
+{"commands":[
+"sudo -iu ec2-user bash -lc 'kubectl --context ohio get pod node-cleanup-160 -n efa-validation 2>&1'",
+"echo ---",
+"sudo -iu ec2-user bash -lc 'kubectl --context ohio logs node-cleanup-160 -n efa-validation --tail=50 2>&1'"
+]}

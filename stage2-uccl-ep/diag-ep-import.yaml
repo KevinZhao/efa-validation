@@ -1,0 +1,59 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: uccl-ep-diag
+  namespace: efa-validation
+spec:
+  restartPolicy: Never
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  nodeSelector:
+    node.kubernetes.io/instance-type: p5.48xlarge
+  containers:
+    - name: diag
+      image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/uccl-ep:v2
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/bash", "-lc"]
+      args:
+        - |
+          set +e
+          echo "===== GPU / torch ====="
+          nvidia-smi -L || true
+          python3 -c "import torch; print('torch:', torch.__version__, 'cuda:', torch.version.cuda)"
+
+          TORCH_LIB=$(python3 -c "import torch, os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))")
+          echo "TORCH_LIB=$TORCH_LIB"
+          export LD_LIBRARY_PATH="$TORCH_LIB:${LD_LIBRARY_PATH}"
+
+          echo "===== uccl.ep WITH torch/lib on LD_LIBRARY_PATH ====="
+          python3 -c "import uccl.ep as ep; print('uccl.ep OK', ep.__file__)" 2>&1
+
+          echo "===== deep_ep WITH torch/lib on LD_LIBRARY_PATH ====="
+          python3 -c "import deep_ep; print('deep_ep OK', deep_ep.__file__)" 2>&1
+
+          echo "===== Rebuild DeepEP on this GPU node ====="
+          cd /opt/deepep
+          TORCH_CUDA_ARCH_LIST="9.0" pip install --no-cache-dir --force-reinstall . 2>&1 | tail -30
+          python3 -c "import deep_ep; print('deep_ep OK after rebuild', deep_ep.__file__)" 2>&1
+
+          echo "===== Rebuild UCCL-EP on this GPU node ====="
+          cd /opt/uccl/ep
+          TORCH_CUDA_ARCH_LIST="9.0" python3 setup.py install 2>&1 | tail -30
+          python3 -c "import uccl.ep as ep; print('uccl.ep OK after rebuild', ep.__file__)" 2>&1
+
+          echo "===== Done, sleep 900 ====="
+          sleep 900
+      securityContext:
+        capabilities:
+          add: [IPC_LOCK]
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+          vpc.amazonaws.com/efa: 0
+          memory: 64Gi
+        requests:
+          nvidia.com/gpu: 1
+          memory: 32Gi

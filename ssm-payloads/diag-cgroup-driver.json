@@ -1,0 +1,16 @@
+{
+  "commands": [
+    "echo === kubelet cgroup driver ===",
+    "grep -E 'cgroup' /etc/kubernetes/kubelet/config.json 2>&1 || cat /etc/eks/kubelet/kubelet-config.json 2>&1 | grep -i cgroup",
+    "ps -ef | grep kubelet | grep -v grep | head -3",
+    "echo === containerd SystemdCgroup ===",
+    "grep -E 'SystemdCgroup' /etc/containerd/config.toml",
+    "echo === nvidia-container-runtime mode ===",
+    "grep -E '^mode' /etc/nvidia-container-runtime/config.toml",
+    "echo === binary path sanity ===",
+    "ls -l /usr/bin/nvidia-container-runtime",
+    "file /usr/bin/nvidia-container-runtime",
+    "echo === try launch raw runc via nvidia runtime ===",
+    "nvidia-container-runtime --version 2>&1 | head -3"
+  ]
+}

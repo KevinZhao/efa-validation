@@ -1,0 +1,7 @@
+{
+  "commands": [
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get mpijob uccl-ep-upstream -n efa-validation -o jsonpath=\"{.status.conditions}\" 2>&1; echo'",
+    "echo === workspace log in launcher pod ===",
+    "sudo -iu ec2-user bash -lc 'LAUNCHER=$(kubectl --context ohio get pods -n efa-validation -l training.kubeflow.org/job-name=uccl-ep-upstream,training.kubeflow.org/job-role=launcher -o jsonpath=\"{.items[0].metadata.name}\"); echo launcher=$LAUNCHER; kubectl --context ohio exec -n efa-validation $LAUNCHER -- cat /workspace/out/uccl-upstream.log 2>&1 | head -300'"
+  ]
+}

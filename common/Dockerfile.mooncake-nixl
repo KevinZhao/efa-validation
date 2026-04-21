@@ -1,0 +1,221 @@
+# -----------------------------------------------------------------------------
+# Stage-3 image: Mooncake Transfer Engine (KV over EFA) + NIXL (fallback / 对照)
+#
+# Built on top of the common base image (CUDA 12.6 + EFA installer 1.47 +
+# libfabric under /opt/amazon/efa + OpenMPI + NCCL + aws-ofi-nccl).
+#
+# Produces two C++/Python toolchains exercised in stage 3:
+#   - Mooncake Transfer Engine with `efa` protocol (主路径, KV over EFA)
+#   - NIXL >= 1.0.0 with LIBFABRIC backend           (fallback / 对照)
+#
+# Target binaries / entrypoints:
+#   /opt/mooncake/build/mooncake-transfer-engine/example/transfer_engine_bench
+#   /opt/mooncake/mooncake-transfer-engine/example/efa_latency_bench.py   (SSH-driven)
+#   /opt/nixl/bin/nixlbench                          (ETCD-coordinated)
+#   python3 -c "import mooncake"                     (python binding, mooncake-wheel)
+#   python3 -c "import nixl"                         (python binding)
+#
+# Upstream pins (verified against GitHub releases 2026-04-21):
+#   Mooncake v0.3.10.post1  (2026-04-01) — USE_EFA=ON landed; transfer_engine_bench
+#                                           has --protocol=efa, efa_latency_bench.py
+#                                           ships in mooncake-transfer-engine/example/
+#   NIXL     v1.0.1         (2025-04-14) — LIBFABRIC plugin ships under
+#                                           src/plugins/libfabric (surfaces EFA via
+#                                           the libfabric provider layer).
+# -----------------------------------------------------------------------------
+ARG BASE_IMAGE=<AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/base-cuda-efa:v1
+FROM ${BASE_IMAGE}
+
+# Pinned refs (verified upstream). Override only after a follow-up run validates
+# a newer tag end-to-end.
+ARG MOONCAKE_REF=v0.3.10.post1
+ARG NIXL_REF=v1.0.1
+# NIXL depends on a recent UCX; the base image does NOT ship UCX, so we build it here.
+# v1.18.0 is the last release tested against aws-ofi-nccl 1.19.0 / libfabric 1.22.
+ARG UCX_VERSION=v1.18.0
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
+
+# ---- additional system deps for Mooncake + NIXL ----
+#   Mooncake dependencies.sh installs most of these, but we front-run the apt layer
+#   for Docker build-cache friendliness and so that dependencies.sh -y becomes a no-op
+#   fast-path on a warm cache.
+#   NIXL: cmake, meson, ninja, pybind11, UCX (built below), libfabric (base)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      cmake ninja-build meson pkg-config patchelf \
+      libyaml-cpp-dev libgflags-dev libgoogle-glog-dev \
+      libboost-all-dev libjsoncpp-dev libssl-dev \
+      libgtest-dev libgmock-dev libjemalloc-dev \
+      libcurl4-openssl-dev uuid-dev \
+      libgrpc-dev libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc \
+      pybind11-dev python3-pybind11 \
+      python3-setuptools python3-wheel python3-venv python3-dev \
+      wget unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# pin pip toolchain used by both python bindings
+# - etcd3/etcd-client: NIXL nixlbench requires an etcd server for runtime coordination;
+#   the python client is useful for launch-time health checks.
+# - grpcio: Mooncake store master gRPC; pulled in even with STORE_USE_ETCD=OFF because
+#   the store library still links gRPC.
+RUN python3 -m pip install --no-cache-dir --upgrade \
+      pip setuptools wheel \
+      "pybind11>=2.11" "numpy<2" "torch==2.4.*" \
+      meson ninja \
+      "grpcio>=1.60" "grpcio-tools>=1.60" \
+      "etcd3>=0.12" "protobuf>=4.25"
+
+# -----------------------------------------------------------------------------
+# UCX (required by NIXL UCX backend — kept even though we run LIBFABRIC, so that
+# `--backend UCX` remains available for triage runs).
+# Build against the libfabric shipped in /opt/amazon/efa so that the EFA provider
+# surfaces uniformly to UCX→libfabric and directly to the NIXL LIBFABRIC plugin.
+# -----------------------------------------------------------------------------
+RUN git clone --depth 1 -b ${UCX_VERSION} https://github.com/openucx/ucx.git /opt/ucx-src && \
+    cd /opt/ucx-src && \
+    ./autogen.sh && \
+    ./contrib/configure-release \
+      --prefix=/opt/ucx \
+      --with-cuda=/usr/local/cuda \
+      --with-verbs \
+      --with-rdmacm \
+      --enable-mt && \
+    make -j"$(nproc)" && make install && \
+    ldconfig && \
+    rm -rf /opt/ucx-src
+
+ENV PATH="/opt/ucx/bin:${PATH}" \
+    LD_LIBRARY_PATH="/opt/ucx/lib:${LD_LIBRARY_PATH}" \
+    PKG_CONFIG_PATH="/opt/ucx/lib/pkgconfig:/opt/amazon/efa/lib/pkgconfig:${PKG_CONFIG_PATH}"
+
+# -----------------------------------------------------------------------------
+# Mooncake Transfer Engine
+#   Repo:   https://github.com/kvcache-ai/Mooncake
+#   Pinned: v0.3.10.post1
+#   Flags verified via upstream docs (kvcache-ai.github.io/Mooncake):
+#     -DUSE_EFA=ON           enable AWS EFA transport (libfabric SRD)
+#     -DUSE_CUDA=ON          required for GPU-memory transfers
+#     -DWITH_TE=ON           transfer engine + sample code (default ON; explicit)
+#     -DWITH_STORE=OFF       skip store layer (bench-only image)
+#     -DSTORE_USE_ETCD=OFF   bench uses P2PHANDSHAKE metadata, no etcd required
+#     -DSTORE_USE_REDIS=OFF  same rationale
+# -----------------------------------------------------------------------------
+RUN git clone --recursive https://github.com/kvcache-ai/Mooncake.git /opt/mooncake && \
+    cd /opt/mooncake && git checkout ${MOONCAKE_REF} && \
+    git submodule update --init --recursive
+
+# dependencies.sh is the project's canonical bootstrap; it installs apt + go +
+# yalantinglibs-0.5.7 from source. Most apt bits are already in the layer above,
+# but the yalantinglibs install is load-bearing for the store/RPC layer.
+RUN cd /opt/mooncake && \
+    if [ -x dependencies.sh ]; then yes | ./dependencies.sh || ./dependencies.sh -y || true; fi
+
+# Ensure Go ends up on PATH for the dependencies.sh-installed toolchain.
+ENV PATH="/usr/local/go/bin:${PATH}"
+
+# Build Mooncake with EFA / CUDA enabled. `USE_EFA=ON` wires in libfabric (SRD).
+# libfabric root is discovered via PKG_CONFIG_PATH=/opt/amazon/efa/lib/pkgconfig
+# set above, so no explicit LIBFABRIC_ROOT var is needed.
+RUN mkdir -p /opt/mooncake/build && cd /opt/mooncake/build && \
+    cmake .. \
+      -GNinja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/opt/mooncake/install \
+      -DUSE_EFA=ON \
+      -DUSE_CUDA=ON \
+      -DWITH_TE=ON \
+      -DWITH_STORE=OFF \
+      -DWITH_P2P_STORE=OFF \
+      -DWITH_EP=OFF \
+      -DSTORE_USE_ETCD=OFF \
+      -DSTORE_USE_REDIS=OFF \
+      -DBUILD_UNIT_TESTS=OFF && \
+    ninja -j"$(nproc)" && \
+    ninja install && \
+    ldconfig
+
+# Mooncake python binding (wheel lives at repo root under mooncake-wheel/ on v0.3.10+).
+# `sudo make install` docs call path produces both the python package and CLI entrypoints.
+RUN cd /opt/mooncake && \
+    if [ -d mooncake-wheel ]; then \
+        pip install --no-cache-dir ./mooncake-wheel ; \
+    elif [ -f mooncake-transfer-engine/python/setup.py ]; then \
+        pip install --no-cache-dir ./mooncake-transfer-engine/python ; \
+    else \
+        echo "ERROR: Mooncake python package not found at expected path" >&2 ; exit 1 ; \
+    fi
+
+ENV MOONCAKE_HOME=/opt/mooncake \
+    PATH="/opt/mooncake/install/bin:/opt/mooncake/build/mooncake-transfer-engine/example:${PATH}" \
+    LD_LIBRARY_PATH="/opt/mooncake/install/lib:/opt/mooncake/install/lib64:${LD_LIBRARY_PATH}"
+
+# -----------------------------------------------------------------------------
+# NIXL (fallback / 对照 bench)
+#   Repo:   https://github.com/ai-dynamo/nixl
+#   Pinned: v1.0.1
+#   Notes:
+#     - EFA access goes through the LIBFABRIC plugin (src/plugins/libfabric/);
+#       there is no standalone 'EFA' plugin directory. `--backend LIBFABRIC` at
+#       nixlbench time + FI_PROVIDER=efa at the env layer selects EFA.
+#     - meson_options.txt exposes `enable_plugins` / `disable_plugins` as
+#       comma-separated strings. Plugin token naming follows `--backend` labels
+#       (UCX, LIBFABRIC, MOONCAKE, ...).
+#     - nixlbench uses ETCD for worker coordination (no manual server/client flag).
+# -----------------------------------------------------------------------------
+RUN git clone --recursive https://github.com/ai-dynamo/nixl.git /opt/nixl-src && \
+    cd /opt/nixl-src && git checkout ${NIXL_REF} && \
+    git submodule update --init --recursive
+
+# NIXL build via meson+ninja.
+# `enable_plugins` limits the build to plugins we actually need:
+#   UCX, LIBFABRIC  -> 主验证路径
+#   MOONCAKE        -> 允许在 nixlbench 内对 Mooncake backend 做同框架对照
+# Disable GDS + everything else to keep the image slim.
+RUN cd /opt/nixl-src && \
+    meson setup build \
+      --prefix=/opt/nixl \
+      --buildtype=release \
+      -Ducx_path=/opt/ucx \
+      -Dlibfabric_path=/opt/amazon/efa \
+      -Dcudapath_inc=/usr/local/cuda/include \
+      -Dcudapath_lib=/usr/local/cuda/lib64 \
+      -Denable_plugins=UCX,LIBFABRIC \
+      -Ddisable_gds_backend=true \
+      -Dbuild_tests=false \
+      -Dbuild_examples=true && \
+    ninja -C build -j"$(nproc)" && \
+    ninja -C build install && \
+    ldconfig
+
+# NIXL python binding. v1.0.1: meson install already drops
+# `_bindings.cpython-*.so`, `_api.py`, `__init__.py` under
+# /opt/nixl/lib/python3/dist-packages/nixl_cu12 — there is no setup.py to
+# pip install. We just add that dir to PYTHONPATH.
+ENV PYTHONPATH="/opt/nixl/lib/python3/dist-packages:${PYTHONPATH}"
+
+ENV NIXL_HOME=/opt/nixl \
+    PATH="/opt/nixl/bin:${PATH}" \
+    LD_LIBRARY_PATH="/opt/nixl/lib:/opt/nixl/lib64:${LD_LIBRARY_PATH}" \
+    NIXL_PLUGIN_DIR="/opt/nixl/lib/plugins"
+
+# -----------------------------------------------------------------------------
+# Sanity: dump fi_info providers + list Mooncake / NIXL entrypoints at image build time.
+# Build fails if the Mooncake bench binary is missing (cmake silently drops USE_EFA
+# when libfabric can't be found). NIXL v1.0.1 meson install does NOT drop nixlbench
+# under bin/ by default, so we check its plugins dir + python binding as proxies.
+# fi_info inside the build environment has no EFA device; tolerate EFA check.
+# -----------------------------------------------------------------------------
+RUN (/opt/amazon/efa/bin/fi_info -p efa -t FI_EP_RDM | head -n 40 || \
+      echo "NOTE: no EFA device visible in build environment; will be present at runtime") && \
+    ls -l /opt/mooncake/build/mooncake-transfer-engine/example/transfer_engine_bench && \
+    ls -l /opt/mooncake/mooncake-transfer-engine/example/efa_latency_bench.py && \
+    ls -l /opt/nixl/lib/x86_64-linux-gnu/plugins/ && \
+    (ls -l /opt/nixl/bin/ 2>&1 | head -20 || true) && \
+    python3 -c "import mooncake; print('mooncake OK', mooncake.__file__)" && \
+    (python3 -c "import nixl_cu12; print('nixl_cu12 OK', nixl_cu12.__file__)" || \
+      echo "NOTE: nixl python binding not importable (tolerated; C++ bench is primary)")
+
+WORKDIR /workspace
+CMD ["/bin/bash"]

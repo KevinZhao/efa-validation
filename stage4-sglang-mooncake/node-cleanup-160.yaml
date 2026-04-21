@@ -1,0 +1,45 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: node-cleanup-160
+  namespace: efa-validation
+  annotations:
+    # Help kubelet not evict us even under disk pressure.
+    scheduler.alpha.kubernetes.io/critical-pod: ""
+spec:
+  restartPolicy: Never
+  hostPID: true
+  priorityClassName: system-node-critical
+  tolerations:
+    - operator: Exists
+  nodeName: <GPU_NODE_0>
+  containers:
+    - name: cleanup
+      image: public.ecr.aws/amazonlinux/amazonlinux:2023
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/bash", "-lc"]
+      args:
+        - |
+          set -eux
+          echo === df before ===
+          df -h | head -5
+          # The overlay filesystem under /var/lib/containerd is what matters
+          # for kubelet disk-pressure. Prune unused images.
+          echo === disk usage on /host-root/var ===
+          du -sh /host-root/var/lib/containerd 2>&1 | head -3
+          du -sh /host-root/var/lib/kubelet/pods 2>&1 | head -3
+          echo === chroot and run crictl ===
+          chroot /host-root /bin/bash -c "crictl images 2>&1 | head -30"
+          chroot /host-root /bin/bash -c "crictl rmi --prune 2>&1 | head -20"
+          echo === df after ===
+          chroot /host-root /bin/bash -c "df -h | head -5"
+      securityContext:
+        privileged: true
+      volumeMounts:
+        - name: host-root
+          mountPath: /host-root
+  volumes:
+    - name: host-root
+      hostPath:
+        path: /
+        type: Directory

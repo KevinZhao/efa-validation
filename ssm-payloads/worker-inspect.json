@@ -1,0 +1,7 @@
+{
+  "commands": [
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pod -n efa-validation uccl-ep-correctness-worker-0 -o yaml | grep -A 20 \"containers:\"'",
+    "echo --- nccl-tests pod for ref ---",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio exec -n efa-validation uccl-ep-correctness-worker-0 -- ss -tln' 2>&1"
+  ]
+}

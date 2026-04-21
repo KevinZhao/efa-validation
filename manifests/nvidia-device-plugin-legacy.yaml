@@ -1,0 +1,56 @@
+# Restore the original EKS device plugin (v0.15.0 + libnvidia-ml symlinks)
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nvidia-device-plugin-daemonset
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      name: nvidia-device-plugin-ds
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        name: nvidia-device-plugin-ds
+    spec:
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      nodeSelector:
+        workload-type: gpu
+      priorityClassName: system-node-critical
+      hostPID: true
+      containers:
+        - name: nvidia-device-plugin-ctr
+          image: nvcr.io/nvidia/k8s-device-plugin:v0.15.0
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              ln -sf /host-lib64/libnvidia-ml.so.* /usr/lib/x86_64-linux-gnu/ 2>/dev/null || true
+              ln -sf /host-lib64/libnvidia-ml.so.* /usr/lib64/ 2>/dev/null || true
+              exec /usr/bin/nvidia-device-plugin
+          env:
+            - name: FAIL_ON_INIT_ERROR
+              value: "false"
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - mountPath: /var/lib/kubelet/device-plugins
+              name: device-plugin
+            - mountPath: /host-lib64
+              name: host-lib64
+              readOnly: true
+      volumes:
+        - name: device-plugin
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+        - name: host-lib64
+          hostPath:
+            path: /usr/lib64

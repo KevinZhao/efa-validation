@@ -1,0 +1,72 @@
+# Replacement for the stock EKS nvidia-device-plugin DaemonSet:
+# - Bumps to v0.17.4 (upstream stable with CDI support)
+# - Enables CDI injection so containers actually get /dev/nvidia*
+#
+# Apply with: kubectl apply -f nvidia-device-plugin-cdi.yaml
+# (this overwrites the existing DaemonSet in kube-system)
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nvidia-device-plugin-daemonset
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      name: nvidia-device-plugin-ds
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        name: nvidia-device-plugin-ds
+    spec:
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      nodeSelector:
+        workload-type: gpu
+      priorityClassName: system-node-critical
+      hostPID: true
+      containers:
+        - name: nvidia-device-plugin-ctr
+          image: nvcr.io/nvidia/k8s-device-plugin:v0.17.4
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              ln -sf /host-lib64/libnvidia-ml.so.* /usr/lib/x86_64-linux-gnu/ 2>/dev/null || true
+              ln -sf /host-lib64/libnvidia-ml.so.* /usr/lib64/ 2>/dev/null || true
+              exec /usr/bin/nvidia-device-plugin
+          env:
+            - name: FAIL_ON_INIT_ERROR
+              value: "false"
+            - name: DEVICE_LIST_STRATEGY
+              value: "cdi-annotations"
+            - name: CDI_ANNOTATION_PREFIX
+              value: "cdi.k8s.io/"
+            - name: NVIDIA_DRIVER_ROOT
+              value: "/"
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - mountPath: /var/lib/kubelet/device-plugins
+              name: device-plugin
+            - mountPath: /var/run/cdi
+              name: cdi
+            - mountPath: /host-lib64
+              name: host-lib64
+              readOnly: true
+      volumes:
+        - name: device-plugin
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+        - name: cdi
+          hostPath:
+            path: /var/run/cdi
+        - name: host-lib64
+          hostPath:
+            path: /usr/lib64

@@ -1,0 +1,10 @@
+{
+  "commands": [
+    "sudo -iu ec2-user bash -lc 'aws s3 cp s3://efa-validation-<AWS_ACCOUNT_ID>/manifests/mooncake-efa-bench.yaml /tmp/mooncake-efa-bench.yaml --region us-east-2'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete -f /tmp/mooncake-efa-bench.yaml --ignore-not-found --grace-period=0 --force 2>&1 || true'",
+    "sleep 5",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio apply -f /tmp/mooncake-efa-bench.yaml 2>&1'",
+    "sleep 8",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods -n efa-validation 2>&1'"
+  ]
+}

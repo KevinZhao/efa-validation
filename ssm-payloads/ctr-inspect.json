@@ -1,0 +1,8 @@
+{
+  "commands": [
+    "which crictl ctr nerdctl 2>&1",
+    "ls /usr/bin/ | grep -E 'crictl|ctr$|nerdctl' 2>&1",
+    "ctr --address /run/containerd/containerd.sock namespaces list 2>&1 || true",
+    "ctr --address /run/containerd/containerd.sock -n k8s.io containers list 2>&1 | head -10 || true"
+  ]
+}

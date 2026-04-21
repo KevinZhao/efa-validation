@@ -1,0 +1,337 @@
+# 1 Prefill LWS (TP=8, 1 node) + 1 Decode LWS (TP=8, 1 node) + mini_lb router
+# KV transfer backend = mooncake (EFA by default inside our base image).
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sglang-launcher-override
+  namespace: efa-validation
+data:
+  sglang-launcher.sh: |
+    #!/usr/bin/env bash
+    # Override launcher that understands ROLE=lb and ROLE=decode without PEER_HOST.
+    set -eu
+    ROLE="${ROLE:-baseline}"
+    MODEL_PATH="${MODEL_PATH:-/models/current}"
+    TP="${TP:-8}"
+    HOST="${HOST:-0.0.0.0}"
+    PORT="${PORT:-30000}"
+    KV_BACKEND="${KV_TRANSPORT_BACKEND:-mooncake}"
+    BOOTSTRAP_PORT="${BOOTSTRAP_PORT:-8998}"
+
+    TORCH_LIB=$(python3 -c 'import torch, os; print(os.path.join(os.path.dirname(torch.__file__), "lib"))')
+    export LD_LIBRARY_PATH="${TORCH_LIB}:${LD_LIBRARY_PATH:-}"
+
+    COMMON_ARGS=(
+      --model-path "${MODEL_PATH}"
+      --tp "${TP}"
+      --host "${HOST}"
+      --port "${PORT}"
+      --trust-remote-code
+      --mem-fraction-static 0.85
+    )
+
+    case "${ROLE}" in
+      baseline)
+        exec python3 -m sglang.launch_server "${COMMON_ARGS[@]}"
+        ;;
+      prefill)
+        exec python3 -m sglang.launch_server \
+          "${COMMON_ARGS[@]}" \
+          --disaggregation-mode prefill \
+          --disaggregation-transfer-backend "${KV_BACKEND}" \
+          --disaggregation-bootstrap-port "${BOOTSTRAP_PORT}"
+        ;;
+      decode)
+        exec python3 -m sglang.launch_server \
+          "${COMMON_ARGS[@]}" \
+          --disaggregation-mode decode \
+          --disaggregation-transfer-backend "${KV_BACKEND}" \
+          --disaggregation-bootstrap-port "${BOOTSTRAP_PORT}"
+        ;;
+      lb)
+        : "${PREFILL_URL:?need PREFILL_URL}"
+        : "${DECODE_URL:?need DECODE_URL}"
+        LB_PORT="${LB_PORT:-8000}"
+        exec python3 -m sglang.srt.disaggregation.launch_lb \
+          --prefill "${PREFILL_URL}" \
+          --decode "${DECODE_URL}" \
+          --host 0.0.0.0 \
+          --port "${LB_PORT}"
+        ;;
+      *)
+        echo "unknown ROLE=${ROLE}"; exit 2
+        ;;
+    esac
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sglang-prefill
+  namespace: efa-validation
+spec:
+  selector:
+    role: prefill
+    app: sglang-disagg
+  ports:
+    - name: http
+      port: 30000
+      targetPort: 30000
+    - name: bootstrap
+      port: 8998
+      targetPort: 8998
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sglang-decode
+  namespace: efa-validation
+spec:
+  selector:
+    role: decode
+    app: sglang-disagg
+  ports:
+    - name: http
+      port: 30000
+      targetPort: 30000
+    - name: bootstrap
+      port: 8998
+      targetPort: 8998
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sglang-lb
+  namespace: efa-validation
+spec:
+  selector:
+    app: sglang-disagg-lb
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sglang-prefill
+  namespace: efa-validation
+  labels: { app: sglang-disagg, role: prefill }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: sglang-disagg, role: prefill }
+  template:
+    metadata:
+      labels: { app: sglang-disagg, role: prefill }
+    spec:
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      nodeSelector:
+        node.kubernetes.io/instance-type: p5.48xlarge
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: sglang-disagg
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: server
+          image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/sglang-mooncake:v1
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: ROLE
+              value: "prefill"
+            - name: MODEL_PATH
+              value: "/models/current"
+            - name: TP
+              value: "8"
+            - name: PORT
+              value: "30000"
+            - name: BOOTSTRAP_PORT
+              value: "8998"
+            - name: KV_TRANSPORT_BACKEND
+              value: "mooncake"
+          command: ["/bin/bash", "-lc"]
+          args: ["exec /scripts/sglang-launcher.sh"]
+          readinessProbe:
+            httpGet: { path: /get_model_info, port: 30000 }
+            initialDelaySeconds: 60
+            periodSeconds: 5
+            failureThreshold: 120
+          ports:
+            - { containerPort: 30000, name: http }
+            - { containerPort: 8998, name: bootstrap }
+          securityContext:
+            capabilities: { add: [IPC_LOCK] }
+          resources:
+            limits:
+              nvidia.com/gpu: 8
+              vpc.amazonaws.com/efa: 32
+              hugepages-2Mi: 5120Mi
+              memory: 256Gi
+            requests:
+              nvidia.com/gpu: 8
+              vpc.amazonaws.com/efa: 32
+              hugepages-2Mi: 5120Mi
+              memory: 256Gi
+          volumeMounts:
+            - { name: models, mountPath: /models }
+            - { name: shm, mountPath: /dev/shm }
+            - { name: scripts, mountPath: /scripts }
+      volumes:
+        - name: models
+          hostPath:
+            path: /var/lib/efa-models
+            type: Directory
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: scripts
+          configMap:
+            name: sglang-launcher-override
+            defaultMode: 0755
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sglang-decode
+  namespace: efa-validation
+  labels: { app: sglang-disagg, role: decode }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: sglang-disagg, role: decode }
+  template:
+    metadata:
+      labels: { app: sglang-disagg, role: decode }
+    spec:
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      nodeSelector:
+        node.kubernetes.io/instance-type: p5.48xlarge
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: sglang-disagg
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: server
+          image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/sglang-mooncake:v1
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: ROLE
+              value: "decode"
+            - name: MODEL_PATH
+              value: "/models/current"
+            - name: TP
+              value: "8"
+            - name: PORT
+              value: "30000"
+            - name: BOOTSTRAP_PORT
+              value: "8998"
+            - name: KV_TRANSPORT_BACKEND
+              value: "mooncake"
+          command: ["/bin/bash", "-lc"]
+          args: ["exec /scripts/sglang-launcher.sh"]
+          readinessProbe:
+            httpGet: { path: /get_model_info, port: 30000 }
+            initialDelaySeconds: 60
+            periodSeconds: 5
+            failureThreshold: 120
+          ports:
+            - { containerPort: 30000, name: http }
+            - { containerPort: 8998, name: bootstrap }
+          securityContext:
+            capabilities: { add: [IPC_LOCK] }
+          resources:
+            limits:
+              nvidia.com/gpu: 8
+              vpc.amazonaws.com/efa: 32
+              hugepages-2Mi: 5120Mi
+              memory: 256Gi
+            requests:
+              nvidia.com/gpu: 8
+              vpc.amazonaws.com/efa: 32
+              hugepages-2Mi: 5120Mi
+              memory: 256Gi
+          volumeMounts:
+            - { name: models, mountPath: /models }
+            - { name: shm, mountPath: /dev/shm }
+            - { name: scripts, mountPath: /scripts }
+      volumes:
+        - name: models
+          hostPath:
+            path: /var/lib/efa-models
+            type: Directory
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: scripts
+          configMap:
+            name: sglang-launcher-override
+            defaultMode: 0755
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sglang-lb
+  namespace: efa-validation
+  labels: { app: sglang-disagg-lb }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: sglang-disagg-lb }
+  template:
+    metadata:
+      labels: { app: sglang-disagg-lb }
+    spec:
+      tolerations:
+        # The only available nodes in this ns carry the nvidia.com/gpu=true
+        # taint. Tolerate it so LB can run alongside GPU workloads — it uses
+        # no GPU resources.
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: lb
+          image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/sglang-mooncake:v1
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: ROLE
+              value: "lb"
+            - name: PREFILL_URL
+              value: "http://sglang-prefill.efa-validation.svc:30000"
+            - name: DECODE_URL
+              value: "http://sglang-decode.efa-validation.svc:30000"
+            - name: LB_PORT
+              value: "8000"
+          command: ["/bin/bash", "-lc"]
+          args: ["exec /scripts/sglang-launcher.sh"]
+          ports:
+            - { containerPort: 8000, name: http }
+          resources:
+            limits: { cpu: "4", memory: 8Gi }
+            requests: { cpu: "1", memory: 2Gi }
+          volumeMounts:
+            - { name: scripts, mountPath: /scripts }
+      volumes:
+        - name: scripts
+          configMap:
+            name: sglang-launcher-override
+            defaultMode: 0755

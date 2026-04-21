@@ -1,0 +1,76 @@
+# sglang.bench_serving client. Set TARGET_URL (baseline or lb) and DATASET.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sglang-bench-serving
+  namespace: efa-validation
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      nodeSelector:
+        node.kubernetes.io/instance-type: p5.48xlarge
+      containers:
+        - name: bench
+          image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/sglang-mooncake:v1
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: TARGET_HOST
+              value: "sglang-baseline.efa-validation.svc"
+            - name: TARGET_PORT
+              value: "30000"
+            - name: MODEL
+              value: "/models/current"
+            - name: NUM_PROMPTS
+              value: "128"
+            - name: DATASET_NAME
+              value: "random"
+            - name: RANDOM_INPUT_LEN
+              value: "1024"
+            - name: RANDOM_OUTPUT_LEN
+              value: "256"
+            - name: TOKENIZER
+              value: "/models/current"
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -eux
+              mkdir -p /results
+              # wait for server ready
+              for i in $(seq 1 120); do
+                CODE=$(curl -o /dev/null -s -w "%{http_code}" http://${TARGET_HOST}:${TARGET_PORT}/get_model_info 2>/dev/null || echo 000)
+                echo "wait server attempt=$i code=$CODE"
+                [ "$CODE" = "200" ] && break
+                sleep 5
+              done
+              python3 -m sglang.bench_serving \
+                --backend sglang \
+                --host "${TARGET_HOST}" --port "${TARGET_PORT}" \
+                --model "${MODEL}" \
+                --tokenizer "${TOKENIZER}" \
+                --num-prompts "${NUM_PROMPTS}" \
+                --dataset-name "${DATASET_NAME}" \
+                --random-input-len "${RANDOM_INPUT_LEN}" \
+                --random-output-len "${RANDOM_OUTPUT_LEN}" \
+                --output-file /results/bench.json \
+                2>&1 | tee /results/bench.log
+              echo "=== DONE ==="
+          volumeMounts:
+            - name: results
+              mountPath: /results
+            - name: models
+              mountPath: /models
+      volumes:
+        - name: results
+          emptyDir: {}
+        - name: models
+          hostPath:
+            path: /var/lib/efa-models
+            type: Directory

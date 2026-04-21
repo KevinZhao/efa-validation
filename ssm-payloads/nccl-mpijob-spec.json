@@ -1,0 +1,5 @@
+{
+  "commands": [
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get mpijob nccl-tests-efa -n efa-validation -o json 2>&1 | python3 -c \"import sys,json; m=json.load(sys.stdin); [print(\\\"role=\\\",k,\\\"container=\\\",c.get(\\\"name\\\"),\\\"cmd=\\\",c.get(\\\"command\\\"),\\\"args=\\\",c.get(\\\"args\\\")) for k,v in m[\\\"spec\\\"][\\\"mpiReplicaSpecs\\\"].items() for c in v[\\\"template\\\"][\\\"spec\\\"][\\\"containers\\\"]]\"'"
+  ]
+}

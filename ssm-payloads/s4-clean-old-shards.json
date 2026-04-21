@@ -1,0 +1,8 @@
+{
+  "commands": [
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete job model-prefetch -n efa-validation --ignore-not-found 2>&1'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete deploy sglang-baseline -n efa-validation --ignore-not-found 2>&1'",
+    "echo === inspect current model dir ===",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get nodes -l node.kubernetes.io/instance-type=p5.48xlarge -o name | head -1'"
+  ]
+}

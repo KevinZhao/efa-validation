@@ -1,0 +1,7 @@
+{
+  "commands": [
+    "sudo -iu ec2-user bash -lc 'aws s3 cp s3://efa-validation-<AWS_ACCOUNT_ID>/scripts/mpi-debug-inner.sh /tmp/mpi-debug-inner.sh && chmod +x /tmp/mpi-debug-inner.sh'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio cp /tmp/mpi-debug-inner.sh efa-validation/nccl-tests-efa-launcher-2tjrv:/tmp/mpi-debug-inner.sh'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio exec -n efa-validation nccl-tests-efa-launcher-2tjrv -- bash /tmp/mpi-debug-inner.sh 2>&1 | tail -100'"
+  ]
+}

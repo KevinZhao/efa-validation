@@ -1,0 +1,137 @@
+# =============================================================================
+# Stage 4 — 端到端发压 Job
+# 跑在非 GPU 节点（system 节点组），对 sglang-*-svc 发压，
+# 混合 ShareGPT + LongBench 负载，500+ 请求，记录 P50/P95/P99。
+#
+# 使用方式：
+#   1) 部署 baseline：  kubectl apply -f lws-baseline-tp8.yaml
+#      改 TARGET_SVC=sglang-baseline-svc，apply 本 Job，出基线数据
+#   2) 删 baseline，部署 prefill + decode
+#      改 TARGET_SVC=sglang-decode-svc，apply 本 Job，出 PD 分离数据
+#   3) 比对两组 TTFT / TPOT / OTPS / P50/P95/P99
+# =============================================================================
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sglang-bench-serving
+  namespace: efa-validation
+  labels:
+    app: sglang-bench
+    stage: stage4-e2e
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: sglang-bench
+    spec:
+      serviceAccountName: efa-runner
+      restartPolicy: Never
+      # 非 GPU 节点：回避 GPU taint，不容忍 nvidia.com/gpu=true:NoSchedule
+      nodeSelector:
+        # TODO: 确认 system 节点标签；若集群用 karpenter/不同名，改这里
+        node.kubernetes.io/instance-type: m7i.xlarge
+      containers:
+        - name: bench
+          image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/sglang-mooncake:v1
+          imagePullPolicy: IfNotPresent
+          env:
+            # ---- 目标 Service：切 baseline 或 PD ----
+            # TODO: 改这里在 sglang-baseline-svc / sglang-decode-svc 之间切换
+            - name: TARGET_SVC
+              value: "sglang-decode-svc"
+            - name: TARGET_PORT
+              value: "30000"
+            - name: MODEL
+              value: "<MODEL_ID>"
+            - name: NUM_PROMPTS
+              value: "500"
+            - name: REQUEST_RATE
+              # "inf" 表示尽可能快并发；也可改为 QPS 数字 (e.g. 8) 压稳态
+              value: "inf"
+            - name: MAX_CONCURRENCY
+              value: "64"
+            - name: RESULT_DIR
+              value: "/results"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: HF_HUB_ENABLE_HF_TRANSFER
+              value: "1"
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -euxo pipefail
+              TARGET_URL="http://${TARGET_SVC}.efa-validation.svc.cluster.local:${TARGET_PORT}"
+              mkdir -p "$RESULT_DIR"
+
+              # 健康检查：等服务起来
+              for i in $(seq 1 120); do
+                if curl -sf "${TARGET_URL}/health" >/dev/null; then
+                  echo "target ${TARGET_URL} healthy"; break
+                fi
+                echo "[$i] waiting for ${TARGET_URL}/health ..."; sleep 10
+                if [ "$i" = "120" ]; then echo "target never became healthy"; exit 1; fi
+              done
+
+              STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+              BASENAME="bench-${TARGET_SVC}-${STAMP}"
+
+              # ============================================================
+              # 1) ShareGPT 混合（short prompts, multi-turn conversations）
+              # ============================================================
+              echo "===== ShareGPT, ${NUM_PROMPTS} prompts ====="
+              python3 -m sglang.bench_serving \
+                --backend sglang \
+                --host "${TARGET_SVC}.efa-validation.svc.cluster.local" \
+                --port "${TARGET_PORT}" \
+                --model "${MODEL}" \
+                --dataset-name sharegpt \
+                --num-prompts "${NUM_PROMPTS}" \
+                --request-rate "${REQUEST_RATE}" \
+                --max-concurrency "${MAX_CONCURRENCY}" \
+                --output-file "${RESULT_DIR}/${BASENAME}-sharegpt.jsonl" \
+                2>&1 | tee "${RESULT_DIR}/${BASENAME}-sharegpt.log"
+
+              # ============================================================
+              # 2) LongBench-风格长 prompt（贴欧洲 MaaS agent 长上下文）
+              # ============================================================
+              echo "===== LongBench-style, ${NUM_PROMPTS} prompts ====="
+              # TODO: LongBench dataset 可能需要先下载到 /models/datasets
+              #       或改用 sglang 的 --dataset-name random / --random-input-len 32768
+              python3 -m sglang.bench_serving \
+                --backend sglang \
+                --host "${TARGET_SVC}.efa-validation.svc.cluster.local" \
+                --port "${TARGET_PORT}" \
+                --model "${MODEL}" \
+                --dataset-name random \
+                --random-input-len 8192 \
+                --random-output-len 512 \
+                --num-prompts "${NUM_PROMPTS}" \
+                --request-rate "${REQUEST_RATE}" \
+                --max-concurrency "${MAX_CONCURRENCY}" \
+                --output-file "${RESULT_DIR}/${BASENAME}-longbench.jsonl" \
+                2>&1 | tee "${RESULT_DIR}/${BASENAME}-longbench.log"
+
+              echo "===== SUMMARY (P50/P95/P99 from bench_serving stdout) ====="
+              grep -E "Median|P50|P95|P99|TTFT|TPOT|OTPS|Throughput" \
+                "${RESULT_DIR}/${BASENAME}-sharegpt.log" \
+                "${RESULT_DIR}/${BASENAME}-longbench.log" | tee "${RESULT_DIR}/${BASENAME}-summary.txt"
+
+              echo "===== DONE: ${BASENAME} ====="
+          resources:
+            limits:
+              cpu: "4"
+              memory: 8Gi
+            requests:
+              cpu: "2"
+              memory: 4Gi
+          volumeMounts:
+            - name: results
+              mountPath: /results
+      volumes:
+        # TODO: 阶段开始前换 PVC，便于数据落盘到集中位置做对比
+        - name: results
+          emptyDir:
+            sizeLimit: 10Gi

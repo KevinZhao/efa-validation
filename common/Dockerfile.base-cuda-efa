@@ -1,0 +1,85 @@
+# -----------------------------------------------------------------------------
+# Base image: CUDA 12.6 devel + EFA installer + libfabric + OpenMPI + NCCL + aws-ofi-nccl
+# Size target: ~8-10 GB (vs 40 GB if we started from nvcr.io/nvidia/pytorch)
+# Used as common base for: nccl-tests (stage 1), uccl-ep (stage 2),
+#   mooncake KV bench (stage 3), sglang-mooncake (stage 4).
+# -----------------------------------------------------------------------------
+FROM nvidia/cuda:12.6.2-cudnn-devel-ubuntu22.04
+
+ARG EFA_INSTALLER_VERSION=1.47.0
+ARG AWS_OFI_NCCL_VERSION=v1.19.0
+ARG NCCL_VERSION=v2.23.4-1
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    DEBCONF_NOWARNINGS=yes
+
+# ---- system deps (keep apt cache for EFA installer below) ----
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential autoconf automake libtool pkg-config \
+      curl wget git ca-certificates \
+      libnuma-dev hwloc libhwloc-dev \
+      openssh-server openssh-client net-tools iproute2 iputils-ping \
+      python3 python3-pip python3-dev jq \
+      libibverbs-dev rdma-core \
+      pciutils environment-modules tcl gnupg2 lsb-release
+
+# ---- EFA installer (userspace only; kmod comes from host) ----
+RUN cd /tmp && \
+    curl -fsSL https://efa-installer.amazonaws.com/aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz -o efa.tar.gz && \
+    tar -xzf efa.tar.gz && cd aws-efa-installer && \
+    ./efa_installer.sh -y --skip-kmod --skip-limit-conf --no-verify && \
+    ldconfig && \
+    cd / && rm -rf /tmp/aws-efa-installer /tmp/efa.tar.gz && \
+    rm -rf /var/lib/apt/lists/*
+
+# /opt/amazon/{efa,openmpi} now present. Use bundled OpenMPI.
+
+# ---- Build NCCL against container CUDA ----
+RUN git clone --depth 1 -b ${NCCL_VERSION} https://github.com/NVIDIA/nccl.git /opt/nccl && \
+    cd /opt/nccl && \
+    make -j$(nproc) src.build BUILDDIR=/opt/nccl/build \
+      NVCC_GENCODE="-gencode=arch=compute_90,code=sm_90" && \
+    cp -r /opt/nccl/build/include/* /usr/local/cuda/include/ && \
+    cp -r /opt/nccl/build/lib/* /usr/local/cuda/lib64/ && \
+    ldconfig
+
+# ---- aws-ofi-nccl plugin ----
+RUN git clone --depth 1 -b ${AWS_OFI_NCCL_VERSION} https://github.com/aws/aws-ofi-nccl.git /opt/aws-ofi-nccl-src && \
+    cd /opt/aws-ofi-nccl-src && \
+    ./autogen.sh && \
+    ./configure --prefix=/opt/aws-ofi-nccl \
+      --with-libfabric=/opt/amazon/efa \
+      --with-cuda=/usr/local/cuda \
+      --with-mpi=/opt/amazon/openmpi \
+      --enable-platform-aws && \
+    make -j$(nproc) && make install && \
+    ldconfig && \
+    rm -rf /opt/aws-ofi-nccl-src
+
+# ---- SSH for MPI (disable StrictModes so kubeflow projected keys work) ----
+RUN mkdir -p /var/run/sshd && \
+    sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config && \
+    sed -i 's/#StrictModes.*/StrictModes no/' /etc/ssh/sshd_config && \
+    grep -q '^StrictModes' /etc/ssh/sshd_config || echo 'StrictModes no' >> /etc/ssh/sshd_config && \
+    sed -i 's/#StrictHostKeyChecking.*/StrictHostKeyChecking no/' /etc/ssh/ssh_config && \
+    sed -i 's|#   StrictHostKeyChecking.*|    StrictHostKeyChecking no|' /etc/ssh/ssh_config && \
+    echo 'Host *' >> /etc/ssh/ssh_config && \
+    echo '    StrictHostKeyChecking no' >> /etc/ssh/ssh_config && \
+    echo '    UserKnownHostsFile /dev/null' >> /etc/ssh/ssh_config && \
+    echo '    IdentityFile /root/.ssh/id_rsa' >> /etc/ssh/ssh_config && \
+    echo '    Port 22' >> /etc/ssh/ssh_config && \
+    ssh-keygen -A
+
+ENV PATH="/opt/amazon/efa/bin:/opt/amazon/openmpi/bin:/usr/local/cuda/bin:${PATH}" \
+    LD_LIBRARY_PATH="/opt/amazon/efa/lib:/opt/amazon/openmpi/lib:/opt/aws-ofi-nccl/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH}" \
+    NCCL_NET_PLUGIN="/opt/aws-ofi-nccl/lib/libnccl-net.so" \
+    FI_PROVIDER="efa" \
+    FI_EFA_USE_DEVICE_RDMA="1" \
+    FI_EFA_FORK_SAFE="1" \
+    OMPI_ALLOW_RUN_AS_ROOT="1" \
+    OMPI_ALLOW_RUN_AS_ROOT_CONFIRM="1"
+
+WORKDIR /workspace
+CMD ["/bin/bash"]

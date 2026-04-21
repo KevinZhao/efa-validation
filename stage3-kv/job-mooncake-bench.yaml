@@ -1,0 +1,282 @@
+# -----------------------------------------------------------------------------
+# Stage 3 (KV over EFA) — Mooncake Transfer Engine cross-node put/get bench.
+#
+# Topology: 2 × p5.48xlarge (8 GPU + 32 EFA each), one Pod = target (server),
+# one Pod = initiator (client).
+# Sweep: 64KB, 1MB, 16MB, 256MB, 1GB payloads, write(=put) + read(=get).
+# Target: 8× EFA per node aggregate ~ 170 GB/s (gate >= 150 GB/s).
+#
+# We use MPIJob so we get the same SSH / hostfile plumbing as stage 1, but the
+# launcher drives the two roles (target / initiator) on the two workers by SSH.
+#
+# Pinned upstream: kvcache-ai/Mooncake @ v0.3.10.post1 (see
+# ../common/Dockerfile.mooncake-nixl). CLI flags in the command: block below are
+# the v0.3.10.post1 flags extracted from
+#   mooncake-transfer-engine/example/transfer_engine_bench.cpp
+# (gflags DEFINE_* declarations). Keep in sync when bumping MOONCAKE_REF.
+# -----------------------------------------------------------------------------
+apiVersion: kubeflow.org/v2beta1
+kind: MPIJob
+metadata:
+  name: mooncake-bench-efa
+  namespace: efa-validation
+  labels:
+    stage: stage3-kv
+    tool: mooncake
+spec:
+  slotsPerWorker: 8
+  runPolicy:
+    cleanPodPolicy: Running
+    ttlSecondsAfterFinished: 7200
+  sshAuthMountPath: /root/.ssh
+  mpiReplicaSpecs:
+    Launcher:
+      replicas: 1
+      template:
+        spec:
+          serviceAccountName: efa-runner
+          restartPolicy: Never
+          tolerations:
+            - key: nvidia.com/gpu
+              operator: Equal
+              value: "true"
+              effect: NoSchedule
+          nodeSelector:
+            node.kubernetes.io/instance-type: p5.48xlarge
+          containers:
+            - name: launcher
+              image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/mooncake-nixl:v1
+              imagePullPolicy: IfNotPresent
+              env: &commonEnv
+                - name: OMPI_ALLOW_RUN_AS_ROOT
+                  value: "1"
+                - name: OMPI_ALLOW_RUN_AS_ROOT_CONFIRM
+                  value: "1"
+                - name: FI_PROVIDER
+                  value: "efa"
+                - name: FI_EFA_USE_DEVICE_RDMA
+                  value: "1"
+                - name: FI_EFA_FORK_SAFE
+                  value: "1"
+                - name: FI_LOG_LEVEL
+                  value: "warn"
+                - name: NCCL_DEBUG
+                  value: "INFO"
+                - name: NCCL_NET_PLUGIN
+                  value: "/opt/aws-ofi-nccl/lib/libnccl-net.so"
+                - name: PATH
+                  value: "/opt/mooncake/install/bin:/opt/mooncake/build/mooncake-transfer-engine/example:/opt/nixl/bin:/opt/ucx/bin:/opt/amazon/efa/bin:/opt/amazon/openmpi/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin"
+                - name: LD_LIBRARY_PATH
+                  value: "/opt/mooncake/install/lib:/opt/mooncake/install/lib64:/opt/nixl/lib:/opt/nixl/lib64:/opt/ucx/lib:/opt/amazon/efa/lib:/opt/amazon/openmpi/lib:/opt/aws-ofi-nccl/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64:/usr/local/lib:/usr/lib"
+                # Mooncake Transfer Engine protocol selection. Official env vars
+                # per kvcache-ai.github.io/Mooncake/getting_started/supported-protocols.html:
+                - name: MOONCAKE_PROTOCOL
+                  value: "efa"
+                - name: MOONCAKE_DEVICE
+                  value: ""   # empty == use all EFA NICs auto-detected via libfabric
+                # Payload sweep (bytes).  64KB, 1MB, 16MB, 256MB, 1GB.
+                - name: PAYLOAD_BYTES
+                  value: "65536,1048576,16777216,268435456,1073741824"
+                # Mooncake bench uses a duration-driven loop; iterations flag does
+                # not exist on v0.3.10.post1. We sweep via --duration + --block_size.
+                - name: BENCH_DURATION
+                  value: "15"
+                - name: BATCH_SIZE
+                  value: "128"
+                # One submission thread per EFA NIC so the aggregate fan-out saturates 8× 400 Gbps.
+                - name: NUM_THREADS
+                  value: "8"
+              command:
+                - /bin/bash
+                - -lc
+                - |
+                  set -eux
+                  echo "===== mooncake-bench launcher ready ====="
+                  cat /etc/mpi/discover_hosts.sh || true
+
+                  # Wait for workers to appear (same pattern as stage 1).
+                  for i in $(seq 1 60); do
+                    NH=$(/etc/mpi/discover_hosts.sh 2>/dev/null | wc -l)
+                    HOSTS=$(/etc/mpi/discover_hosts.sh 2>/dev/null | paste -sd, -)
+                    echo "attempt=$i hosts_count=$NH hosts=$HOSTS"
+                    [ "$NH" -ge 2 ] && break
+                    sleep 5
+                  done
+                  if [ "$NH" -lt 2 ]; then
+                    echo "FATAL: workers not discovered after 5 minutes"
+                    exit 1
+                  fi
+
+                  SERVER_HOST=$(/etc/mpi/discover_hosts.sh | awk 'NR==1{print $1}')
+                  CLIENT_HOST=$(/etc/mpi/discover_hosts.sh | awk 'NR==2{print $1}')
+                  echo "SERVER_HOST=$SERVER_HOST CLIENT_HOST=$CLIENT_HOST"
+
+                  # Validate ssh connectivity (same as stage 1).
+                  for h in "$SERVER_HOST" "$CLIENT_HOST"; do
+                    for i in $(seq 1 30); do
+                      if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=2 "$h" hostname 2>/dev/null; then
+                        echo "ssh OK: $h"; break
+                      fi
+                      sleep 2
+                    done
+                  done
+
+                  LOG_DIR=/tmp
+                  STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+
+                  # --- sanity: EFA provider visible on both hosts ---
+                  for H in "$SERVER_HOST" "$CLIENT_HOST"; do
+                    ssh -o StrictHostKeyChecking=no "$H" \
+                      "/opt/amazon/efa/bin/fi_info -p efa -t FI_EP_RDM | head -n 8" \
+                      | tee -a "$LOG_DIR/mooncake-bench-${STAMP}.fi-info.log"
+                  done
+
+                  BENCH=/opt/mooncake/build/mooncake-transfer-engine/example/transfer_engine_bench
+                  if [ ! -x "$BENCH" ]; then
+                    BENCH=$(find /opt/mooncake/build -maxdepth 6 -type f -name 'transfer_engine_bench' -executable | head -n1)
+                  fi
+                  echo "BENCH=$BENCH"
+
+                  SERVER_LOG="$LOG_DIR/mooncake-bench-${STAMP}.server.log"
+                  CLIENT_LOG="$LOG_DIR/mooncake-bench-${STAMP}.client.log"
+                  SUMMARY="$LOG_DIR/mooncake-bench-${STAMP}.summary.log"
+
+                  # ---------------------------------------------------------------
+                  # Flags verified against v0.3.10.post1 transfer_engine_bench.cpp
+                  # (DEFINE_string / DEFINE_int32 / DEFINE_uint64):
+                  #   --mode={initiator,target}
+                  #   --protocol={rdma,efa,tcp,nvlink,nvlink_intra,hip,barex,ubshmem}
+                  #   --device_name=<NIC>                (empty for auto on EFA)
+                  #   --operation={read,write}           (read==get, write==put)
+                  #   --segment_id=<host>                (initiator only)
+                  #   --local_server_name=<host:port>    (target; defaults to hostname)
+                  #   --metadata_server=<etcd|P2PHANDSHAKE>
+                  #   --block_size=<bytes>               (per-request payload)
+                  #   --batch_size=<n>                   (requests per batch)
+                  #   --duration=<seconds>               (run time per config)
+                  #   --threads=<n>                      (submission threads)
+                  #   --use_vram=true|false --gpu_id=<n> (GPU memory source)
+                  #   --report_unit=GB --report_precision=2
+                  # ---------------------------------------------------------------
+
+                  echo "===== start target on $SERVER_HOST ====="
+                  ssh -o StrictHostKeyChecking=no "$SERVER_HOST" bash -lc "'
+                    set -eux
+                    export FI_PROVIDER=efa FI_EFA_USE_DEVICE_RDMA=1 FI_EFA_FORK_SAFE=1
+                    export MOONCAKE_PROTOCOL=efa MOONCAKE_DEVICE=\"\"
+                    nohup $BENCH \
+                      --mode=target \
+                      --protocol=efa \
+                      --device_name= \
+                      --metadata_server=P2PHANDSHAKE \
+                      --local_server_name=${SERVER_HOST}:12345 \
+                      --use_vram=true --gpu_id=0 \
+                      > /tmp/mooncake-server.log 2>&1 &
+                    echo \$! > /tmp/mooncake-server.pid
+                  '"
+                  sleep 5
+                  ssh -o StrictHostKeyChecking=no "$SERVER_HOST" "head -n 40 /tmp/mooncake-server.log" \
+                    | tee -a "$SERVER_LOG"
+
+                  echo "===== initiator sweep on $CLIENT_HOST ====="
+                  IFS=',' read -ra SIZES <<< "${PAYLOAD_BYTES}"
+                  for SZ in "${SIZES[@]}"; do
+                    for OP in write read; do  # write==put, read==get
+                      echo "===== payload=${SZ} op=${OP} =====" | tee -a "$SUMMARY"
+                      ssh -o StrictHostKeyChecking=no "$CLIENT_HOST" bash -lc "'
+                        set -eux
+                        export FI_PROVIDER=efa FI_EFA_USE_DEVICE_RDMA=1 FI_EFA_FORK_SAFE=1
+                        export MOONCAKE_PROTOCOL=efa MOONCAKE_DEVICE=\"\"
+                        $BENCH \
+                          --mode=initiator \
+                          --protocol=efa \
+                          --device_name= \
+                          --metadata_server=P2PHANDSHAKE \
+                          --segment_id=${SERVER_HOST}:12345 \
+                          --operation=${OP} \
+                          --block_size=${SZ} \
+                          --batch_size=${BATCH_SIZE} \
+                          --duration=${BENCH_DURATION} \
+                          --threads=${NUM_THREADS} \
+                          --use_vram=true --gpu_id=0 \
+                          --report_unit=GB --report_precision=2
+                      '" 2>&1 | tee -a "$CLIENT_LOG" | tee -a "$SUMMARY"
+                    done
+                  done
+
+                  echo "===== shutdown target ====="
+                  ssh -o StrictHostKeyChecking=no "$SERVER_HOST" \
+                    "kill \$(cat /tmp/mooncake-server.pid) || true; tail -n 200 /tmp/mooncake-server.log" \
+                    >> "$SERVER_LOG" 2>&1 || true
+
+                  echo "===== aggregate throughput summary ====="
+                  # transfer_engine_bench prints lines like:
+                  #   "Throughput: 172.41 GB/s" and "Latency: ... us"
+                  echo "---- GATE: payload=268435456 / 1073741824 aggregate bandwidth ----" | tee -a "$SUMMARY"
+                  grep -E 'Throughput|Bandwidth|Latency|avg|p50|p99|GB/s|us' "$CLIENT_LOG" \
+                    | tee -a "$SUMMARY"
+
+                  echo "===== DONE ====="
+                  echo "Logs:"
+                  ls -l "$LOG_DIR"/mooncake-bench-${STAMP}.*
+              resources:
+                limits:
+                  memory: 8Gi
+                  cpu: "2"
+                requests:
+                  memory: 4Gi
+                  cpu: "1"
+    Worker:
+      replicas: 2
+      template:
+        spec:
+          restartPolicy: OnFailure
+          hostNetwork: false
+          dnsPolicy: ClusterFirstWithHostNet
+          tolerations:
+            - key: nvidia.com/gpu
+              operator: Equal
+              value: "true"
+              effect: NoSchedule
+          nodeSelector:
+            node.kubernetes.io/instance-type: p5.48xlarge
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      training.kubeflow.org/job-name: mooncake-bench-efa
+                      training.kubeflow.org/job-role: worker
+                  topologyKey: kubernetes.io/hostname
+          containers:
+            - name: worker
+              image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/mooncake-nixl:v1
+              imagePullPolicy: IfNotPresent
+              env: *commonEnv
+              securityContext:
+                capabilities:
+                  add: [IPC_LOCK]
+              resources:
+                limits:
+                  nvidia.com/gpu: 8
+                  vpc.amazonaws.com/efa: 32
+                  hugepages-2Mi: 5120Mi
+                  memory: 256Gi
+                requests:
+                  nvidia.com/gpu: 8
+                  vpc.amazonaws.com/efa: 32
+                  hugepages-2Mi: 5120Mi
+                  memory: 256Gi
+              volumeMounts:
+                - name: shm
+                  mountPath: /dev/shm
+                - name: hugepage-2mi
+                  mountPath: /hugepages-2Mi
+          volumes:
+            - name: shm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 32Gi
+            - name: hugepage-2mi
+              emptyDir:
+                medium: HugePages-2Mi

@@ -1,0 +1,166 @@
+# =============================================================================
+# Stage 4 (a) — 对照基线：SGLang 单机 TP=8，不开 disaggregation
+# 1 LWS（size=1），独占 1 × p5.48xlarge。
+# 用途：给 PD 分离（形态 b）提供 TTFT / TPOT / OTPS 单机基线，
+#       SLA 判据 = 主路径 ≤ 该基线 × 1.3
+# =============================================================================
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: sglang-baseline-tp8
+  namespace: efa-validation
+  labels:
+    app: sglang
+    role: baseline
+    stage: stage4-e2e
+spec:
+  replicas: 1
+  leaderWorkerTemplate:
+    size: 1
+    restartPolicy: RecreateGroupOnPodRestart
+    leaderTemplate:
+      metadata:
+        labels:
+          app: sglang
+          role: baseline
+      spec:
+        serviceAccountName: efa-runner
+        restartPolicy: Never
+        terminationGracePeriodSeconds: 60
+        hostIPC: true
+        tolerations:
+          - key: nvidia.com/gpu
+            operator: Equal
+            value: "true"
+            effect: NoSchedule
+        containers:
+          - name: baseline
+            image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/sglang-mooncake:v1
+            imagePullPolicy: IfNotPresent
+            securityContext:
+              capabilities:
+                add: [IPC_LOCK]
+            ports:
+              - name: http
+                containerPort: 30000
+            env:
+              - name: MODEL
+                value: "<MODEL_ID>"
+              - name: TP_SIZE
+                value: "8"
+              # ---- EFA + NCCL + OMPI（baseline 单机仅需 NVLink，但保留一致以避免镜像差异）----
+              - name: FI_PROVIDER
+                value: "efa"
+              - name: FI_EFA_USE_DEVICE_RDMA
+                value: "1"
+              - name: FI_EFA_FORK_SAFE
+                value: "1"
+              - name: NCCL_NET_PLUGIN
+                value: "/opt/aws-ofi-nccl/lib/libnccl-net.so"
+              - name: NCCL_DEBUG
+                value: "WARN"
+              - name: NCCL_PROTO
+                value: "simple"
+              - name: NCCL_ALGO
+                value: "ring"
+              - name: NCCL_SOCKET_IFNAME
+                value: "eth0"
+              - name: OMPI_ALLOW_RUN_AS_ROOT
+                value: "1"
+              - name: OMPI_ALLOW_RUN_AS_ROOT_CONFIRM
+                value: "1"
+              - name: LD_LIBRARY_PATH
+                value: "/opt/mooncake/install/lib:/opt/amazon/efa/lib:/opt/amazon/openmpi/lib:/opt/aws-ofi-nccl/lib:/usr/local/cuda/lib64:/usr/local/lib:/usr/lib"
+              - name: PATH
+                value: "/opt/amazon/efa/bin:/opt/amazon/openmpi/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin"
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: HF_HUB_ENABLE_HF_TRANSFER
+                value: "1"
+            command:
+              - /bin/bash
+              - -lc
+              - |
+                set -euxo pipefail
+                nvidia-smi
+                echo "MODEL=$MODEL  TP=$TP_SIZE  (baseline, no disaggregation)"
+
+                python3 -m sglang.launch_server \
+                  --model-path "$MODEL" \
+                  --trust-remote-code \
+                  --host 0.0.0.0 \
+                  --port 30000 \
+                  --tp-size "$TP_SIZE" \
+                  --mem-fraction-static 0.85 \
+                  --enable-metrics \
+                  --log-level info \
+                  2>&1 | tee /results/baseline.log
+            resources:
+              limits:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 1Ti
+              requests:
+                nvidia.com/gpu: 8
+                vpc.amazonaws.com/efa: 32
+                hugepages-2Mi: 5120Mi
+                memory: 1Ti
+            readinessProbe:
+              httpGet:
+                path: /health
+                port: http
+              initialDelaySeconds: 180
+              periodSeconds: 10
+              failureThreshold: 60
+            livenessProbe:
+              httpGet:
+                path: /health
+                port: http
+              initialDelaySeconds: 600
+              periodSeconds: 30
+              failureThreshold: 5
+            volumeMounts:
+              - name: shm
+                mountPath: /dev/shm
+              - name: hugepage
+                mountPath: /hugepages-2Mi
+              - name: models
+                mountPath: /models
+              - name: results
+                mountPath: /results
+        volumes:
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 32Gi
+          - name: hugepage
+            emptyDir:
+              medium: HugePages-2Mi
+          # TODO: 阶段开始前换 FSx PVC（ReadWriteMany），预热 <MODEL_ID>
+          - name: models
+            emptyDir:
+              sizeLimit: 200Gi
+          # TODO: 阶段开始前换 PVC
+          - name: results
+            emptyDir:
+              sizeLimit: 50Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sglang-baseline-svc
+  namespace: efa-validation
+  labels:
+    app: sglang
+    role: baseline
+spec:
+  type: ClusterIP
+  selector:
+    app: sglang
+    role: baseline
+    leaderworkerset.sigs.k8s.io/worker-index: "0"
+  ports:
+    - name: http
+      port: 30000
+      targetPort: http

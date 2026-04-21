@@ -1,0 +1,25 @@
+# Local secrets and env
+.env
+.env.*.local
+*.local
+
+# Runtime logs / results — keep only templates/summaries in git
+logs/
+results/
+*.log
+*.cid
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Python/Node cache
+__pycache__/
+*.pyc
+node_modules/
+
+# kubeconfig
+kubeconfig
+*.kubeconfig

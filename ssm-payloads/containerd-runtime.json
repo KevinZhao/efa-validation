@@ -1,0 +1,11 @@
+{
+  "commands": [
+    "echo === /etc/containerd/config.toml default_runtime ===",
+    "grep -E -B1 -A5 'default_runtime_name|runtime_engine|nvidia' /etc/containerd/config.toml 2>&1 | head -40",
+    "echo === /etc/cdi (Container Device Interface) ===",
+    "ls -la /etc/cdi /var/run/cdi 2>&1 | head -20 || echo no-cdi",
+    "cat /etc/cdi/nvidia.yaml 2>&1 | head -20 || echo no-nvidia-cdi",
+    "echo === nvidia-container-toolkit config ===",
+    "cat /etc/nvidia-container-runtime/config.toml 2>&1 | head -30 || echo no-toolkit-config"
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "commands": [
+    "set -e",
+    "echo '=== install MPI Operator v0.6.0 ==='",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio apply --server-side -f https://raw.githubusercontent.com/kubeflow/mpi-operator/v0.6.0/deploy/v2beta1/mpi-operator.yaml 2>&1 | tail -20'",
+    "echo '=== install LeaderWorkerSet v0.7.0 ==='",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio apply --server-side -f https://github.com/kubernetes-sigs/lws/releases/download/v0.7.0/manifests.yaml 2>&1 | tail -20'",
+    "echo '=== wait 30s ==='",
+    "sleep 30",
+    "echo '=== mpi-operator pods ==='",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods -n mpi-operator 2>&1'",
+    "echo '=== lws pods ==='",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods -n lws-system 2>&1'",
+    "echo '=== CRDs ==='",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get crd | grep -E \"mpijobs|leaderworkerset\" 2>&1'"
+  ]
+}

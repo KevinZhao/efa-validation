@@ -1,0 +1,10 @@
+{
+  "commands": [
+    "sudo -iu ec2-user bash -lc 'aws s3 cp s3://efa-validation-<AWS_ACCOUNT_ID>/manifests/stage4/bench-serving.yaml /tmp/bench-serving.yaml --region us-east-2'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete job sglang-bench-serving -n efa-validation --ignore-not-found 2>&1'",
+    "sleep 3",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio apply -f /tmp/bench-serving.yaml 2>&1'",
+    "sleep 10",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods -n efa-validation | grep bench 2>&1'"
+  ]
+}

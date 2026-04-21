@@ -1,0 +1,12 @@
+{
+  "commands": [
+    "echo === nvidia-container-runtime config ===",
+    "cat /etc/nvidia-container-runtime/config.toml 2>&1 | head -50 || echo no-config",
+    "echo === /etc/cdi ===",
+    "ls /etc/cdi 2>&1",
+    "echo === /var/run/cdi ===",
+    "ls /var/run/cdi 2>&1",
+    "echo === journalctl containerd recent ===",
+    "journalctl -u containerd --since '10 min ago' --no-pager 2>&1 | grep -iE nvidia|cdi|device 2>&1 | tail -30"
+  ]
+}

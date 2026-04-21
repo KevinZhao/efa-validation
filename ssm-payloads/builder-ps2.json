@@ -1,0 +1,11 @@
+{
+  "commands": [
+    "ps -ef | grep -E 'docker build|docker push|mooncake|uccl' | grep -v grep || echo no_build",
+    "echo ---",
+    "ls -la /root/build/*/build.log 2>/dev/null | tail -6",
+    "echo ---mooncake tail---",
+    "tail -10 /root/build/mooncake-nixl-20260421T093111Z/build.log 2>&1 | head -10 || true",
+    "echo ---uccl-ep v2 tail---",
+    "tail -10 /root/build/uccl-ep-20260421T093923Z/build.log 2>&1 | head -10 || true"
+  ]
+}

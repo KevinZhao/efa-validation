@@ -1,0 +1,5 @@
+{
+  "commands": [
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio exec -n efa-validation uccl-ep-diag -- bash -lc \"TORCH_LIB=\\$(python3 -c \\\"import torch,os;print(os.path.dirname(torch.__file__)+\\\\\\\"/lib\\\\\\\")\\\"); echo TORCH_LIB=\\$TORCH_LIB; export LD_LIBRARY_PATH=\\$TORCH_LIB:\\$LD_LIBRARY_PATH; ls \\$TORCH_LIB | head -10; echo ===TRY uccl.ep===; python3 -c \\\"import uccl.ep as ep; print(\\\\\\\"uccl.ep OK\\\\\\\", ep.__file__)\\\" 2>&1; echo ===TRY deep_ep===; python3 -c \\\"import deep_ep; print(\\\\\\\"deep_ep OK\\\\\\\", deep_ep.__file__)\\\" 2>&1; echo ===ls tests===; ls /opt/uccl/ep/tests/ 2>&1 | head -5; ls /opt/deepep/tests/ 2>&1 | head -5\"'"
+  ]
+}

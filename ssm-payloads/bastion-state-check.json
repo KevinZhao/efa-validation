@@ -1,0 +1,13 @@
+{
+  "commands": [
+    "sudo -iu ec2-user bash -lc 'aws sts get-caller-identity 2>&1'",
+    "echo '--- workspace ---'",
+    "sudo -iu ec2-user bash -lc 'ls ~/workspace 2>&1'",
+    "echo '--- cluster-deployment ---'",
+    "sudo -iu ec2-user bash -lc 'ls ~/workspace/cluster-deployment 2>&1 | head -5'",
+    "echo '--- .env region/cluster ---'",
+    "sudo -iu ec2-user bash -lc 'grep -E \"^(CLUSTER_NAME|AWS_REGION|VPC_ID|GPU_)\" ~/workspace/cluster-deployment/.env 2>/dev/null | head -20'",
+    "echo '--- kubectl ---'",
+    "sudo -iu ec2-user bash -lc 'kubectl config current-context 2>&1; kubectl get nodes 2>&1'"
+  ]
+}

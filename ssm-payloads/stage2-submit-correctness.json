@@ -1,0 +1,10 @@
+{
+  "commands": [
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete mpijob -n efa-validation uccl-ep-correctness --ignore-not-found=true'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete configmap -n efa-validation uccl-ep-correctness-script --ignore-not-found=true'",
+    "sleep 3",
+    "sudo -iu ec2-user bash -lc 'aws s3 cp s3://efa-validation-<AWS_ACCOUNT_ID>/manifests/stage2-correctness.yaml /tmp/s2-corr.yaml && kubectl --context ohio apply -f /tmp/s2-corr.yaml'",
+    "sleep 10",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods -n efa-validation -o wide'"
+  ]
+}

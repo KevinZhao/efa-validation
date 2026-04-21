@@ -1,0 +1,9 @@
+{
+  "commands": [
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get nodes -o wide 2>&1'",
+    "echo === all pods on all nodes ===",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods --all-namespaces -o wide 2>&1 | grep -v kube-system | grep -v eks-utils'",
+    "echo === taints on 160 ===",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio describe node <GPU_NODE_0> 2>&1 | grep -A 5 Taints'"
+  ]
+}

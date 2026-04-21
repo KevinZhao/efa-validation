@@ -1,0 +1,7 @@
+{
+  "commands": [
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods -n efa-validation | grep bench-disagg'",
+    "echo === bench-disagg log ===",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n efa-validation -l job-name=sglang-bench-disagg --tail=120 2>&1 | tail -100'"
+  ]
+}

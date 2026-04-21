@@ -1,0 +1,13 @@
+{
+  "commands": [
+    "sudo -iu ec2-user bash -lc 'aws s3 cp s3://efa-validation-<AWS_ACCOUNT_ID>/manifests/stage4/clean-model-dir.yaml /tmp/clean-model-dir.yaml --region us-east-2'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete job model-prefetch -n efa-validation --ignore-not-found 2>&1'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete deploy sglang-baseline -n efa-validation --ignore-not-found 2>&1'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete svc sglang-baseline -n efa-validation --ignore-not-found 2>&1'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete job clean-model-dir -n efa-validation --ignore-not-found 2>&1'",
+    "sleep 3",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio apply -f /tmp/clean-model-dir.yaml 2>&1'",
+    "sleep 30",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n efa-validation -l job-name=clean-model-dir --tail=40 2>&1'"
+  ]
+}

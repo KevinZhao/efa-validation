@@ -1,0 +1,11 @@
+{
+  "commands": [
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods -n efa-validation --show-labels 2>&1 | grep uccl'",
+    "echo === get all pods any status ===",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods -n efa-validation -o wide 2>&1'",
+    "echo === launcher log by name ===",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n efa-validation uccl-ep-upstream-launcher-7v7w6 --tail=200 2>&1 > /tmp/s2.log; wc -l /tmp/s2.log; grep -i -E \"ALL PASSED|NON-DETERMINISM|PASSED|FAILED|Traceback|Error:|dispatch|combine|hash_details\" /tmp/s2.log | head -40'",
+    "echo === lines 1-200 ===",
+    "sudo -iu ec2-user bash -lc 'head -200 /tmp/s2.log'"
+  ]
+}

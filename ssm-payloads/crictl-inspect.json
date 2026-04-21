@@ -1,0 +1,9 @@
+{
+  "commands": [
+    "echo === container ===",
+    "crictl --runtime-endpoint unix:///run/containerd/containerd.sock ps 2>&1 | grep -i gpu-smoke 2>&1 | head -5 || true",
+    "CID=$(crictl --runtime-endpoint unix:///run/containerd/containerd.sock ps -q --name gpu-smoke-cdi 2>&1 | head -1)",
+    "echo container_id=$CID",
+    "test -n \"$CID\" && crictl --runtime-endpoint unix:///run/containerd/containerd.sock inspect $CID 2>&1 | python3 -c 'import sys,json; d=json.load(sys.stdin); info=d.get(\"info\",{}); print(\"runtimeType:\", info.get(\"runtimeType\")); print(\"runtimeOptions:\", json.dumps(info.get(\"runtimeOptions\",{}),indent=2)[:600]); cfg=d.get(\"status\",{}); print(\"mounts count:\", len(d.get(\"info\",{}).get(\"runtimeSpec\",{}).get(\"mounts\",[]))); print(\"devices:\", [x.get(\"path\") for x in d.get(\"info\",{}).get(\"runtimeSpec\",{}).get(\"linux\",{}).get(\"devices\",[])])'"
+  ]
+}

@@ -1,0 +1,48 @@
+# -----------------------------------------------------------------------------
+# Stage-4 image: SGLang + Mooncake (for PD 1P:1D disaggregation)
+#
+# Built on top of efa-validation/mooncake-nixl:v1 which already includes:
+#   - Mooncake v0.3.10.post1 (transfer_engine_bench, python package)
+#   - NIXL v1.0.1 (C++ libs, python binding)
+#   - EFA / libfabric / aws-ofi-nccl / OpenMPI / NCCL 2.23
+#   - PyTorch 2.5.1 cu124
+#
+# We only add sglang here so the build is thin.
+#
+# SGLang:
+#   - 0.4.5 is the pinned baseline (cu124 wheel, Python 3.10).
+#   - Starting 0.4.3 it exposes `--disaggregation-mode` CLI + Mooncake KV
+#     transfer backend, which aligns with production SGLang disaggregation deployments.
+# -----------------------------------------------------------------------------
+ARG BASE_IMAGE=<AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/mooncake-nixl:v1
+FROM ${BASE_IMAGE}
+
+ARG SGLANG_VERSION=0.4.10.post2
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir \
+      "sglang[all]==${SGLANG_VERSION}" \
+      hf_transfer orjson aiohttp uvloop psutil
+
+# Confirm install + dump disaggregation flags to build log.
+RUN python3 -c "import sglang as sgl; print('sglang', sgl.__version__)" && \
+    (python3 -m sglang.launch_server --help 2>&1 | grep -i -E "disaggregation|mooncake|kv" | head -40 || \
+      echo "NOTE: disaggregation flags not in this sglang version")
+
+# Mooncake python package already installed by base; confirm import.
+RUN python3 -c "import mooncake; print('mooncake import OK')"
+
+# Tiny wrapper: given env ROLE={prefill|decode|baseline}, launches sglang with
+# the appropriate CLI. Caller provides MODEL, TP, HOST, etc. via env.
+COPY sglang-launcher.sh /usr/local/bin/sglang-launcher.sh
+RUN chmod +x /usr/local/bin/sglang-launcher.sh
+
+ENV SGLANG_USE_CUDA_GRAPH=1 \
+    HF_HUB_ENABLE_HF_TRANSFER=1
+
+WORKDIR /workspace
+CMD ["/bin/bash"]

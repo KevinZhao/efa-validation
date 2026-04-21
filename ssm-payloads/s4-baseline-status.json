@@ -1,0 +1,7 @@
+{
+  "commands": [
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods -n efa-validation 2>&1 | grep sglang-baseline'",
+    "echo === baseline log tail ===",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n efa-validation -l app=sglang-baseline --tail=60 2>&1 | tail -60'"
+  ]
+}

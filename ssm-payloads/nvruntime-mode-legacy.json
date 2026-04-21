@@ -1,0 +1,14 @@
+{
+  "commands": [
+    "echo === before ===",
+    "grep -E '^mode' /etc/nvidia-container-runtime/config.toml",
+    "cp -a /etc/nvidia-container-runtime/config.toml /etc/nvidia-container-runtime/config.toml.bak.auto",
+    "sed -i 's/^mode = \"auto\"/mode = \"legacy\"/' /etc/nvidia-container-runtime/config.toml",
+    "echo === after ===",
+    "grep -E '^mode' /etc/nvidia-container-runtime/config.toml",
+    "echo === restart containerd ===",
+    "systemctl restart containerd && echo restarted_ok",
+    "sleep 5",
+    "systemctl is-active containerd"
+  ]
+}

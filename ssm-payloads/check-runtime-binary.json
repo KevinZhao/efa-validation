@@ -1,0 +1,8 @@
+{
+  "commands": [
+    "echo === test: launch minimal container via nerdctl with nvidia runtime ===",
+    "nerdctl --namespace k8s.io run --rm --runtime nvidia --gpus all nvidia/cuda:12.6.2-base-ubuntu22.04 nvidia-smi 2>&1 | head -20 || echo fail",
+    "echo === without runtime flag ===",
+    "nerdctl --namespace k8s.io run --rm --gpus all nvidia/cuda:12.6.2-base-ubuntu22.04 nvidia-smi 2>&1 | head -20 || echo fail"
+  ]
+}

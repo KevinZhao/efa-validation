@@ -1,0 +1,10 @@
+{
+  "commands": [
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete pod -n efa-validation gpu-smoke --ignore-not-found=true --force --grace-period=0 2>&1 | tail -3'",
+    "sleep 3",
+    "sudo -iu ec2-user bash -lc 'aws s3 cp s3://efa-validation-<AWS_ACCOUNT_ID>/manifests/gpu-smoke.yaml /tmp/gpu-smoke.yaml && kubectl --context ohio apply -f /tmp/gpu-smoke.yaml'",
+    "sleep 30",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pod -n efa-validation gpu-smoke -o wide'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n efa-validation gpu-smoke 2>&1 | tail -40'"
+  ]
+}

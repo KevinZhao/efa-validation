@@ -1,0 +1,5 @@
+{
+  "commands": [
+    "sudo -iu ec2-user bash -lc 'for n in <GPU_NODE_0> <GPU_NODE_1>; do echo \"=== $n ===\"; kubectl --context ohio describe node $n | grep -E \"nvidia.com/gpu|vpc.amazonaws.com/efa|Allocatable|Capacity|hugepages|cpu:|memory:|efa-bolt\" | head -20; done'"
+  ]
+}

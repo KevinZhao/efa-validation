@@ -1,0 +1,5 @@
+{
+  "commands": [
+    "grep -B 2 -A 30 'ERROR\\|failed\\|fatal' /root/build/mooncake-nixl-20260421T093111Z/build.log 2>/dev/null | tail -80"
+  ]
+}

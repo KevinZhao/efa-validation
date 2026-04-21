@@ -1,0 +1,311 @@
+# -----------------------------------------------------------------------------
+# Stage 3 (KV over EFA) — NIXL cross-node put/get bench (fallback / 对照).
+#
+# Same topology as the Mooncake job:
+#   2 × p5.48xlarge (8 GPU + 32 EFA each), one "initiator" Pod, one "target" Pod.
+# Payload sweep is identical to job-mooncake-bench.yaml so the two runs produce
+# an apples-to-apples comparison for the "which KV plane do we ship in the EU
+# MaaS" decision.
+#
+# Pinned upstream: ai-dynamo/nixl @ v1.0.1 (see ../common/Dockerfile.mooncake-nixl).
+# CLI flags in the command: block come from v1.0.1 benchmark/nixlbench/README.md
+# and are grouped as:
+#   --backend LIBFABRIC        (routes through src/plugins/libfabric + FI_PROVIDER=efa)
+#   --runtime_type ETCD --etcd_endpoints http://<launcher>:2379
+#   --op_type {READ,WRITE}     --scheme pairwise
+#   --initiator_seg_type VRAM --target_seg_type VRAM
+#   --start_block_size <bytes> --max_block_size <bytes>  (fixed per sweep point)
+#   --num_iter / --warmup_iter / --num_threads
+#   --num_initiator_dev / --num_target_dev  (EFA NICs per role)
+#
+# nixlbench coordinates workers via ETCD (no manual target/initiator flag); we
+# launch etcd in the launcher pod and point both workers there.
+# -----------------------------------------------------------------------------
+apiVersion: kubeflow.org/v2beta1
+kind: MPIJob
+metadata:
+  name: nixl-bench-efa
+  namespace: efa-validation
+  labels:
+    stage: stage3-kv
+    tool: nixl
+spec:
+  slotsPerWorker: 8
+  runPolicy:
+    cleanPodPolicy: Running
+    ttlSecondsAfterFinished: 7200
+  sshAuthMountPath: /root/.ssh
+  mpiReplicaSpecs:
+    Launcher:
+      replicas: 1
+      template:
+        spec:
+          serviceAccountName: efa-runner
+          restartPolicy: Never
+          tolerations:
+            - key: nvidia.com/gpu
+              operator: Equal
+              value: "true"
+              effect: NoSchedule
+          nodeSelector:
+            node.kubernetes.io/instance-type: p5.48xlarge
+          containers:
+            - name: launcher
+              image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/mooncake-nixl:v1
+              imagePullPolicy: IfNotPresent
+              env: &commonEnv
+                - name: OMPI_ALLOW_RUN_AS_ROOT
+                  value: "1"
+                - name: OMPI_ALLOW_RUN_AS_ROOT_CONFIRM
+                  value: "1"
+                - name: FI_PROVIDER
+                  value: "efa"
+                - name: FI_EFA_USE_DEVICE_RDMA
+                  value: "1"
+                - name: FI_EFA_FORK_SAFE
+                  value: "1"
+                - name: FI_LOG_LEVEL
+                  value: "warn"
+                - name: NCCL_DEBUG
+                  value: "INFO"
+                - name: NCCL_NET_PLUGIN
+                  value: "/opt/aws-ofi-nccl/lib/libnccl-net.so"
+                - name: PATH
+                  value: "/opt/nixl/bin:/opt/mooncake/install/bin:/opt/ucx/bin:/opt/amazon/efa/bin:/opt/amazon/openmpi/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin"
+                - name: LD_LIBRARY_PATH
+                  value: "/opt/nixl/lib:/opt/nixl/lib64:/opt/mooncake/install/lib:/opt/mooncake/install/lib64:/opt/ucx/lib:/opt/amazon/efa/lib:/opt/amazon/openmpi/lib:/opt/aws-ofi-nccl/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64:/usr/local/lib:/usr/lib"
+                # NIXL plugin path + backend pin.
+                - name: NIXL_PLUGIN_DIR
+                  value: "/opt/nixl/lib/plugins"
+                # Payload sweep must match job-mooncake-bench.yaml exactly.
+                - name: PAYLOAD_BYTES
+                  value: "65536,1048576,16777216,268435456,1073741824"
+                - name: NUM_ITER
+                  value: "200"
+                - name: WARMUP_ITER
+                  value: "20"
+                - name: NUM_THREADS
+                  value: "8"
+                - name: NUM_DEVICES
+                  value: "8"
+                - name: ETCD_PORT
+                  value: "2379"
+              command:
+                - /bin/bash
+                - -lc
+                - |
+                  set -eux
+                  echo "===== nixl-bench launcher ready ====="
+                  cat /etc/mpi/discover_hosts.sh || true
+
+                  # Wait for workers (stage 1 pattern).
+                  for i in $(seq 1 60); do
+                    NH=$(/etc/mpi/discover_hosts.sh 2>/dev/null | wc -l)
+                    HOSTS=$(/etc/mpi/discover_hosts.sh 2>/dev/null | paste -sd, -)
+                    echo "attempt=$i hosts_count=$NH hosts=$HOSTS"
+                    [ "$NH" -ge 2 ] && break
+                    sleep 5
+                  done
+                  if [ "$NH" -lt 2 ]; then
+                    echo "FATAL: workers not discovered after 5 minutes"
+                    exit 1
+                  fi
+
+                  INITIATOR_HOST=$(/etc/mpi/discover_hosts.sh | awk 'NR==1{print $1}')
+                  TARGET_HOST=$(/etc/mpi/discover_hosts.sh | awk 'NR==2{print $1}')
+                  LAUNCHER_IP=$(hostname -i | awk '{print $1}')
+                  echo "INITIATOR_HOST=$INITIATOR_HOST TARGET_HOST=$TARGET_HOST LAUNCHER_IP=$LAUNCHER_IP"
+
+                  # Validate ssh connectivity.
+                  for h in "$INITIATOR_HOST" "$TARGET_HOST"; do
+                    for i in $(seq 1 30); do
+                      if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=2 "$h" hostname 2>/dev/null; then
+                        echo "ssh OK: $h"; break
+                      fi
+                      sleep 2
+                    done
+                  done
+
+                  LOG_DIR=/tmp
+                  STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+
+                  # --- sanity: EFA provider + NIXL plugins on both hosts ---
+                  for H in "$INITIATOR_HOST" "$TARGET_HOST"; do
+                    ssh -o StrictHostKeyChecking=no "$H" \
+                      "/opt/amazon/efa/bin/fi_info -p efa -t FI_EP_RDM | head -n 8 && \
+                       ls /opt/nixl/lib/plugins/" \
+                      | tee -a "$LOG_DIR/nixl-bench-${STAMP}.env.log"
+                  done
+
+                  BENCH=/opt/nixl/bin/nixlbench
+                  if [ ! -x "$BENCH" ]; then
+                    BENCH=$(find /opt/nixl -maxdepth 6 -type f -name 'nixlbench' -executable | head -n1)
+                  fi
+                  echo "BENCH=$BENCH"
+
+                  # ---------------------------------------------------------------
+                  # Start a local etcd in the launcher pod. nixlbench workers
+                  # coordinate ranks through this endpoint.
+                  # The mooncake-nixl image ships `etcd` via dependencies.sh (go-based).
+                  # If etcd is missing, fall back to the standalone release binary.
+                  # ---------------------------------------------------------------
+                  if ! command -v etcd >/dev/null; then
+                    echo "etcd not on PATH; pulling standalone binary"
+                    ETCD_VER=v3.5.13
+                    curl -L "https://github.com/etcd-io/etcd/releases/download/${ETCD_VER}/etcd-${ETCD_VER}-linux-$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" \
+                      -o /tmp/etcd.tgz
+                    tar -xzf /tmp/etcd.tgz -C /tmp
+                    export PATH="$(ls -d /tmp/etcd-${ETCD_VER}-linux-*):${PATH}"
+                  fi
+                  ETCD_ENDPOINT="http://${LAUNCHER_IP}:${ETCD_PORT}"
+                  echo "ETCD_ENDPOINT=$ETCD_ENDPOINT"
+                  nohup etcd \
+                    --listen-client-urls "http://0.0.0.0:${ETCD_PORT}" \
+                    --advertise-client-urls "${ETCD_ENDPOINT}" \
+                    --data-dir /tmp/etcd-data \
+                    > /tmp/etcd.log 2>&1 &
+                  ETCD_PID=$!
+                  echo "$ETCD_PID" > /tmp/etcd.pid
+
+                  # Wait for etcd readiness.
+                  for i in $(seq 1 30); do
+                    if curl -sf "${ETCD_ENDPOINT}/health" >/dev/null; then
+                      echo "etcd ready after ${i}s"; break
+                    fi
+                    sleep 1
+                  done
+
+                  INITIATOR_LOG="$LOG_DIR/nixl-bench-${STAMP}.initiator.log"
+                  TARGET_LOG="$LOG_DIR/nixl-bench-${STAMP}.target.log"
+                  SUMMARY="$LOG_DIR/nixl-bench-${STAMP}.summary.log"
+
+                  # ---------------------------------------------------------------
+                  # nixlbench sweep. For each payload point we:
+                  #   1) start nixlbench on the target host (background)
+                  #   2) start nixlbench on the initiator host (foreground)
+                  #   3) wait for initiator to exit, then reap target
+                  # Both processes coordinate via the launcher's etcd.
+                  # ---------------------------------------------------------------
+                  IFS=',' read -ra SIZES <<< "${PAYLOAD_BYTES}"
+                  for SZ in "${SIZES[@]}"; do
+                    for OP in WRITE READ; do   # WRITE==put, READ==get
+                      echo "===== payload=${SZ} op=${OP} =====" | tee -a "$SUMMARY"
+
+                      # Per-run ETCD namespace avoids stale rendezvous state.
+                      BENCH_GROUP="stage3-${STAMP}-${SZ}-${OP}"
+
+                      COMMON_ARGS=(
+                        --backend LIBFABRIC
+                        --runtime_type ETCD
+                        --etcd_endpoints "${ETCD_ENDPOINT}"
+                        --benchmark_group "${BENCH_GROUP}"
+                        --scheme pairwise
+                        --op_type "${OP}"
+                        --initiator_seg_type VRAM
+                        --target_seg_type VRAM
+                        --start_block_size "${SZ}"
+                        --max_block_size "${SZ}"
+                        --num_iter "${NUM_ITER}"
+                        --warmup_iter "${WARMUP_ITER}"
+                        --num_threads "${NUM_THREADS}"
+                        --num_initiator_dev "${NUM_DEVICES}"
+                        --num_target_dev "${NUM_DEVICES}"
+                      )
+
+                      echo "----- target on $TARGET_HOST -----"
+                      ssh -o StrictHostKeyChecking=no "$TARGET_HOST" bash -lc "'
+                        set -eux
+                        export FI_PROVIDER=efa FI_EFA_USE_DEVICE_RDMA=1 FI_EFA_FORK_SAFE=1
+                        export NIXL_PLUGIN_DIR=/opt/nixl/lib/plugins
+                        nohup $BENCH ${COMMON_ARGS[*]} \
+                          > /tmp/nixl-target-${SZ}-${OP}.log 2>&1 &
+                        echo \$! > /tmp/nixl-target.pid
+                      '"
+                      sleep 3
+
+                      echo "----- initiator on $INITIATOR_HOST -----"
+                      ssh -o StrictHostKeyChecking=no "$INITIATOR_HOST" bash -lc "'
+                        set -eux
+                        export FI_PROVIDER=efa FI_EFA_USE_DEVICE_RDMA=1 FI_EFA_FORK_SAFE=1
+                        export NIXL_PLUGIN_DIR=/opt/nixl/lib/plugins
+                        $BENCH ${COMMON_ARGS[*]}
+                      '" 2>&1 | tee -a "$INITIATOR_LOG" | tee -a "$SUMMARY"
+
+                      # Reap target for this payload point.
+                      ssh -o StrictHostKeyChecking=no "$TARGET_HOST" \
+                        "kill \$(cat /tmp/nixl-target.pid) 2>/dev/null || true; \
+                         tail -n 80 /tmp/nixl-target-${SZ}-${OP}.log" \
+                        >> "$TARGET_LOG" 2>&1 || true
+                    done
+                  done
+
+                  echo "===== shutdown etcd ====="
+                  kill "$ETCD_PID" 2>/dev/null || true
+
+                  echo "===== aggregate throughput summary ====="
+                  grep -E 'Throughput|Bandwidth|Latency|avg|p50|p99|GB/s|us|MB/s' "$INITIATOR_LOG" \
+                    | tee -a "$SUMMARY"
+
+                  echo "===== DONE ====="
+                  ls -l "$LOG_DIR"/nixl-bench-${STAMP}.*
+              resources:
+                limits:
+                  memory: 8Gi
+                  cpu: "2"
+                requests:
+                  memory: 4Gi
+                  cpu: "1"
+    Worker:
+      replicas: 2
+      template:
+        spec:
+          restartPolicy: OnFailure
+          hostNetwork: false
+          dnsPolicy: ClusterFirstWithHostNet
+          tolerations:
+            - key: nvidia.com/gpu
+              operator: Equal
+              value: "true"
+              effect: NoSchedule
+          nodeSelector:
+            node.kubernetes.io/instance-type: p5.48xlarge
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      training.kubeflow.org/job-name: nixl-bench-efa
+                      training.kubeflow.org/job-role: worker
+                  topologyKey: kubernetes.io/hostname
+          containers:
+            - name: worker
+              image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/mooncake-nixl:v1
+              imagePullPolicy: IfNotPresent
+              env: *commonEnv
+              securityContext:
+                capabilities:
+                  add: [IPC_LOCK]
+              resources:
+                limits:
+                  nvidia.com/gpu: 8
+                  vpc.amazonaws.com/efa: 32
+                  hugepages-2Mi: 5120Mi
+                  memory: 256Gi
+                requests:
+                  nvidia.com/gpu: 8
+                  vpc.amazonaws.com/efa: 32
+                  hugepages-2Mi: 5120Mi
+                  memory: 256Gi
+              volumeMounts:
+                - name: shm
+                  mountPath: /dev/shm
+                - name: hugepage-2mi
+                  mountPath: /hugepages-2Mi
+          volumes:
+            - name: shm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 32Gi
+            - name: hugepage-2mi
+              emptyDir:
+                medium: HugePages-2Mi

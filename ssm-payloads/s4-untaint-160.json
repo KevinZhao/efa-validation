@@ -1,0 +1,7 @@
+{
+  "commands": [
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio taint nodes <GPU_NODE_0> node.kubernetes.io/disk-pressure:NoSchedule- 2>&1 || echo taint already gone'",
+    "sleep 10",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods -n efa-validation -o wide 2>&1 | grep -E \"prefetch|NAME\"'"
+  ]
+}

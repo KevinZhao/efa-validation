@@ -1,0 +1,7 @@
+{
+  "commands": [
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n efa-validation -l job-name=sglang-bench-serving > /tmp/s4-baseline-bench.log 2>&1; wc -l /tmp/s4-baseline-bench.log'",
+    "sudo -iu ec2-user bash -lc 'aws s3 cp /tmp/s4-baseline-bench.log s3://efa-validation-<AWS_ACCOUNT_ID>/logs/s4-baseline-bench.log --region us-east-2'",
+    "sudo -iu ec2-user bash -lc 'POD=$(kubectl --context ohio get pod -n efa-validation -l job-name=sglang-bench-serving -o jsonpath=\"{.items[0].metadata.name}\"); kubectl --context ohio cp -n efa-validation $POD:/results/bench.json /tmp/s4-baseline-bench.json 2>&1; aws s3 cp /tmp/s4-baseline-bench.json s3://efa-validation-<AWS_ACCOUNT_ID>/logs/s4-baseline-bench.json --region us-east-2 2>&1 || true'"
+  ]
+}

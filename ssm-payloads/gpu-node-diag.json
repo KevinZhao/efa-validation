@@ -1,0 +1,15 @@
+{
+  "commands": [
+    "echo === containerd config ===",
+    "grep -E -A3 'nvidia|default_runtime_name|runtime_engine' /etc/containerd/config.toml 2>&1 | head -30 || true",
+    "echo === nvidia-container-runtime ===",
+    "which nvidia-container-runtime nvidia-container-runtime-hook nvidia-container-cli 2>&1",
+    "nvidia-container-runtime --version 2>&1 | head -3 || echo missing",
+    "echo === driver ===",
+    "nvidia-smi 2>&1 | head -10 || echo missing_nvidia_smi",
+    "echo === device-plugin ds labels ===",
+    "ls /dev/nvidia* 2>&1",
+    "echo === runtime-class ===",
+    "crictl --runtime-endpoint unix:///run/containerd/containerd.sock info 2>&1 | grep -E runtime | head -10 || true"
+  ]
+}

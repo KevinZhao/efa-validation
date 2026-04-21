@@ -1,0 +1,11 @@
+{
+  "commands": [
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete pod -n efa-validation gpu-smoke --force --grace-period=0 --ignore-not-found=true 2>&1 | tail -2'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete mpijob -n efa-validation nccl-tests-efa --ignore-not-found=true'",
+    "sleep 5",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get nodes -l workload-type=gpu -o custom-columns=NAME:.metadata.name,GPU:.status.allocatable.nvidia\\\\.com/gpu,EFA:.status.allocatable.vpc\\\\.amazonaws\\\\.com/efa'",
+    "sudo -iu ec2-user bash -lc 'aws s3 cp s3://efa-validation-<AWS_ACCOUNT_ID>/manifests/stage1-mpijob-nccl-tests.yaml /tmp/stage1-mpi.yaml && kubectl --context ohio apply -f /tmp/stage1-mpi.yaml'",
+    "sleep 8",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods -n efa-validation -o wide'"
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "commands": [
+    "ls -la /root/build/nccl-tests-20260421T050013Z/ 2>&1 | head -5",
+    "ps -ef | grep 'docker build\\|docker push' | grep -v grep || echo 'no docker running'",
+    "echo --- grep BUILD_DONE ---",
+    "grep -c BUILD_DONE /root/build/nccl-tests-20260421T050013Z/build.log 2>/dev/null || echo 0",
+    "echo --- last 30 lines ---",
+    "tail -30 /root/build/nccl-tests-20260421T050013Z/build.log 2>&1 || true"
+  ]
+}

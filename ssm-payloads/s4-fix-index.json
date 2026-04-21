@@ -1,0 +1,11 @@
+{
+  "commands": [
+    "sudo -iu ec2-user bash -lc 'aws s3 cp s3://efa-validation-<AWS_ACCOUNT_ID>/manifests/stage4/model-prefetch.yaml /tmp/model-prefetch.yaml --region us-east-2'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete job model-prefetch -n efa-validation --ignore-not-found --grace-period=0 --force 2>&1 || true'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete deploy sglang-baseline -n efa-validation --ignore-not-found 2>&1 || true'",
+    "sleep 10",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio apply -f /tmp/model-prefetch.yaml 2>&1'",
+    "sleep 10",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods -n efa-validation -o wide | grep prefetch'"
+  ]
+}

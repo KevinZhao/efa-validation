@@ -1,0 +1,5 @@
+{
+  "commands": [
+    "tail -150 /root/build/uccl-ep-20260421T091610Z/build.log 2>&1"
+  ]
+}

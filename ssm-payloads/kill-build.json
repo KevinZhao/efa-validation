@@ -1,0 +1,14 @@
+{
+  "commands": [
+    "echo '=== killing docker build + nohup wrappers ==='",
+    "pkill -9 -f 'docker build' 2>&1 || true",
+    "pkill -9 -f 'nohup bash' 2>&1 || true",
+    "sleep 2",
+    "ps -ef | grep -E 'docker build|nohup bash' | grep -v grep || echo 'no build running'",
+    "echo '=== clean prior layers ==='",
+    "docker system prune -af 2>&1 | tail -5 || true",
+    "echo '=== stats ==='",
+    "df -h /var/lib/docker 2>&1 || df -h /",
+    "rm -f /root/build/build.log"
+  ]
+}

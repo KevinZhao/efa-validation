@@ -1,0 +1,7 @@
+{
+  "commands": [
+    "ps -ef | grep -E 'docker build|docker push|mooncake' | grep -v grep || echo no docker",
+    "echo ---",
+    "ls -la /root/build/mooncake* 2>&1 | tail -5"
+  ]
+}

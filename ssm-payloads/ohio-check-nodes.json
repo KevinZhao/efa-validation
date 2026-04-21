@@ -1,0 +1,11 @@
+{
+  "commands": [
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get nodes -o wide 2>&1'",
+    "echo '--- gpu nodes ---'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get nodes -l node.kubernetes.io/instance-type=p5.48xlarge -o wide 2>&1'",
+    "echo '--- daemonsets kube-system ---'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get ds -n kube-system 2>&1'",
+    "echo '--- all namespaces workloads ---'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods -A 2>&1 | head -40'"
+  ]
+}

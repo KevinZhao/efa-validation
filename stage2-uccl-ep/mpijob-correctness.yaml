@@ -1,0 +1,401 @@
+# -----------------------------------------------------------------------------
+# Stage 2.0 - Correctness smoke: UCCL-EP on EFA vs DeepEP (NCCL-EP reference)
+# on EFA. Fixed seed / routing / token distribution; runs dispatch+combine with
+# both backends, compares output tensors element-wise (fp16 target max_abs_diff
+# ~1e-3).
+#
+# Confirmed upstream facts (baked in, no more TODOs):
+#   - Python modules: `uccl.ep` (not `uccl_ep`) and `deep_ep`
+#   - DeepEP & UCCL-EP expose the same API:
+#       buffer = <mod>.Buffer(group, num_nvl_bytes, num_rdma_bytes,
+#                             low_latency_mode=True, num_qps_per_rank=...)
+#       recv_x, recv_count, handle, event, hook = buffer.low_latency_dispatch(
+#           x, topk_idx, num_max_dispatch_tokens_per_rank, num_experts,
+#           use_fp8=False, async_finish=False, return_recv_hook=False)
+#       combined_x, event, hook = buffer.low_latency_combine(
+#           recv_x, topk_idx, topk_weights, handle)
+#
+# Structure (tolerations, anti-affinity, nodeSelector on launcher, hostfile
+# wait loop + ssh validation, FQDN / eth0 MCA flags) mirrors the proven
+# stage1-nccl-tests template.
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: uccl-ep-correctness-script
+  namespace: efa-validation
+data:
+  compare_ep.py: |
+    #!/usr/bin/env python3
+    """
+    Run fixed-seed low_latency dispatch+combine with a chosen EP backend
+    (uccl.ep or deep_ep), save the combined output tensor to disk. Launched
+    twice by the launcher (once per backend), then compare_tensors.py diffs
+    the two saved .pt files.
+    """
+    import argparse
+    import os
+    import sys
+    import torch
+    import torch.distributed as dist
+
+    def parse_args():
+        p = argparse.ArgumentParser()
+        p.add_argument("--backend", required=True, choices=["uccl", "nccl"])
+        p.add_argument("--hidden", type=int, default=7168)
+        p.add_argument("--num-tokens", type=int, default=16)
+        p.add_argument("--num-experts", type=int, default=256)
+        p.add_argument("--topk", type=int, default=8)
+        p.add_argument("--seed", type=int, default=42)
+        p.add_argument("--out", required=True, help="output .pt path (rank 0 only)")
+        return p.parse_args()
+
+    def init_dist():
+        # mpirun launches us without RANK/WORLD_SIZE/MASTER_* env vars, so we
+        # translate from OMPI_COMM_WORLD_*. MASTER comes from the first entry
+        # of the hostfile (set via env var MASTER_HOST by the launcher).
+        rank = int(os.environ.get("OMPI_COMM_WORLD_RANK", os.environ.get("PMI_RANK", "0")))
+        world = int(os.environ.get("OMPI_COMM_WORLD_SIZE", os.environ.get("PMI_SIZE", "1")))
+        local_rank = int(os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK", str(rank % 8)))
+        os.environ["RANK"] = str(rank)
+        os.environ["WORLD_SIZE"] = str(world)
+        os.environ["LOCAL_RANK"] = str(local_rank)
+        os.environ.setdefault("MASTER_ADDR", os.environ.get("MASTER_HOST", "127.0.0.1"))
+        os.environ.setdefault("MASTER_PORT", "29500")
+        # nccl is fine as a meta process group for EP Buffer; EP kernels go over EFA/RDMA.
+        dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(local_rank)
+        return rank, world, local_rank
+
+    def make_inputs(args, device, rank):
+        # Same seed on every rank -> same x / routing. Good for correctness.
+        g = torch.Generator(device=device).manual_seed(args.seed)
+        x = torch.randn(args.num_tokens, args.hidden,
+                        device=device, dtype=torch.bfloat16, generator=g)
+        logits = torch.randn(args.num_tokens, args.num_experts,
+                             device=device, dtype=torch.float32, generator=g)
+        topk_weights_raw, topk_idx = torch.topk(logits, args.topk, dim=-1)
+        topk_weights = torch.softmax(topk_weights_raw, dim=-1).to(torch.float32)
+        topk_idx = topk_idx.to(torch.int64)
+        return x, topk_idx, topk_weights
+
+    def load_backend(name):
+        # uccl.ep and deep_ep expose the same Buffer / low_latency API surface.
+        if name == "uccl":
+            import uccl.ep as ep  # noqa: F401
+            return ep
+        # nccl-ep reference implementation = DeepEP.
+        import deep_ep as ep  # noqa: F401
+        return ep
+
+    def run_once(ep_mod, x, topk_idx, topk_weights, args, rank, world):
+        # Both modules expose Buffer with the same low_latency dispatch+combine API.
+        # Sizing follows DeepEP/UCCL-EP low-latency defaults:
+        #   num_max_dispatch_tokens_per_rank = num_tokens  (per this rank)
+        num_max_dispatch_tokens_per_rank = args.num_tokens
+        # Rough buffer sizes: NVL intra-node, RDMA inter-node. Values lifted
+        # from DeepEP low-latency tests (plenty for hidden=7168 / 16 tokens).
+        num_nvl_bytes = 1 << 30      # 1 GiB
+        num_rdma_bytes = 1 << 30     # 1 GiB
+
+        group = dist.group.WORLD
+        # Buffer kwargs vary slightly across versions; keep positional to match
+        # DeepEP's canonical signature which UCCL-EP mirrors.
+        buffer = ep_mod.Buffer(
+            group, num_nvl_bytes, num_rdma_bytes,
+            low_latency_mode=True,
+            num_qps_per_rank=1,
+        )
+
+        recv_x, recv_count, handle, event, hook = buffer.low_latency_dispatch(
+            x, topk_idx,
+            num_max_dispatch_tokens_per_rank,
+            args.num_experts,
+            use_fp8=False,
+            async_finish=False,
+            return_recv_hook=False,
+        )
+        combined_x, event, hook = buffer.low_latency_combine(
+            recv_x, topk_idx, topk_weights, handle,
+        )
+        torch.cuda.synchronize()
+        return combined_x
+
+    def main():
+        args = parse_args()
+        rank, world, local_rank = init_dist()
+        device = torch.device(f"cuda:{local_rank}")
+        x, topk_idx, topk_weights = make_inputs(args, device, rank)
+
+        ep_mod = load_backend(args.backend)
+        y = run_once(ep_mod, x, topk_idx, topk_weights, args, rank, world)
+
+        dist.barrier()
+        # Save rank-0 slice for deterministic compare. (Routing is identical
+        # across backends given fixed seed; rank-0 output is representative.)
+        if rank == 0:
+            os.makedirs(os.path.dirname(args.out), exist_ok=True)
+            torch.save({
+                "y": y.detach().to(torch.float32).cpu(),
+                "meta": vars(args),
+                "world": world,
+            }, args.out)
+            print(f"[rank0] backend={args.backend} saved {args.out} "
+                  f"shape={tuple(y.shape)} dtype={y.dtype}", flush=True)
+        dist.barrier()
+        dist.destroy_process_group()
+
+    if __name__ == "__main__":
+        main()
+
+  compare_tensors.py: |
+    #!/usr/bin/env python3
+    """Diff two saved tensors from compare_ep.py runs. PASS/FAIL to stdout."""
+    import sys, torch
+
+    a = torch.load(sys.argv[1], map_location="cpu")
+    b = torch.load(sys.argv[2], map_location="cpu")
+    ya, yb = a["y"].float(), b["y"].float()
+    assert ya.shape == yb.shape, f"shape mismatch {ya.shape} vs {yb.shape}"
+
+    diff = (ya - yb).abs()
+    max_abs = diff.max().item()
+    mean_abs = diff.mean().item()
+    denom = yb.abs().clamp_min(1e-6)
+    rel = (diff / denom).max().item()
+
+    print(f"shape={tuple(ya.shape)} "
+          f"max_abs_diff={max_abs:.3e} "
+          f"mean_abs_diff={mean_abs:.3e} "
+          f"max_rel_diff={rel:.3e}",
+          flush=True)
+
+    threshold = float(sys.argv[3]) if len(sys.argv) > 3 else 1e-3
+    if max_abs > threshold:
+        print(f"FAIL max_abs_diff {max_abs:.3e} > threshold {threshold:.3e}",
+              flush=True)
+        sys.exit(1)
+    print("PASS", flush=True)
+---
+apiVersion: kubeflow.org/v2beta1
+kind: MPIJob
+metadata:
+  name: uccl-ep-correctness
+  namespace: efa-validation
+spec:
+  slotsPerWorker: 8
+  runPolicy:
+    cleanPodPolicy: Running
+    ttlSecondsAfterFinished: 3600
+  sshAuthMountPath: /root/.ssh
+  mpiReplicaSpecs:
+    Launcher:
+      replicas: 1
+      template:
+        spec:
+          serviceAccountName: efa-runner
+          restartPolicy: Never
+          tolerations:
+            - key: nvidia.com/gpu
+              operator: Equal
+              value: "true"
+              effect: NoSchedule
+          nodeSelector:
+            node.kubernetes.io/instance-type: p5.48xlarge
+          containers:
+            - name: launcher
+              image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/uccl-ep:v2
+              imagePullPolicy: IfNotPresent
+              env: &commonEnv
+                - name: OMPI_ALLOW_RUN_AS_ROOT
+                  value: "1"
+                - name: OMPI_ALLOW_RUN_AS_ROOT_CONFIRM
+                  value: "1"
+                - name: NCCL_DEBUG
+                  value: "INFO"
+                - name: NCCL_DEBUG_SUBSYS
+                  value: "INIT,NET,ENV"
+                - name: FI_PROVIDER
+                  value: "efa"
+                - name: FI_EFA_USE_DEVICE_RDMA
+                  value: "1"
+                - name: FI_EFA_FORK_SAFE
+                  value: "1"
+                - name: NCCL_NET_PLUGIN
+                  value: "/opt/aws-ofi-nccl/lib/libnccl-net.so"
+                - name: PATH
+                  value: "/opt/amazon/efa/bin:/opt/amazon/openmpi/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin"
+                - name: LD_LIBRARY_PATH
+                  value: "/opt/amazon/efa/lib:/opt/amazon/openmpi/lib:/opt/aws-ofi-nccl/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64:/usr/local/lib:/usr/lib"
+                - name: PYTHONUNBUFFERED
+                  value: "1"
+                - name: OMP_NUM_THREADS
+                  value: "8"
+              command:
+                - /bin/bash
+                - -lc
+                - |
+                  set -eux
+                  echo "===== uccl-ep correctness launcher ready ====="
+
+                  # uccl-ep:v2 is built on base:v2 which already has the ssh_config
+                  # hardening (StrictModes no, IdentityFile, etc.) baked in.
+
+                  cat /etc/mpi/discover_hosts.sh || true
+
+                  # Wait for workers to appear in discover_hosts.sh
+                  for i in $(seq 1 60); do
+                    HOSTS=$(/etc/mpi/discover_hosts.sh 2>/dev/null | paste -sd, -)
+                    NH=$(/etc/mpi/discover_hosts.sh 2>/dev/null | wc -l)
+                    echo "attempt=$i hosts_count=$NH hosts=$HOSTS"
+                    [ "$NH" -ge 2 ] && break
+                    sleep 5
+                  done
+
+                  if [ "$NH" -lt 2 ]; then
+                    echo "FATAL: workers not discovered after 5 minutes"
+                    exit 1
+                  fi
+
+                  # Build hostfile with explicit slots=8
+                  HOSTFILE=/tmp/hostfile
+                  : > $HOSTFILE
+                  for h in $(/etc/mpi/discover_hosts.sh); do
+                    echo "$h slots=8" >> $HOSTFILE
+                  done
+                  echo "--- hostfile ---"
+                  cat $HOSTFILE
+
+                  # Validate ssh connectivity to each worker
+                  for h in $(/etc/mpi/discover_hosts.sh); do
+                    for i in $(seq 1 30); do
+                      if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=2 "$h" hostname 2>/dev/null; then
+                        echo "ssh OK: $h"
+                        break
+                      fi
+                      sleep 2
+                    done
+                  done
+
+                  MY_IP=$(hostname -i | awk '{print $1}')
+                  echo "launcher IP=$MY_IP"
+
+                  MASTER_HOST=$(head -1 "$HOSTFILE" | awk '{print $1}')
+                  export MASTER_HOST
+
+                  ENV_ARGS=(
+                    -x PATH -x LD_LIBRARY_PATH
+                    -x NCCL_DEBUG -x NCCL_DEBUG_SUBSYS
+                    -x FI_PROVIDER -x FI_EFA_USE_DEVICE_RDMA -x FI_EFA_FORK_SAFE
+                    -x NCCL_NET_PLUGIN
+                    -x PYTHONUNBUFFERED -x OMP_NUM_THREADS
+                    -x OMPI_ALLOW_RUN_AS_ROOT -x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM
+                    -x MASTER_HOST
+                  )
+
+                  MPI_COMMON=(
+                    --allow-run-as-root
+                    --hostfile "$HOSTFILE"
+                    -np 16 -N 8
+                    --mca pml ^ucx --mca btl ^openib
+                    --mca plm_rsh_no_tree_spawn 1
+                    --mca orte_keep_fqdn_hostnames 1
+                    --mca oob_tcp_if_include eth0
+                    --mca btl_tcp_if_include eth0
+                    --bind-to none
+                    "${ENV_ARGS[@]}"
+                  )
+
+                  mkdir -p /workspace/out
+
+                  echo "===== run UCCL-EP (uccl.ep) on EFA ====="
+                  mpirun "${MPI_COMMON[@]}" \
+                    python /scripts/compare_ep.py \
+                      --backend uccl \
+                      --hidden 7168 --num-tokens 16 \
+                      --num-experts 256 --topk 8 --seed 42 \
+                      --out /workspace/out/uccl.pt | tee /workspace/out/uccl.log
+
+                  echo "===== run NCCL-EP (deep_ep) on EFA ====="
+                  mpirun "${MPI_COMMON[@]}" \
+                    python /scripts/compare_ep.py \
+                      --backend nccl \
+                      --hidden 7168 --num-tokens 16 \
+                      --num-experts 256 --topk 8 --seed 42 \
+                      --out /workspace/out/nccl.pt | tee /workspace/out/nccl.log
+
+                  echo "===== diff tensors ====="
+                  python /scripts/compare_tensors.py \
+                    /workspace/out/uccl.pt /workspace/out/nccl.pt 1e-3 \
+                    | tee /workspace/out/diff.log
+
+                  echo "===== DONE ====="
+              volumeMounts:
+                - name: compare-scripts
+                  mountPath: /scripts
+                - name: workspace
+                  mountPath: /workspace
+          volumes:
+            - name: compare-scripts
+              configMap:
+                name: uccl-ep-correctness-script
+                defaultMode: 0755
+            - name: workspace
+              emptyDir: {}
+    Worker:
+      replicas: 2
+      template:
+        spec:
+          restartPolicy: OnFailure
+          hostNetwork: false
+          dnsPolicy: ClusterFirstWithHostNet
+          tolerations:
+            - key: nvidia.com/gpu
+              operator: Equal
+              value: "true"
+              effect: NoSchedule
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      training.kubeflow.org/job-name: uccl-ep-correctness
+                      training.kubeflow.org/job-role: worker
+                  topologyKey: kubernetes.io/hostname
+          containers:
+            - name: worker
+              image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/uccl-ep:v2
+              imagePullPolicy: IfNotPresent
+              env: *commonEnv
+              securityContext:
+                capabilities:
+                  add: [IPC_LOCK]
+              resources:
+                limits:
+                  nvidia.com/gpu: 8
+                  vpc.amazonaws.com/efa: 32
+                  hugepages-2Mi: 5120Mi
+                  memory: 256Gi
+                requests:
+                  nvidia.com/gpu: 8
+                  vpc.amazonaws.com/efa: 32
+                  hugepages-2Mi: 5120Mi
+                  memory: 256Gi
+              volumeMounts:
+                - name: shm
+                  mountPath: /dev/shm
+                - name: compare-scripts
+                  mountPath: /scripts
+                - name: workspace
+                  mountPath: /workspace
+          volumes:
+            - name: shm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 32Gi
+            - name: compare-scripts
+              configMap:
+                name: uccl-ep-correctness-script
+                defaultMode: 0755
+            - name: workspace
+              emptyDir: {}
