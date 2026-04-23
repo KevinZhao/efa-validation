@@ -3,7 +3,7 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: sglang-bench-serving
-  namespace: efa-validation
+  namespace: yanxi-validation
 spec:
   backoffLimit: 0
   ttlSecondsAfterFinished: 3600
@@ -16,14 +16,14 @@ spec:
           value: "true"
           effect: NoSchedule
       nodeSelector:
-        node.kubernetes.io/instance-type: p5.48xlarge
+        node.kubernetes.io/instance-type: p5en.48xlarge
       containers:
         - name: bench
-          image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/sglang-mooncake:v1
+          image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake:v1
           imagePullPolicy: IfNotPresent
           env:
             - name: TARGET_HOST
-              value: "sglang-baseline.efa-validation.svc"
+              value: "sglang-baseline.yanxi-validation.svc"
             - name: TARGET_PORT
               value: "30000"
             - name: MODEL
@@ -72,5 +72,5 @@ spec:
           emptyDir: {}
         - name: models
           hostPath:
-            path: /var/lib/efa-models
+            path: /var/lib/yanxi-models
             type: Directory

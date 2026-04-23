@@ -1,7 +1,7 @@
 # -----------------------------------------------------------------------------
 # Stage-1 image: nccl-tests built against the common base
 # -----------------------------------------------------------------------------
-ARG BASE_IMAGE=<AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/base-cuda-efa:v1
+ARG BASE_IMAGE=788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/base-cuda-efa:v1
 FROM ${BASE_IMAGE}
 
 ARG NCCL_TESTS_VERSION=v2.14.0

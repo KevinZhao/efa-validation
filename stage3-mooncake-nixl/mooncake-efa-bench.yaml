@@ -15,7 +15,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: mooncake-metadata
-  namespace: efa-validation
+  namespace: yanxi-validation
 spec:
   selector:
     app: mooncake-metadata
@@ -26,12 +26,12 @@ spec:
   type: ClusterIP
 ---
 # Headless service so mooncake-target / mooncake-initiator pods are
-# resolvable at <pod-hostname>.mooncake-bench.efa-validation.svc
+# resolvable at <pod-hostname>.mooncake-bench.yanxi-validation.svc
 apiVersion: v1
 kind: Service
 metadata:
   name: mooncake-bench
-  namespace: efa-validation
+  namespace: yanxi-validation
 spec:
   clusterIP: None
   selector:
@@ -45,7 +45,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: mooncake-metadata
-  namespace: efa-validation
+  namespace: yanxi-validation
   labels:
     app: mooncake-metadata
 spec:
@@ -66,10 +66,10 @@ spec:
           value: "true"
           effect: NoSchedule
       nodeSelector:
-        node.kubernetes.io/instance-type: p5.48xlarge
+        node.kubernetes.io/instance-type: p5en.48xlarge
       containers:
         - name: metadata
-          image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/mooncake-nixl:v1
+          image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/mooncake-nixl:v1
           imagePullPolicy: IfNotPresent
           volumeMounts:
             - name: workspace
@@ -107,7 +107,7 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: mooncake-target
-  namespace: efa-validation
+  namespace: yanxi-validation
   labels:
     app: mooncake-bench
     role: target
@@ -130,10 +130,10 @@ spec:
                 values: [mooncake-bench]
           topologyKey: kubernetes.io/hostname
   nodeSelector:
-    node.kubernetes.io/instance-type: p5.48xlarge
+    node.kubernetes.io/instance-type: p5en.48xlarge
   containers:
     - name: target
-      image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/mooncake-nixl:v1
+      image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/mooncake-nixl:v1
       imagePullPolicy: IfNotPresent
       env:
         - name: FI_PROVIDER
@@ -150,7 +150,7 @@ spec:
           for i in $(seq 1 120); do
             # Gin only registers /metadata; hitting it returns 404 without ?key
             # which is fine as a reachability probe.
-            CODE=$(curl -o /dev/null -s -w "%{http_code}" http://mooncake-metadata.efa-validation.svc:8080/metadata 2>/dev/null || echo 000)
+            CODE=$(curl -o /dev/null -s -w "%{http_code}" http://mooncake-metadata.yanxi-validation.svc:8080/metadata 2>/dev/null || echo 000)
             if [ "$CODE" = "404" ] || [ "$CODE" = "200" ]; then
               echo "metadata server reachable (code=$CODE)"; break
             fi
@@ -163,7 +163,7 @@ spec:
             --mode=target \
             --protocol=efa \
             --local_server_name="${MY_IP}:12345" \
-            --metadata_server="http://mooncake-metadata.efa-validation.svc:8080/metadata" \
+            --metadata_server="http://mooncake-metadata.yanxi-validation.svc:8080/metadata" \
             --use_vram=false \
             --gpu_id=0 \
             --buffer_size=$((4<<30)) \
@@ -174,12 +174,12 @@ spec:
       resources:
         limits:
           nvidia.com/gpu: 1
-          vpc.amazonaws.com/efa: 32
+          vpc.amazonaws.com/efa: 16
           hugepages-2Mi: 5120Mi
           memory: 128Gi
         requests:
           nvidia.com/gpu: 1
-          vpc.amazonaws.com/efa: 32
+          vpc.amazonaws.com/efa: 16
           hugepages-2Mi: 5120Mi
           memory: 128Gi
       volumeMounts:
@@ -195,7 +195,7 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: mooncake-initiator
-  namespace: efa-validation
+  namespace: yanxi-validation
   labels:
     app: mooncake-bench
     role: initiator
@@ -218,10 +218,10 @@ spec:
                 values: [mooncake-bench]
           topologyKey: kubernetes.io/hostname
   nodeSelector:
-    node.kubernetes.io/instance-type: p5.48xlarge
+    node.kubernetes.io/instance-type: p5en.48xlarge
   containers:
     - name: initiator
-      image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/mooncake-nixl:v1
+      image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/mooncake-nixl:v1
       imagePullPolicy: IfNotPresent
       env:
         - name: FI_PROVIDER
@@ -238,7 +238,7 @@ spec:
           for i in $(seq 1 120); do
             # Gin only registers /metadata; hitting it returns 404 without ?key
             # which is fine as a reachability probe.
-            CODE=$(curl -o /dev/null -s -w "%{http_code}" http://mooncake-metadata.efa-validation.svc:8080/metadata 2>/dev/null || echo 000)
+            CODE=$(curl -o /dev/null -s -w "%{http_code}" http://mooncake-metadata.yanxi-validation.svc:8080/metadata 2>/dev/null || echo 000)
             if [ "$CODE" = "404" ] || [ "$CODE" = "200" ]; then
               echo "metadata server reachable (code=$CODE)"; break
             fi
@@ -247,14 +247,14 @@ spec:
           # Wait for target to register itself with metadata server.
           # Resolve target pod IP via headless service (subdomain=mooncake-bench).
           for i in $(seq 1 60); do
-            TARGET_IP=$(getent hosts mooncake-target.mooncake-bench.efa-validation.svc 2>/dev/null | awk '{print $1}' || true)
+            TARGET_IP=$(getent hosts mooncake-target.mooncake-bench.yanxi-validation.svc 2>/dev/null | awk '{print $1}' || true)
             [ -n "$TARGET_IP" ] && break
             sleep 3
           done
           if [ -z "$TARGET_IP" ]; then
             # Fallback: scrape metadata server for any registered segment id
             echo "target DNS not resolvable; querying metadata server"
-            curl -s http://mooncake-metadata.efa-validation.svc:8080/ | head -100
+            curl -s http://mooncake-metadata.yanxi-validation.svc:8080/ | head -100
             exit 1
           fi
           echo "target_ip=$TARGET_IP"
@@ -270,7 +270,7 @@ spec:
             --protocol=efa \
             --local_server_name="${MY_IP}:12346" \
             --segment_id="${TARGET_IP}:12345" \
-            --metadata_server="http://mooncake-metadata.efa-validation.svc:8080/metadata" \
+            --metadata_server="http://mooncake-metadata.yanxi-validation.svc:8080/metadata" \
             --operation=write \
             --use_vram=false \
             --gpu_id=0 \
@@ -287,12 +287,12 @@ spec:
       resources:
         limits:
           nvidia.com/gpu: 1
-          vpc.amazonaws.com/efa: 32
+          vpc.amazonaws.com/efa: 16
           hugepages-2Mi: 5120Mi
           memory: 128Gi
         requests:
           nvidia.com/gpu: 1
-          vpc.amazonaws.com/efa: 32
+          vpc.amazonaws.com/efa: 16
           hugepages-2Mi: 5120Mi
           memory: 128Gi
       volumeMounts:

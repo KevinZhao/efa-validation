@@ -1,0 +1,509 @@
+# Stage 4 p5en — 1 Prefill + 2 Decode + mini_lb router
+# Image: sglang-mooncake:v2 (SGLang 0.5.10 + Mooncake v0.3.10.post2 含 Henan EFA PRs)
+# KV 传输 backend = mooncake  (EFA provider, multi-NIC striping)
+# Node 拓扑：1 P on ip-10-1-11-93, 2 D spread on 108/197（podAntiAffinity 强制打散）
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sglang-launcher-override
+  namespace: yanxi-validation
+data:
+  sglang-launcher.sh: |
+    #!/usr/bin/env bash
+    # Override launcher for p5en 1P:2D.
+    set -eu
+    ROLE="${ROLE:-baseline}"
+    MODEL_PATH="${MODEL_PATH:-/models/current}"
+    TP="${TP:-8}"
+    HOST="${HOST:-0.0.0.0}"
+    PORT="${PORT:-30000}"
+    KV_BACKEND="${KV_TRANSPORT_BACKEND:-mooncake}"
+    BOOTSTRAP_PORT="${BOOTSTRAP_PORT:-8998}"
+
+    TORCH_LIB=$(python3 -c 'import torch, os; print(os.path.join(os.path.dirname(torch.__file__), "lib"))')
+    export LD_LIBRARY_PATH="${TORCH_LIB}:${LD_LIBRARY_PATH:-}"
+
+    # Mooncake/EFA env.
+    export FI_PROVIDER="${FI_PROVIDER:-efa}"
+    export FI_EFA_USE_DEVICE_RDMA="${FI_EFA_USE_DEVICE_RDMA:-1}"
+    export FI_EFA_FORK_SAFE="${FI_EFA_FORK_SAFE:-1}"
+    export MOONCAKE_PROTOCOL="${MOONCAKE_PROTOCOL:-rdma}"
+    export MOONCAKE_DEVICE="${MOONCAKE_DEVICE:-auto-discovery}"
+    export VLLM_MOONCAKE_PROTOCOL="${VLLM_MOONCAKE_PROTOCOL:-rdma}"
+
+    # Auto-discover all EFA devices (p5en: 16 × rdmapXXXs0-rdm).
+    IB_DEVICE="${IB_DEVICE:-}"
+    if [ -z "${IB_DEVICE}" ] && command -v fi_info >/dev/null 2>&1; then
+      # sglang validator expects kernel device names (rdmapXXXs0), not libfabric domain names.
+      IB_DEVICE=$(fi_info -p efa 2>/dev/null | awk '/domain:/ {print $2}' | sed 's/-rdm$//;s/-dgrm$//' | sort -u | paste -sd, -)
+    fi
+    [ -n "${IB_DEVICE}" ] && echo "[launcher] IB_DEVICE=${IB_DEVICE}"
+
+    # AWS EFA fix: sglang 0.5.10 hard-codes protocol="rdma" which maps to libibverbs
+    # RdmaTransport (unsupported on EFA). Patch to "efa" so Mooncake post2 activates
+    # EfaTransport (Henan #1509/#1523/#1821/#1912 — libfabric efa provider, multi-NIC
+    # striping, PTE auto-split MR).  Both sites in sglang's mooncake wrapper.
+    MC_PY=/usr/local/lib/python3.10/dist-packages/sglang/srt/distributed/device_communicators/mooncake_transfer_engine.py
+    if [ -f "${MC_PY}" ] && grep -q '"rdma"' "${MC_PY}"; then
+      echo "[launcher] patching ${MC_PY}: rdma -> efa"
+      sed -i 's/"rdma",$/"efa",/' "${MC_PY}"
+      rm -f "${MC_PY%.py}.pyc" /usr/local/lib/python3.10/dist-packages/sglang/srt/distributed/device_communicators/__pycache__/mooncake_transfer_engine.cpython-310.pyc 2>/dev/null || true
+      grep -n -E '"efa"|"rdma"' "${MC_PY}" | head -5
+    fi
+
+    COMMON_ARGS=(
+      --model-path "${MODEL_PATH}"
+      --tp "${TP}"
+      --host "${HOST}"
+      --port "${PORT}"
+      --trust-remote-code
+      --mem-fraction-static 0.85
+    )
+
+    case "${ROLE}" in
+      baseline)
+        exec python3 -m sglang.launch_server "${COMMON_ARGS[@]}"
+        ;;
+      prefill)
+        DISAGG_EXTRA=()
+        [ -n "${IB_DEVICE}" ] && DISAGG_EXTRA+=(--disaggregation-ib-device "${IB_DEVICE}")
+        exec python3 -m sglang.launch_server \
+          "${COMMON_ARGS[@]}" \
+          --disaggregation-mode prefill \
+          --disaggregation-transfer-backend "${KV_BACKEND}" \
+          --disaggregation-bootstrap-port "${BOOTSTRAP_PORT}" \
+          "${DISAGG_EXTRA[@]}"
+        ;;
+      decode)
+        DISAGG_EXTRA=()
+        [ -n "${IB_DEVICE}" ] && DISAGG_EXTRA+=(--disaggregation-ib-device "${IB_DEVICE}")
+        exec python3 -m sglang.launch_server \
+          "${COMMON_ARGS[@]}" \
+          --disaggregation-mode decode \
+          --disaggregation-transfer-backend "${KV_BACKEND}" \
+          --disaggregation-bootstrap-port "${BOOTSTRAP_PORT}" \
+          "${DISAGG_EXTRA[@]}"
+        ;;
+      lb)
+        : "${PREFILL_URL:?need PREFILL_URL}"
+        : "${DECODE_URL:?need DECODE_URL}"
+        LB_PORT="${LB_PORT:-8000}"
+        # sglang 0.5.10 removed the built-in mini_lb; install the Rust router.
+        if ! python3 -c "import sglang_router" 2>/dev/null; then
+          pip install --no-cache-dir "sglang-router==0.3.2" || exit 3
+        fi
+        # Build --prefill and --decode repeated flags from comma-separated inputs.
+        PREFILL_ARGS=()
+        for u in ${PREFILL_URL//,/ }; do PREFILL_ARGS+=(--prefill "${u}"); done
+        DECODE_ARGS=()
+        for u in ${DECODE_URL//,/ }; do DECODE_ARGS+=(--decode "${u}"); done
+        exec python3 -m sglang_router.launch_router \
+          --pd-disaggregation \
+          "${PREFILL_ARGS[@]}" \
+          "${DECODE_ARGS[@]}" \
+          --host 0.0.0.0 \
+          --port "${LB_PORT}"
+        ;;
+      *)
+        echo "unknown ROLE=${ROLE}"; exit 2
+        ;;
+    esac
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sglang-prefill
+  namespace: yanxi-validation
+spec:
+  selector:
+    role: prefill
+    app: sglang-disagg
+  ports:
+    - name: http
+      port: 30000
+      targetPort: 30000
+    - name: bootstrap
+      port: 8998
+      targetPort: 8998
+  type: ClusterIP
+---
+# Headless Service so mini_lb can resolve each decode Pod individually.
+apiVersion: v1
+kind: Service
+metadata:
+  name: sglang-decode
+  namespace: yanxi-validation
+spec:
+  clusterIP: None
+  selector:
+    role: decode
+    app: sglang-disagg
+  ports:
+    - name: http
+      port: 30000
+      targetPort: 30000
+    - name: bootstrap
+      port: 8998
+      targetPort: 8998
+---
+# Per-pod Services for decode 0/1 so LB has stable URLs.
+apiVersion: v1
+kind: Service
+metadata:
+  name: sglang-decode-0
+  namespace: yanxi-validation
+spec:
+  selector:
+    role: decode
+    decode-idx: "0"
+    app: sglang-disagg
+  ports:
+    - name: http
+      port: 30000
+      targetPort: 30000
+    - name: bootstrap
+      port: 8998
+      targetPort: 8998
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sglang-decode-1
+  namespace: yanxi-validation
+spec:
+  selector:
+    role: decode
+    decode-idx: "1"
+    app: sglang-disagg
+  ports:
+    - name: http
+      port: 30000
+      targetPort: 30000
+    - name: bootstrap
+      port: 8998
+      targetPort: 8998
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sglang-lb
+  namespace: yanxi-validation
+spec:
+  selector:
+    app: sglang-disagg-lb
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sglang-prefill
+  namespace: yanxi-validation
+  labels: { app: sglang-disagg, role: prefill }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: sglang-disagg, role: prefill }
+  template:
+    metadata:
+      labels: { app: sglang-disagg, role: prefill }
+    spec:
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      nodeSelector:
+        node.kubernetes.io/instance-type: p5en.48xlarge
+      # 保证 P 与所有 D 打散到不同节点。
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: sglang-disagg
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: server
+          image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake:v2
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: ROLE
+              value: "prefill"
+            - name: MODEL_PATH
+              value: "/models/current"
+            - name: TP
+              value: "8"
+            - name: PORT
+              value: "30000"
+            - name: BOOTSTRAP_PORT
+              value: "8998"
+            - name: KV_TRANSPORT_BACKEND
+              value: "mooncake"
+          command: ["/bin/bash", "-lc"]
+          args: ["exec /scripts/sglang-launcher.sh"]
+          readinessProbe:
+            httpGet: { path: /get_model_info, port: 30000 }
+            initialDelaySeconds: 60
+            periodSeconds: 5
+            failureThreshold: 120
+          ports:
+            - { containerPort: 30000, name: http }
+            - { containerPort: 8998, name: bootstrap }
+          securityContext:
+            capabilities: { add: [IPC_LOCK] }
+          resources:
+            limits:
+              nvidia.com/gpu: 8
+              vpc.amazonaws.com/efa: 16
+              hugepages-2Mi: 5120Mi
+              memory: 256Gi
+            requests:
+              nvidia.com/gpu: 8
+              vpc.amazonaws.com/efa: 16
+              hugepages-2Mi: 5120Mi
+              memory: 256Gi
+          volumeMounts:
+            - { name: models, mountPath: /models }
+            - { name: shm, mountPath: /dev/shm }
+            - { name: scripts, mountPath: /scripts }
+      volumes:
+        - name: models
+          hostPath:
+            path: /var/lib/yanxi-models
+            type: Directory
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: scripts
+          configMap:
+            name: sglang-launcher-override
+            defaultMode: 0755
+---
+# Decode 0
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sglang-decode-0
+  namespace: yanxi-validation
+  labels: { app: sglang-disagg, role: decode, decode-idx: "0" }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: sglang-disagg, role: decode, decode-idx: "0" }
+  template:
+    metadata:
+      labels: { app: sglang-disagg, role: decode, decode-idx: "0" }
+    spec:
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      nodeSelector:
+        node.kubernetes.io/instance-type: p5en.48xlarge
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: sglang-disagg
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: server
+          image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake:v2
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: ROLE
+              value: "decode"
+            - name: MODEL_PATH
+              value: "/models/current"
+            - name: TP
+              value: "8"
+            - name: PORT
+              value: "30000"
+            - name: BOOTSTRAP_PORT
+              value: "8998"
+            - name: KV_TRANSPORT_BACKEND
+              value: "mooncake"
+          command: ["/bin/bash", "-lc"]
+          args: ["exec /scripts/sglang-launcher.sh"]
+          readinessProbe:
+            httpGet: { path: /get_model_info, port: 30000 }
+            initialDelaySeconds: 60
+            periodSeconds: 5
+            failureThreshold: 120
+          ports:
+            - { containerPort: 30000, name: http }
+            - { containerPort: 8998, name: bootstrap }
+          securityContext:
+            capabilities: { add: [IPC_LOCK] }
+          resources:
+            limits:
+              nvidia.com/gpu: 8
+              vpc.amazonaws.com/efa: 16
+              hugepages-2Mi: 5120Mi
+              memory: 256Gi
+            requests:
+              nvidia.com/gpu: 8
+              vpc.amazonaws.com/efa: 16
+              hugepages-2Mi: 5120Mi
+              memory: 256Gi
+          volumeMounts:
+            - { name: models, mountPath: /models }
+            - { name: shm, mountPath: /dev/shm }
+            - { name: scripts, mountPath: /scripts }
+      volumes:
+        - name: models
+          hostPath:
+            path: /var/lib/yanxi-models
+            type: Directory
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: scripts
+          configMap:
+            name: sglang-launcher-override
+            defaultMode: 0755
+---
+# Decode 1
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sglang-decode-1
+  namespace: yanxi-validation
+  labels: { app: sglang-disagg, role: decode, decode-idx: "1" }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: sglang-disagg, role: decode, decode-idx: "1" }
+  template:
+    metadata:
+      labels: { app: sglang-disagg, role: decode, decode-idx: "1" }
+    spec:
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      nodeSelector:
+        node.kubernetes.io/instance-type: p5en.48xlarge
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: sglang-disagg
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: server
+          image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake:v2
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: ROLE
+              value: "decode"
+            - name: MODEL_PATH
+              value: "/models/current"
+            - name: TP
+              value: "8"
+            - name: PORT
+              value: "30000"
+            - name: BOOTSTRAP_PORT
+              value: "8998"
+            - name: KV_TRANSPORT_BACKEND
+              value: "mooncake"
+          command: ["/bin/bash", "-lc"]
+          args: ["exec /scripts/sglang-launcher.sh"]
+          readinessProbe:
+            httpGet: { path: /get_model_info, port: 30000 }
+            initialDelaySeconds: 60
+            periodSeconds: 5
+            failureThreshold: 120
+          ports:
+            - { containerPort: 30000, name: http }
+            - { containerPort: 8998, name: bootstrap }
+          securityContext:
+            capabilities: { add: [IPC_LOCK] }
+          resources:
+            limits:
+              nvidia.com/gpu: 8
+              vpc.amazonaws.com/efa: 16
+              hugepages-2Mi: 5120Mi
+              memory: 256Gi
+            requests:
+              nvidia.com/gpu: 8
+              vpc.amazonaws.com/efa: 16
+              hugepages-2Mi: 5120Mi
+              memory: 256Gi
+          volumeMounts:
+            - { name: models, mountPath: /models }
+            - { name: shm, mountPath: /dev/shm }
+            - { name: scripts, mountPath: /scripts }
+      volumes:
+        - name: models
+          hostPath:
+            path: /var/lib/yanxi-models
+            type: Directory
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: scripts
+          configMap:
+            name: sglang-launcher-override
+            defaultMode: 0755
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sglang-lb
+  namespace: yanxi-validation
+  labels: { app: sglang-disagg-lb }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: sglang-disagg-lb }
+  template:
+    metadata:
+      labels: { app: sglang-disagg-lb }
+    spec:
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: lb
+          image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake:v2
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: ROLE
+              value: "lb"
+            - name: PREFILL_URL
+              value: "http://sglang-prefill.yanxi-validation.svc:30000"
+            - name: DECODE_URL
+              value: "http://sglang-decode-0.yanxi-validation.svc:30000,http://sglang-decode-1.yanxi-validation.svc:30000"
+            - name: LB_PORT
+              value: "8000"
+          command: ["/bin/bash", "-lc"]
+          args: ["exec /scripts/sglang-launcher.sh"]
+          ports:
+            - { containerPort: 8000, name: http }
+          resources:
+            limits: { cpu: "4", memory: 8Gi }
+            requests: { cpu: "1", memory: 2Gi }
+          volumeMounts:
+            - { name: scripts, mountPath: /scripts }
+      volumes:
+        - name: scripts
+          configMap:
+            name: sglang-launcher-override
+            defaultMode: 0755

@@ -1,8 +1,8 @@
 {
   "commands": [
-    "sudo -iu ec2-user bash -lc 'aws s3 cp s3://efa-validation-<AWS_ACCOUNT_ID>/manifests/stage4/baseline-tp8.yaml /tmp/baseline-tp8.yaml --region us-east-2'",
+    "sudo -iu ec2-user bash -lc 'aws s3 cp s3://yanxi-validation-788668107894/manifests/stage4/baseline-tp8.yaml /tmp/baseline-tp8.yaml --region us-east-2'",
     "sudo -iu ec2-user bash -lc 'kubectl --context ohio apply -f /tmp/baseline-tp8.yaml 2>&1'",
     "sleep 15",
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods,svc,endpoints -n efa-validation 2>&1 | grep -E baseline'"
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods,svc,endpoints -n yanxi-validation 2>&1 | grep -E baseline'"
   ]
 }

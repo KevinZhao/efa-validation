@@ -1,13 +1,13 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: efa-validation
+  name: yanxi-validation
   labels:
     purpose: efa-validation
-    project: efa-validation
+    project: jd-joyai
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: efa-runner
-  namespace: efa-validation
+  name: yanxi-runner
+  namespace: yanxi-validation

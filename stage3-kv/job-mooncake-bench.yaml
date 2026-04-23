@@ -19,7 +19,7 @@ apiVersion: kubeflow.org/v2beta1
 kind: MPIJob
 metadata:
   name: mooncake-bench-efa
-  namespace: efa-validation
+  namespace: yanxi-validation
   labels:
     stage: stage3-kv
     tool: mooncake
@@ -34,7 +34,7 @@ spec:
       replicas: 1
       template:
         spec:
-          serviceAccountName: efa-runner
+          serviceAccountName: yanxi-runner
           restartPolicy: Never
           tolerations:
             - key: nvidia.com/gpu
@@ -42,10 +42,10 @@ spec:
               value: "true"
               effect: NoSchedule
           nodeSelector:
-            node.kubernetes.io/instance-type: p5.48xlarge
+            node.kubernetes.io/instance-type: p5en.48xlarge
           containers:
             - name: launcher
-              image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/mooncake-nixl:v1
+              image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/mooncake-nixl:v1
               imagePullPolicy: IfNotPresent
               env: &commonEnv
                 - name: OMPI_ALLOW_RUN_AS_ROOT
@@ -239,7 +239,7 @@ spec:
               value: "true"
               effect: NoSchedule
           nodeSelector:
-            node.kubernetes.io/instance-type: p5.48xlarge
+            node.kubernetes.io/instance-type: p5en.48xlarge
           affinity:
             podAntiAffinity:
               requiredDuringSchedulingIgnoredDuringExecution:
@@ -250,7 +250,7 @@ spec:
                   topologyKey: kubernetes.io/hostname
           containers:
             - name: worker
-              image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/mooncake-nixl:v1
+              image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/mooncake-nixl:v1
               imagePullPolicy: IfNotPresent
               env: *commonEnv
               securityContext:
@@ -259,12 +259,12 @@ spec:
               resources:
                 limits:
                   nvidia.com/gpu: 8
-                  vpc.amazonaws.com/efa: 32
+                  vpc.amazonaws.com/efa: 16
                   hugepages-2Mi: 5120Mi
                   memory: 256Gi
                 requests:
                   nvidia.com/gpu: 8
-                  vpc.amazonaws.com/efa: 32
+                  vpc.amazonaws.com/efa: 16
                   hugepages-2Mi: 5120Mi
                   memory: 256Gi
               volumeMounts:

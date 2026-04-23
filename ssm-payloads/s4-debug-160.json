@@ -1,5 +1,5 @@
 {
   "commands": [
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio debug node/<GPU_NODE_0> --image=public.ecr.aws/amazonlinux/amazonlinux:2023 --target=containerd -q -it=false -- /bin/sh -c \"df -h /host; ls -la /host/var/lib/efa-models/current/ 2>&1 | head -30; find /host/var/lib/efa-models/current -maxdepth 1 -name model-0000[1-4]-of-00004.safetensors -delete; rm -rf /host/var/lib/efa-models/.hf-cache; rm -rf /host/var/lib/efa-models/current/.cache; df -h /host\" 2>&1 | tail -60'"
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio debug node/ip-10-1-12-160.us-east-2.compute.internal --image=public.ecr.aws/amazonlinux/amazonlinux:2023 --target=containerd -q -it=false -- /bin/sh -c \"df -h /host; ls -la /host/var/lib/yanxi-models/current/ 2>&1 | head -30; find /host/var/lib/yanxi-models/current -maxdepth 1 -name model-0000[1-4]-of-00004.safetensors -delete; rm -rf /host/var/lib/yanxi-models/.hf-cache; rm -rf /host/var/lib/yanxi-models/current/.cache; df -h /host\" 2>&1 | tail -60'"
   ]
 }

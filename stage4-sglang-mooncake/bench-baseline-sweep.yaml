@@ -1,0 +1,75 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bench-baseline-sweep
+  namespace: yanxi-validation
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: bench
+          image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake:v1
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: TARGET_HOST
+              value: "sglang-baseline.yanxi-validation.svc"
+            - name: TARGET_PORT
+              value: "30000"
+            - name: MODEL
+              value: "/models/current"
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -eux
+              mkdir -p /results
+              for i in $(seq 1 60); do
+                CODE=$(curl -o /dev/null -s -w "%{http_code}" http://${TARGET_HOST}:${TARGET_PORT}/get_model_info 2>/dev/null || echo 000)
+                echo "wait server attempt=$i code=$CODE"
+                [ "$CODE" = "200" ] && break
+                sleep 5
+              done
+
+              SUMMARY=/results/baseline-summary.tsv
+              echo -e "rate\tprompts\tTTFT_mean_ms\tTTFT_p99_ms\tTPOT_mean_ms\tITL_mean_ms\toutput_tps\trequest_tps" > "$SUMMARY"
+
+              for RATE in inf 2 4 8 16; do
+                OUT=/results/baseline-rate-${RATE}.json
+                LOG=/results/baseline-rate-${RATE}.log
+                echo "=== RUN rate=${RATE} ==="
+                python3 -m sglang.bench_serving \
+                  --backend sglang \
+                  --host "${TARGET_HOST}" --port "${TARGET_PORT}" \
+                  --model "${MODEL}" --tokenizer "${MODEL}" \
+                  --num-prompts 128 \
+                  --dataset-name random \
+                  --random-input-len 1024 \
+                  --random-output-len 256 \
+                  --request-rate ${RATE} \
+                  --output-file "${OUT}" \
+                  > "${LOG}" 2>&1 || echo "(rate=${RATE} failed)"
+                # 解析
+                TTFT=$(grep -E "Mean TTFT|Median TTFT" "${LOG}" | head -1 | grep -oE "[0-9.]+" | head -1)
+                TTFT99=$(grep -E "P99 TTFT" "${LOG}" | head -1 | grep -oE "[0-9.]+" | head -1)
+                TPOT=$(grep -E "Mean TPOT" "${LOG}" | head -1 | grep -oE "[0-9.]+" | head -1)
+                ITL=$(grep -E "Mean ITL" "${LOG}" | head -1 | grep -oE "[0-9.]+" | head -1)
+                OTPS=$(grep -E "Output token throughput" "${LOG}" | head -1 | grep -oE "[0-9.]+" | head -1)
+                RTPS=$(grep -E "Request throughput" "${LOG}" | head -1 | grep -oE "[0-9.]+" | head -1)
+                echo -e "${RATE}\t128\t${TTFT:-NA}\t${TTFT99:-NA}\t${TPOT:-NA}\t${ITL:-NA}\t${OTPS:-NA}\t${RTPS:-NA}" | tee -a "$SUMMARY"
+                sleep 5
+              done
+              echo "=== SWEEP DONE ==="
+              cat "$SUMMARY"
+          volumeMounts:
+            - name: results
+              mountPath: /results
+      volumes:
+        - name: results
+          emptyDir: {}

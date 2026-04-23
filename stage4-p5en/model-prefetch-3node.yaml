@@ -1,0 +1,89 @@
+# Prefetch SmolLM2-1.7B to /var/lib/yanxi-models on ALL 3 p5en nodes.
+# 1 Prefill + 2 Decode 需要 3 份本地 hostPath。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: model-prefetch-script
+  namespace: yanxi-validation
+data:
+  prefetch.sh: |
+    #!/usr/bin/env bash
+    set -eux
+    MODEL_ID="${MODEL_ID:-moonshotai/Kimi-K2-Instruct-0905}"
+    DEST="${DEST:-/models/current}"
+    mkdir -p "$DEST"
+    EXPECTED_DIR_MARKER="$DEST/.model-id"
+    if [ -f "$EXPECTED_DIR_MARKER" ] && [ "$(cat $EXPECTED_DIR_MARKER)" = "$MODEL_ID" ] && [ -f "$DEST/config.json" ]; then
+      echo "Target model ${MODEL_ID} already present; skipping."
+      ls -la "$DEST" | head -20
+      exit 0
+    fi
+    echo "Wiping old model (or different model) at $DEST"
+    find "$DEST" -mindepth 1 -delete 2>/dev/null || true
+    rm -rf /models/.hf-cache 2>/dev/null || true
+    export HF_HUB_ENABLE_HF_TRANSFER=1
+    export HF_HOME=/models/.hf-cache
+    # sglang:v2 image has `hf` CLI (huggingface_hub>=0.28); huggingface-cli is removed.
+    if command -v hf >/dev/null 2>&1; then
+      hf download "$MODEL_ID" --local-dir "$DEST" --max-workers 16
+    else
+      huggingface-cli download "$MODEL_ID" --local-dir "$DEST" --local-dir-use-symlinks False --max-workers 8
+    fi
+    echo "$MODEL_ID" > "$DEST/.model-id"
+    ls -la "$DEST" | head -20
+    du -sh "$DEST"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: model-prefetch-p5en
+  namespace: yanxi-validation
+spec:
+  backoffLimit: 3
+  completions: 3
+  parallelism: 3
+  completionMode: Indexed
+  template:
+    metadata:
+      labels:
+        app: yanxi-model-prefetch
+    spec:
+      restartPolicy: Never
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      nodeSelector:
+        node.kubernetes.io/instance-type: p5en.48xlarge
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: yanxi-model-prefetch
+      containers:
+        - name: prefetch
+          image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake:v2
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MODEL_ID
+              value: "moonshotai/Kimi-K2-Instruct-0905"
+            - name: DEST
+              value: "/models/current"
+          command: ["/bin/bash", "/scripts/prefetch.sh"]
+          volumeMounts:
+            - name: models
+              mountPath: /models
+            - name: scripts
+              mountPath: /scripts
+      volumes:
+        - name: models
+          hostPath:
+            path: /var/lib/yanxi-models
+            type: DirectoryOrCreate
+        - name: scripts
+          configMap:
+            name: model-prefetch-script
+            defaultMode: 0755

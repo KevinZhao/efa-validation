@@ -1,0 +1,51 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: clean-bin-index
+  namespace: yanxi-validation
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  completions: 2
+  parallelism: 2
+  completionMode: Indexed
+  template:
+    metadata:
+      labels:
+        job: clean-bin-index
+    spec:
+      restartPolicy: Never
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              job: clean-bin-index
+      nodeSelector:
+        node.kubernetes.io/instance-type: p5en.48xlarge
+      containers:
+        - name: clean
+          image: busybox:1.36
+          command: ["sh","-c"]
+          args:
+            - |
+              set -x
+              ls -la /m/current/*.index.json 2>&1
+              rm -f /m/current/pytorch_model.bin.index.json
+              # double-check: if no model.safetensors.index.json exists but there are sharded safetensors, keep it clean
+              ls /m/current/ | head -15
+              du -sh /m/current/
+          volumeMounts:
+            - name: m
+              mountPath: /m
+      volumes:
+        - name: m
+          hostPath:
+            path: /var/lib/yanxi-models
+            type: Directory

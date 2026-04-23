@@ -1,0 +1,53 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bench-disagg-smoke
+  namespace: yanxi-validation
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 7200
+  template:
+    spec:
+      restartPolicy: Never
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: bench
+          image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake:v1
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -ux
+              TARGET="sglang-lb.yanxi-validation.svc:8000"
+              for i in $(seq 1 60); do
+                CODE=$(curl -o /dev/null -s -w "%{http_code}" http://${TARGET}/get_model_info 2>/dev/null || echo 000)
+                echo "wait lb attempt=$i code=$CODE"
+                [ "$CODE" = "200" ] && break
+                sleep 5
+              done
+              echo "=== SMOKE num_prompts=8 rate=2 ==="
+              timeout 300 python3 -u -m sglang.bench_serving \
+                --backend sglang \
+                --host sglang-lb.yanxi-validation.svc --port 8000 \
+                --model /models/current --tokenizer /models/current \
+                --num-prompts 8 \
+                --dataset-name random \
+                --random-input-len 1024 \
+                --random-output-len 128 \
+                --request-rate 2 \
+                --pd-separated \
+                --disable-tqdm
+              echo "=== SMOKE RC=$? ==="
+              sleep 300
+          volumeMounts:
+            - name: models
+              mountPath: /models
+      volumes:
+        - name: models
+          hostPath:
+            path: /var/lib/yanxi-models
+            type: Directory

@@ -1,6 +1,6 @@
 {
   "commands": [
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio describe node <GPU_NODE_0> 2>&1 | grep -E \"Taints|Allocatable|DiskPressure\" | head -20'",
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get node <GPU_NODE_0> -o yaml 2>&1 | grep -A 3 taints'"
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio describe node ip-10-1-12-160.us-east-2.compute.internal 2>&1 | grep -E \"Taints|Allocatable|DiskPressure\" | head -20'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get node ip-10-1-12-160.us-east-2.compute.internal -o yaml 2>&1 | grep -A 3 taints'"
   ]
 }

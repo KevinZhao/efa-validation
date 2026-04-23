@@ -1,6 +1,6 @@
 {
   "commands": [
-    "sudo -iu ec2-user bash -lc 'aws s3 cp s3://efa-validation-<AWS_ACCOUNT_ID>/manifests/00-namespace.yaml /tmp/00-ns.yaml && kubectl --context ohio apply -f /tmp/00-ns.yaml'",
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get ns efa-validation -o wide && kubectl --context ohio get sa -n efa-validation'"
+    "sudo -iu ec2-user bash -lc 'aws s3 cp s3://yanxi-validation-788668107894/manifests/00-namespace.yaml /tmp/00-ns.yaml && kubectl --context ohio apply -f /tmp/00-ns.yaml'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get ns yanxi-validation -o wide && kubectl --context ohio get sa -n yanxi-validation'"
   ]
 }

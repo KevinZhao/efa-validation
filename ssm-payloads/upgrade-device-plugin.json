@@ -1,17 +1,17 @@
 {
   "commands": [
-    "sudo -iu ec2-user bash -lc 'aws s3 cp s3://efa-validation-<AWS_ACCOUNT_ID>/manifests/nvidia-device-plugin-cdi.yaml /tmp/dp.yaml'",
+    "sudo -iu ec2-user bash -lc 'aws s3 cp s3://yanxi-validation-788668107894/manifests/nvidia-device-plugin-cdi.yaml /tmp/dp.yaml'",
     "sudo -iu ec2-user bash -lc 'kubectl --context ohio apply -f /tmp/dp.yaml'",
     "sleep 20",
     "sudo -iu ec2-user bash -lc 'kubectl --context ohio -n kube-system get pods -l name=nvidia-device-plugin-ds -o wide'",
     "echo --- logs from one pod ---",
     "sudo -iu ec2-user bash -lc 'POD=$(kubectl --context ohio -n kube-system get pods -l name=nvidia-device-plugin-ds -o jsonpath=\"{.items[0].metadata.name}\"); kubectl --context ohio -n kube-system logs $POD --tail=30 2>&1'",
     "echo --- try smoke with CDI annotation ---",
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete pod -n efa-validation gpu-smoke-cdi --force --grace-period=0 --ignore-not-found=true 2>&1 | tail -2'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete pod -n yanxi-validation gpu-smoke-cdi --force --grace-period=0 --ignore-not-found=true 2>&1 | tail -2'",
     "sleep 5",
     "sudo -iu ec2-user bash -lc 'kubectl --context ohio apply -f /tmp/gpu-smoke-cdi.yaml'",
     "sleep 30",
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pod -n efa-validation gpu-smoke-cdi -o wide'",
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n efa-validation gpu-smoke-cdi 2>&1 | tail -20'"
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pod -n yanxi-validation gpu-smoke-cdi -o wide'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n yanxi-validation gpu-smoke-cdi 2>&1 | tail -20'"
   ]
 }

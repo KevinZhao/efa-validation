@@ -1,7 +1,7 @@
 {
   "commands": [
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods -n efa-validation | grep bench'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods -n yanxi-validation | grep bench'",
     "echo === bench log ===",
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n efa-validation -l job-name=sglang-bench-serving --tail=80 2>&1 | tail -80'"
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n yanxi-validation -l job-name=sglang-bench-serving --tail=80 2>&1 | tail -80'"
   ]
 }

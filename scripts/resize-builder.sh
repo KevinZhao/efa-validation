@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Resize the efa-builder EC2 instance. Run from laptop/bastion with AWS admin creds.
+# Resize the yanxi-builder EC2 instance. Run from laptop/bastion with AWS admin creds.
 # Usage: ./resize-builder.sh <instance-type>
 set -euo pipefail
 source "$(dirname "$0")/lib.sh"

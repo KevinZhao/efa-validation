@@ -1,5 +1,5 @@
 {
   "commands": [
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete pod uccl-ep-diag -n efa-validation --ignore-not-found --grace-period=0 --force 2>&1'"
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete pod uccl-ep-diag -n yanxi-validation --ignore-not-found --grace-period=0 --force 2>&1'"
   ]
 }

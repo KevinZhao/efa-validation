@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: uccl-probe
+  namespace: yanxi-validation
+spec:
+  restartPolicy: Never
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  containers:
+    - name: probe
+      image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/uccl-ep:v2
+      imagePullPolicy: IfNotPresent
+      command: ["bash","-c"]
+      args:
+        - |
+          echo "===== uccl test files ====="
+          find /opt/uccl -name 'test_*.py' 2>/dev/null | head -20
+          echo "===== deepep test files ====="
+          find /opt/deepep -name 'test_*.py' 2>/dev/null | head -20
+          echo "===== uccl ep tests dir ====="
+          ls -la /opt/uccl/ep/tests/ /opt/uccl/ep/bench/ 2>&1 | head -40
+          echo "===== scripts configmap? ====="
+          ls /scripts/ 2>&1 | head -10
+          sleep 60

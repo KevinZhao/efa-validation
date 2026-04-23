@@ -1,0 +1,39 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: logtail-160
+  namespace: yanxi-validation
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/hostname: ip-10-1-12-160.us-east-2.compute.internal
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  containers:
+    - name: x
+      image: busybox:1.36
+      command: ["sh","-c"]
+      args:
+        - |
+          echo === ls ===
+          ls -la /h/
+          echo === uccl-perf-internode best ===
+          grep -E "Best dispatch|Best combine" /h/uccl-perf-internode.log 2>/dev/null | tail -8
+          echo === uccl-perf-internode tail ===
+          tail -20 /h/uccl-perf-internode.log 2>/dev/null
+          echo === uccl-perf-ll bandwidth ===
+          grep -E "Dispatch bandwidth|Combine bandwidth|send/recv time" /h/uccl-perf-ll.log 2>/dev/null | tail -40
+          echo === uccl-perf-ll tail ===
+          tail -20 /h/uccl-perf-ll.log 2>/dev/null
+          echo === nccl internode best ===
+          grep -E "Best dispatch|Best combine" /h/nccl-perf-internode.log 2>/dev/null | tail -4
+          sleep 60
+      volumeMounts:
+        - name: h
+          mountPath: /h
+  volumes:
+    - name: h
+      hostPath: {path: /var/lib/yanxi-logs/stage2}

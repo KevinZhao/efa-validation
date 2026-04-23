@@ -1,21 +1,10 @@
 {"commands":[
-  "# Push an EKS cluster .env to the bastion, then configure kubeconfig.",
-  "# Template of the .env content:",
-  "#   CLUSTER_NAME=<EKS_CLUSTER_NAME>",
-  "#   AWS_REGION=<AWS_REGION>",
-  "#   VPC_ID=<VPC_ID>",
-  "#   PRIVATE_SUBNET_{A,B,C}=<SUBNET_ID>",
-  "#   PUBLIC_SUBNET_{A,B,C}=<SUBNET_ID>",
-  "#   AZ_{A,B,C}=<AWS_AZ>",
-  "#   SYSTEM_NODE_INSTANCE_TYPE=m7g.large",
-  "#   K8S_VERSION=1.35",
-  "# Replace <BASE64_ENV_BLOB> with: base64 -w0 .env.ohio",
-  "sudo -iu ec2-user bash -lc 'echo <BASE64_ENV_BLOB> | base64 -d > ~/workspace/cluster-deployment/.env.ohio'",
-  "sudo -iu ec2-user bash -lc 'cp -f ~/workspace/cluster-deployment/.env.ohio ~/workspace/cluster-deployment/.env && grep -E \"^(CLUSTER_NAME|AWS_REGION|VPC_ID)\" ~/workspace/cluster-deployment/.env'",
-  "sudo -iu ec2-user bash -lc 'aws eks update-kubeconfig --name <EKS_CLUSTER_NAME> --region <AWS_REGION> --alias ohio 2>&1'",
+  "sudo -iu ec2-user bash -lc 'echo IyBPaGlvIEVLUyBDbHVzdGVyIC0gR1BVIENsdXN0ZXIgRGVwbG95bWVudCBUZXN0CkNMVVNURVJfTkFNRT1ncHUtY2x1c3Rlci1vaGlvCkFXU19SRUdJT049dXMtZWFzdC0yCkFXU19ERUZBVUxUX1JFR0lPTj11cy1lYXN0LTIKCiMgVlBDIGFuZCBTdWJuZXRzICgzIEFacyAtIGZ1bGwgcmVnaW9uIGNvdmVyYWdlKQpWUENfSUQ9dnBjLTBiY2I2MjJjZmZkMjI2ZDI2CgojIFByaXZhdGUgU3VibmV0cwpQUklWQVRFX1NVQk5FVF9BPXN1Ym5ldC0wNmI5YzA4ZTMyNzM4MjZjYQpQUklWQVRFX1NVQk5FVF9CPXN1Ym5ldC0wYzg2ZjFjNjllNDA2Nzg5MApQUklWQVRFX1NVQk5FVF9DPXN1Ym5ldC0wM2ViNTU4YWUwYmIwM2IyNAoKIyBQdWJsaWMgU3VibmV0cwpQVUJMSUNfU1VCTkVUX0E9c3VibmV0LTBjYTRiZjM4MzIyZjUyYjhhClBVQkxJQ19TVUJORVRfQj1zdWJuZXQtMDYzNjg5YWY2ZDI1YmFjYTYKUFVCTElDX1NVQk5FVF9DPXN1Ym5ldC0wOTA3YmM5OTgyYTI1MjA2MwoKIyBBWnMKQVpfQT11cy1lYXN0LTJhCkFaX0I9dXMtZWFzdC0yYgpBWl9DPXVzLWVhc3QtMmMKCiMgU3lzdGVtIG5vZGVncm91cApTWVNURU1fTk9ERV9JTlNUQU5DRV9UWVBFPW03Zy5sYXJnZQpTWVNURU1fTk9ERV9ERVNJUkVEX0NBUEFDSVRZPTIKU1lTVEVNX05PREVfTUlOX1NJWkU9MgpTWVNURU1fTk9ERV9NQVhfU0laRT00ClNZU1RFTV9OT0RFX1JPT1RfVk9MVU1FX1NJWkU9NTAKU1lTVEVNX05PREVfREFUQV9WT0xVTUVfU0laRT0xMDAKU1lTVEVNX05PREVfTEFCRUxfS0VZPWFwcApTWVNURU1fTk9ERV9MQUJFTF9WQUxVRT1la3MtdXRpbHMKCiMgS2FycGVudGVyCklOU1RBTExfS0FSUEVOVEVSPWZhbHNlCgojIEs4cyBWZXJzaW9uIChsYXRlc3QpCks4U19WRVJTSU9OPTEuMzUKCiMgR1BVCkdQVV9JTlNUQU5DRV9UWVBFUz0K | base64 -d > ~/workspace/eks-cluster-deployment/.env.ohio'",
+  "sudo -iu ec2-user bash -lc 'cp -f ~/workspace/eks-cluster-deployment/.env.ohio ~/workspace/eks-cluster-deployment/.env && grep -E \"^(CLUSTER_NAME|AWS_REGION|VPC_ID)\" ~/workspace/eks-cluster-deployment/.env'",
+  "sudo -iu ec2-user bash -lc 'aws eks update-kubeconfig --name gpu-cluster-ohio --region us-east-2 --alias ohio 2>&1'",
   "sudo -iu ec2-user bash -lc 'kubectl --context ohio get nodes -o wide 2>&1'",
   "echo --- ns ---",
   "sudo -iu ec2-user bash -lc 'kubectl --context ohio get ns 2>&1'",
   "echo --- nodegroups ---",
-  "sudo -iu ec2-user bash -lc 'aws eks list-nodegroups --cluster-name <EKS_CLUSTER_NAME> --region <AWS_REGION>'"
+  "sudo -iu ec2-user bash -lc 'aws eks list-nodegroups --cluster-name gpu-cluster-ohio --region us-east-2'"
 ]}

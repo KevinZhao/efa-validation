@@ -1,11 +1,11 @@
 {
   "commands": [
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods -n efa-validation -o wide 2>&1'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods -n yanxi-validation -o wide 2>&1'",
     "echo === metadata log ===",
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n efa-validation deploy/mooncake-metadata --tail=40 2>&1'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n yanxi-validation deploy/mooncake-metadata --tail=40 2>&1'",
     "echo === target log -first 30- ===",
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n efa-validation mooncake-target --tail=40 2>&1'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n yanxi-validation mooncake-target --tail=40 2>&1'",
     "echo === initiator log -first 60- ===",
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n efa-validation mooncake-initiator --tail=60 2>&1'"
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n yanxi-validation mooncake-initiator --tail=60 2>&1'"
   ]
 }

@@ -12,8 +12,8 @@
 
 首轮用 **Qwen2.5-7B-Instruct** 做冒烟（权重公开可 `hf-transfer` 拉）。
 后续按需替换为：
-- <MODEL_NAME>（<MODEL_ID>，如果公开）
-- DeepSeek-V3/R1（MoE 288 experts，更贴近典型生产形态，但单节点显存不够）
+- JoyAI-LLM-Flash（jdopensource/JoyAI-LLM-Flash，如果公开）
+- DeepSeek-V3/R1（MoE 288 experts，更贴近客户生产形态，但单节点显存不够）
 - Qwen3-235B-A22B（未公开时略过）
 
 ## 跑法

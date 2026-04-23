@@ -2,7 +2,7 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: uccl-ep-diag
-  namespace: efa-validation
+  namespace: yanxi-validation
 spec:
   restartPolicy: Never
   tolerations:
@@ -11,10 +11,10 @@ spec:
       value: "true"
       effect: NoSchedule
   nodeSelector:
-    node.kubernetes.io/instance-type: p5.48xlarge
+    node.kubernetes.io/instance-type: p5en.48xlarge
   containers:
     - name: diag
-      image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/uccl-ep:v2
+      image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/uccl-ep:v2
       imagePullPolicy: IfNotPresent
       command: ["/bin/bash", "-lc"]
       args:

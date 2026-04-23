@@ -1,0 +1,37 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bench-debug
+  namespace: yanxi-validation
+spec:
+  restartPolicy: Never
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  containers:
+    - name: bench
+      image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake:v1
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/bash", "-lc"]
+      args:
+        - |
+          set -x
+          python3 -m sglang.bench_serving \
+            --backend sglang \
+            --host sglang-baseline.yanxi-validation.svc --port 30000 \
+            --model /models/current --tokenizer /models/current \
+            --num-prompts 8 --dataset-name random \
+            --random-input-len 512 --random-output-len 128 \
+            --request-rate 2 2>&1 | tail -60
+          echo "=== EXITCODE=${PIPESTATUS[0]} ==="
+          sleep 30
+      volumeMounts:
+        - name: models
+          mountPath: /models
+  volumes:
+    - name: models
+      hostPath:
+        path: /var/lib/yanxi-models
+        type: Directory

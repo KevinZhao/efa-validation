@@ -1,10 +1,10 @@
 {
   "commands": [
-    "sudo -iu ec2-user bash -lc 'aws s3 cp s3://efa-validation-<AWS_ACCOUNT_ID>/manifests/stage4/node-cleanup-160.yaml /tmp/node-cleanup-160.yaml --region us-east-2'",
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete pod node-cleanup-160 -n efa-validation --ignore-not-found --grace-period=0 --force 2>&1 || true'",
+    "sudo -iu ec2-user bash -lc 'aws s3 cp s3://yanxi-validation-788668107894/manifests/stage4/node-cleanup-160.yaml /tmp/node-cleanup-160.yaml --region us-east-2'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete pod node-cleanup-160 -n yanxi-validation --ignore-not-found --grace-period=0 --force 2>&1 || true'",
     "sleep 3",
     "sudo -iu ec2-user bash -lc 'kubectl --context ohio apply -f /tmp/node-cleanup-160.yaml 2>&1'",
     "sleep 20",
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs node-cleanup-160 -n efa-validation 2>&1 | tail -30'"
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs node-cleanup-160 -n yanxi-validation 2>&1 | tail -30'"
   ]
 }

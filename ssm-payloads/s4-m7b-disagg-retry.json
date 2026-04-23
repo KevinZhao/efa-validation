@@ -1,0 +1,6 @@
+{"commands":[
+  "sudo -iu ec2-user bash -lc 'kubectl -n yanxi-validation delete job bench-disagg-sweep --ignore-not-found 2>&1'",
+  "sudo -iu ec2-user bash -lc 'kubectl -n yanxi-validation rollout restart deploy sglang-prefill sglang-decode sglang-lb 2>&1'",
+  "sleep 60",
+  "sudo -iu ec2-user bash -lc 'kubectl -n yanxi-validation get pods 2>&1'"
+]}

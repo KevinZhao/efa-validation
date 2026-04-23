@@ -16,7 +16,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: uccl-ep-upstream-script
-  namespace: efa-validation
+  namespace: yanxi-validation
 data:
   wrapper.sh: |
     #!/usr/bin/env bash
@@ -45,7 +45,7 @@ apiVersion: kubeflow.org/v2beta1
 kind: MPIJob
 metadata:
   name: uccl-ep-upstream
-  namespace: efa-validation
+  namespace: yanxi-validation
 spec:
   slotsPerWorker: 8
   runPolicy:
@@ -57,7 +57,7 @@ spec:
       replicas: 1
       template:
         spec:
-          serviceAccountName: efa-runner
+          serviceAccountName: yanxi-runner
           restartPolicy: Never
           tolerations:
             - key: nvidia.com/gpu
@@ -65,10 +65,10 @@ spec:
               value: "true"
               effect: NoSchedule
           nodeSelector:
-            node.kubernetes.io/instance-type: p5.48xlarge
+            node.kubernetes.io/instance-type: p5en.48xlarge
           containers:
             - name: launcher
-              image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/uccl-ep:v2
+              image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/uccl-ep:v2
               imagePullPolicy: IfNotPresent
               env: &commonEnv
                 - name: OMPI_ALLOW_RUN_AS_ROOT
@@ -199,7 +199,7 @@ spec:
                   topologyKey: kubernetes.io/hostname
           containers:
             - name: worker
-              image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/uccl-ep:v2
+              image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/uccl-ep:v2
               imagePullPolicy: IfNotPresent
               env: *commonEnv
               securityContext:
@@ -208,12 +208,12 @@ spec:
               resources:
                 limits:
                   nvidia.com/gpu: 8
-                  vpc.amazonaws.com/efa: 32
+                  vpc.amazonaws.com/efa: 16
                   hugepages-2Mi: 5120Mi
                   memory: 256Gi
                 requests:
                   nvidia.com/gpu: 8
-                  vpc.amazonaws.com/efa: 32
+                  vpc.amazonaws.com/efa: 16
                   hugepages-2Mi: 5120Mi
                   memory: 256Gi
               volumeMounts:

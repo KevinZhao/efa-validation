@@ -1,8 +1,8 @@
 {
   "commands": [
-    "sudo -iu ec2-user bash -lc 'aws s3 cp s3://efa-validation-<AWS_ACCOUNT_ID>/manifests/stage1-mpijob-nccl-tests.yaml /tmp/stage1-mpi.yaml && kubectl --context ohio apply -f /tmp/stage1-mpi.yaml'",
+    "sudo -iu ec2-user bash -lc 'aws s3 cp s3://yanxi-validation-788668107894/manifests/stage1-mpijob-nccl-tests.yaml /tmp/stage1-mpi.yaml && kubectl --context ohio apply -f /tmp/stage1-mpi.yaml'",
     "sleep 3",
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get mpijobs -n efa-validation'",
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods -n efa-validation -o wide'"
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get mpijobs -n yanxi-validation'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods -n yanxi-validation -o wide'"
   ]
 }

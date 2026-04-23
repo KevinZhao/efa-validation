@@ -8,7 +8,7 @@ apiVersion: leaderworkerset.x-k8s.io/v1
 kind: LeaderWorkerSet
 metadata:
   name: sglang-decode
-  namespace: efa-validation
+  namespace: yanxi-validation
   labels:
     app: sglang
     role: decode
@@ -24,7 +24,7 @@ spec:
           app: sglang
           role: decode
       spec:
-        serviceAccountName: efa-runner
+        serviceAccountName: yanxi-runner
         restartPolicy: Never
         terminationGracePeriodSeconds: 60
         hostIPC: true
@@ -45,7 +45,7 @@ spec:
         containers:
           - name: decode
             # TODO: 阶段开始前确认 tag 已推到 ECR
-            image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/sglang-mooncake:v1
+            image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake:v1
             imagePullPolicy: IfNotPresent
             securityContext:
               capabilities:
@@ -57,7 +57,7 @@ spec:
                 containerPort: 18000
             env:
               - name: MODEL
-                value: "<MODEL_ID>"
+                value: "jdopensource/JoyAI-LLM-Flash"
               - name: ROLE
                 value: "decode"
               - name: TP_SIZE
@@ -99,11 +99,11 @@ spec:
                   fieldRef:
                     fieldPath: status.podIP
               - name: MOONCAKE_MASTER_SERVER
-                value: "sglang-prefill-svc.efa-validation.svc.cluster.local:18000"
+                value: "sglang-prefill-svc.yanxi-validation.svc.cluster.local:18000"
               # ---- SGLang disaggregation handshake ----
               # Decode 通过 Prefill 的 bootstrap port 拿路由信息
               - name: DISAGG_PREFILL_HOST
-                value: "sglang-prefill-svc.efa-validation.svc.cluster.local"
+                value: "sglang-prefill-svc.yanxi-validation.svc.cluster.local"
               - name: DISAGG_PREFILL_PORT
                 value: "8998"
               - name: PYTHONUNBUFFERED
@@ -120,7 +120,7 @@ spec:
                 echo "MODEL=$MODEL  ROLE=$ROLE  TP=$TP_SIZE"
 
                 # 等 Prefill 启好再拉 KV（避免 Mooncake 握手失败）
-                until curl -sf "http://sglang-prefill-svc.efa-validation.svc.cluster.local:30000/health"; do
+                until curl -sf "http://sglang-prefill-svc.yanxi-validation.svc.cluster.local:30000/health"; do
                   echo "waiting for prefill /health ..."; sleep 10
                 done
 
@@ -144,12 +144,12 @@ spec:
             resources:
               limits:
                 nvidia.com/gpu: 8
-                vpc.amazonaws.com/efa: 32
+                vpc.amazonaws.com/efa: 16
                 hugepages-2Mi: 5120Mi
                 memory: 1Ti
               requests:
                 nvidia.com/gpu: 8
-                vpc.amazonaws.com/efa: 32
+                vpc.amazonaws.com/efa: 16
                 hugepages-2Mi: 5120Mi
                 memory: 1Ti
             readinessProbe:
@@ -183,7 +183,7 @@ spec:
           - name: hugepage
             emptyDir:
               medium: HugePages-2Mi
-          # TODO: 阶段开始前换 FSx PVC（ReadWriteMany），预热 <MODEL_ID>
+          # TODO: 阶段开始前换 FSx PVC（ReadWriteMany），预热 jdopensource/JoyAI-LLM-Flash
           - name: models
             emptyDir:
               sizeLimit: 200Gi
@@ -197,7 +197,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: sglang-decode-svc
-  namespace: efa-validation
+  namespace: yanxi-validation
   labels:
     app: sglang
     role: decode

@@ -1,0 +1,370 @@
+# Stage 3.2 — NIXL nixlbench over EFA LIBFABRIC backend with VRAM transfers.
+# Builds etcd-cpp-apiv3 and nixlbench inside each pod via a shared script
+# delivered via a ConfigMap.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nixl-bench-scripts
+  namespace: yanxi-validation
+data:
+  build-and-bench.sh: |
+    #!/bin/bash
+    set -eux
+    ROLE="${ROLE:-unknown}"
+    ETCD_SVC="${ETCD_SVC:-http://nixl-etcd.yanxi-validation.svc:2379}"
+    BENCH_GROUP="${BENCH_GROUP:-default}"
+    BLOCK_SIZE_START="${BLOCK_SIZE_START:-65536}"
+    BLOCK_SIZE_MAX="${BLOCK_SIZE_MAX:-268435456}"
+    INITIATOR_SEG="${INITIATOR_SEG:-VRAM}"
+    TARGET_SEG="${TARGET_SEG:-VRAM}"
+    DEVICE_LIST="${DEVICE_LIST:-all}"
+    NUM_THREADS="${NUM_THREADS:-16}"
+    NUM_ITER="${NUM_ITER:-1008}"
+    WARMUP_ITER="${WARMUP_ITER:-112}"
+    OUTLOG="${OUTLOG:-/workspace/out/nixlbench.log}"
+    mkdir -p "$(dirname "$OUTLOG")" /workspace/build-cache
+
+    if [ ! -f /workspace/build-cache/.apt-done ]; then
+      apt-get update 2>&1 | tail -3
+      DEBIAN_FRONTEND=noninteractive apt-get install -y \
+          libcpprest-dev libssl-dev uuid-dev libgflags-dev \
+          git curl ca-certificates 2>&1 | tail -5
+      touch /workspace/build-cache/.apt-done
+    fi
+
+    if [ ! -x /usr/local/bin/etcd ]; then
+      cd /workspace
+      curl -sSL -o etcd.tar.gz https://github.com/etcd-io/etcd/releases/download/v3.5.13/etcd-v3.5.13-linux-amd64.tar.gz
+      tar xzf etcd.tar.gz
+      cp etcd-v3.5.13-linux-amd64/etcd /usr/local/bin/etcd
+      cp etcd-v3.5.13-linux-amd64/etcdctl /usr/local/bin/etcdctl
+      /usr/local/bin/etcd --version
+    fi
+
+    if [ ! -f /usr/local/lib/libetcd-cpp-api.so ]; then
+      cd /workspace
+      rm -rf etcd-cpp-apiv3
+      git clone --depth=1 https://github.com/etcd-cpp-apiv3/etcd-cpp-apiv3.git
+      cd etcd-cpp-apiv3 && mkdir build && cd build
+      cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DBUILD_ETCD_TESTS=OFF -DBUILD_ETCD_CORE_ONLY=OFF .. 2>&1 | tail -10
+      make -j8 2>&1 | tail -5
+      make install 2>&1 | tail -5
+      ldconfig
+    fi
+
+    if [ ! -x /opt/nixl-src/benchmark/nixlbench/build/nixlbench ]; then
+      cd /opt/nixl-src/benchmark/nixlbench
+      rm -rf build
+      meson setup build --wipe \
+          -Detcd_inc_path=/usr/local/include -Detcd_lib_path=/usr/local/lib \
+          -Dnixl_path=/opt/nixl \
+          -Dcudapath_inc=/usr/local/cuda/include -Dcudapath_lib=/usr/local/cuda/lib64 \
+          --prefix=/workspace/nixlbench-install 2>&1 | tail -20
+      ninja -C build 2>&1 | tail -30
+    fi
+
+    ls -la /opt/nixl-src/benchmark/nixlbench/build/nixlbench
+    export LD_LIBRARY_PATH="/usr/local/lib:/opt/nixl/lib/x86_64-linux-gnu:/opt/nixl/lib/x86_64-linux-gnu/plugins:/opt/amazon/efa/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
+    export NIXL_PLUGIN_DIR="/opt/nixl/lib/x86_64-linux-gnu/plugins"
+    export FI_PROVIDER="efa"
+    export FI_EFA_USE_DEVICE_RDMA="1"
+    export FI_EFA_FORK_SAFE="1"
+
+    /opt/amazon/efa/bin/fi_info -p efa 2>&1 | head -40 || echo "(no fi_info)"
+    nvidia-smi -L 2>&1 | head -10 || echo "(no nvidia-smi)"
+    ls /dev/infiniband 2>&1 | head -5 || echo "(no /dev/infiniband)"
+
+    if [ "$ROLE" = "etcd" ]; then
+      exec /usr/local/bin/etcd \
+          --data-dir=/workspace/etcd-data \
+          --listen-client-urls=http://0.0.0.0:2379 \
+          --advertise-client-urls=http://0.0.0.0:2379 \
+          --listen-peer-urls=http://0.0.0.0:2380 \
+          --initial-advertise-peer-urls=http://0.0.0.0:2380 \
+          --initial-cluster=default=http://0.0.0.0:2380
+    fi
+
+    for i in $(seq 1 120); do
+      if /usr/local/bin/etcdctl --endpoints="${ETCD_SVC}" endpoint health 2>&1; then
+        echo "etcd ready"; break
+      fi
+      echo "waiting for etcd ($i)"; sleep 2
+    done
+
+    if [ "$ROLE" = "target" ]; then
+      sleep 5
+    fi
+
+    set +e
+    /opt/nixl-src/benchmark/nixlbench/build/nixlbench \
+        --etcd_endpoints="${ETCD_SVC}" \
+        --backend=LIBFABRIC \
+        --worker_type=nixl \
+        --benchmark_group="${BENCH_GROUP}" \
+        --scheme=pairwise \
+        --mode=SG \
+        --op_type=WRITE \
+        --initiator_seg_type="${INITIATOR_SEG}" \
+        --target_seg_type="${TARGET_SEG}" \
+        --start_block_size="${BLOCK_SIZE_START}" \
+        --max_block_size="${BLOCK_SIZE_MAX}" \
+        --start_batch_size=1 \
+        --max_batch_size=1 \
+        --num_iter="${NUM_ITER}" \
+        --warmup_iter="${WARMUP_ITER}" \
+        --num_threads="${NUM_THREADS}" \
+        --num_initiator_dev=1 \
+        --num_target_dev=1 \
+        --device_list="${DEVICE_LIST}" \
+        --enable_pt \
+        --progress_threads=2 \
+        2>&1 | tee "${OUTLOG}"
+    RC=$?
+    echo "=== nixlbench exit: ${RC} ==="
+    echo "=== role: ${ROLE} ==="
+    sleep 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nixl-etcd
+  namespace: yanxi-validation
+spec:
+  selector:
+    app: nixl-etcd
+  ports:
+    - name: client
+      port: 2379
+      targetPort: 2379
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nixl-bench
+  namespace: yanxi-validation
+spec:
+  clusterIP: None
+  selector:
+    app: nixl-bench
+  publishNotReadyAddresses: true
+  ports:
+    - name: dummy
+      port: 12345
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nixl-etcd
+  namespace: yanxi-validation
+  labels:
+    app: nixl-etcd
+spec:
+  restartPolicy: Never
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  # etcd runs anywhere — no nodeSelector; prefer a non-GPU node if possible.
+  containers:
+    - name: etcd
+      image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/mooncake-nixl:v1
+      imagePullPolicy: IfNotPresent
+      env:
+        - name: ROLE
+          value: "etcd"
+      command: ["/bin/bash", "/scripts/build-and-bench.sh"]
+      ports:
+        - containerPort: 2379
+        - containerPort: 2380
+      resources:
+        limits:
+          cpu: "2"
+          memory: 4Gi
+        requests:
+          cpu: "500m"
+          memory: 1Gi
+      volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+        - name: scripts
+          mountPath: /scripts
+  volumes:
+    - name: workspace
+      emptyDir: {}
+    - name: scripts
+      configMap:
+        name: nixl-bench-scripts
+        defaultMode: 0755
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nixl-target
+  namespace: yanxi-validation
+  labels:
+    app: nixl-bench
+    role: target
+spec:
+  restartPolicy: Never
+  hostname: nixl-target
+  subdomain: nixl-bench
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values: [nixl-bench, mooncake-bench]
+          topologyKey: kubernetes.io/hostname
+  nodeSelector:
+    node.kubernetes.io/instance-type: p5en.48xlarge
+  containers:
+    - name: target
+      image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/mooncake-nixl:v1
+      imagePullPolicy: IfNotPresent
+      env:
+        - name: ROLE
+          value: "target"
+        - name: BENCH_GROUP
+          value: "stage3-vram-efa"
+        - name: INITIATOR_SEG
+          value: "VRAM"
+        - name: TARGET_SEG
+          value: "VRAM"
+        - name: BLOCK_SIZE_START
+          value: "65536"
+        - name: BLOCK_SIZE_MAX
+          value: "268435456"
+        - name: NUM_THREADS
+          value: "16"
+        - name: NUM_ITER
+          value: "1008"
+        - name: WARMUP_ITER
+          value: "112"
+      command: ["/bin/bash", "/scripts/build-and-bench.sh"]
+      securityContext:
+        capabilities:
+          add: [IPC_LOCK]
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+          vpc.amazonaws.com/efa: 16
+          hugepages-2Mi: 5120Mi
+          memory: 128Gi
+        requests:
+          nvidia.com/gpu: 1
+          vpc.amazonaws.com/efa: 16
+          hugepages-2Mi: 5120Mi
+          memory: 128Gi
+      volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+        - name: shm
+          mountPath: /dev/shm
+        - name: scripts
+          mountPath: /scripts
+  volumes:
+    - name: workspace
+      emptyDir: {}
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 32Gi
+    - name: scripts
+      configMap:
+        name: nixl-bench-scripts
+        defaultMode: 0755
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nixl-initiator
+  namespace: yanxi-validation
+  labels:
+    app: nixl-bench
+    role: initiator
+spec:
+  restartPolicy: Never
+  hostname: nixl-initiator
+  subdomain: nixl-bench
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values: [nixl-bench, mooncake-bench]
+          topologyKey: kubernetes.io/hostname
+  nodeSelector:
+    node.kubernetes.io/instance-type: p5en.48xlarge
+  containers:
+    - name: initiator
+      image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/mooncake-nixl:v1
+      imagePullPolicy: IfNotPresent
+      env:
+        - name: ROLE
+          value: "initiator"
+        - name: BENCH_GROUP
+          value: "stage3-vram-efa"
+        - name: INITIATOR_SEG
+          value: "VRAM"
+        - name: TARGET_SEG
+          value: "VRAM"
+        - name: BLOCK_SIZE_START
+          value: "65536"
+        - name: BLOCK_SIZE_MAX
+          value: "268435456"
+        - name: NUM_THREADS
+          value: "16"
+        - name: NUM_ITER
+          value: "1008"
+        - name: WARMUP_ITER
+          value: "112"
+      command: ["/bin/bash", "/scripts/build-and-bench.sh"]
+      securityContext:
+        capabilities:
+          add: [IPC_LOCK]
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+          vpc.amazonaws.com/efa: 16
+          hugepages-2Mi: 5120Mi
+          memory: 128Gi
+        requests:
+          nvidia.com/gpu: 1
+          vpc.amazonaws.com/efa: 16
+          hugepages-2Mi: 5120Mi
+          memory: 128Gi
+      volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+        - name: shm
+          mountPath: /dev/shm
+        - name: scripts
+          mountPath: /scripts
+  volumes:
+    - name: workspace
+      emptyDir: {}
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 32Gi
+    - name: scripts
+      configMap:
+        name: nixl-bench-scripts
+        defaultMode: 0755

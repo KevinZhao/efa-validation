@@ -1,0 +1,55 @@
+# Stage 3.2 Build Probe — CPU-only pod that explores the nixlbench build on the image
+# No EFA / GPU requested. Stays alive for 4 hours to allow shell probing via kubectl exec.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nixl-build-probe
+  namespace: yanxi-validation
+  labels:
+    app: nixl-probe
+    role: build-probe
+spec:
+  restartPolicy: Never
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  nodeSelector:
+    node.kubernetes.io/instance-type: p5en.48xlarge
+  containers:
+    - name: probe
+      image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/mooncake-nixl:v1
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/bash", "-lc"]
+      args:
+        - |
+          set -eux
+          echo "=== Image inventory ==="
+          which meson ninja cmake go nvcc || true
+          meson --version; ninja --version; cmake --version | head -1
+          dpkg -l | grep -E "(cpprest|boost|grpc)" 2>&1 | head -30 || true
+          echo "=== nixlbench source ==="
+          ls /opt/nixl-src/benchmark/nixlbench/
+          cat /opt/nixl-src/benchmark/nixlbench/meson_options.txt
+          echo "=== NIXL lib ==="
+          ls /opt/nixl/lib/x86_64-linux-gnu/ | head -30
+          ls /opt/nixl/lib/x86_64-linux-gnu/plugins/ || true
+          echo "=== libfabric ==="
+          ls /opt/amazon/efa/lib/ 2>&1 | head -20
+          ls /opt/amazon/efa/include/ 2>&1 | head -10
+          echo "=== Stay alive for probing ==="
+          sleep 14400
+      resources:
+        limits:
+          cpu: "8"
+          memory: 32Gi
+        requests:
+          cpu: "4"
+          memory: 16Gi
+      volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+  volumes:
+    - name: workspace
+      emptyDir: {}

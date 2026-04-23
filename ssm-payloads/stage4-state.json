@@ -1,0 +1,4 @@
+{"commands":[
+  "sudo -iu ec2-user bash -lc 'for n in ip-10-1-12-160 ip-10-1-12-221; do echo ===$n===; aws ssm send-command --region us-east-2 --instance-ids $(aws ec2 describe-instances --region us-east-2 --filters Name=private-dns-name,Values=$n.us-east-2.compute.internal --query Reservations[].Instances[].InstanceId --output text) --document-name AWS-RunShellScript --parameters commands=\"ls /var/lib/yanxi-models/ 2>/dev/null | head; du -sh /var/lib/yanxi-models/current 2>/dev/null\" --query Command.CommandId --output text; done' 2>&1 | head -20",
+  "sudo -iu ec2-user bash -lc 'kubectl -n yanxi-validation get svc 2>&1'"
+]}

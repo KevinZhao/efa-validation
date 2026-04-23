@@ -1,0 +1,43 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fetch-gpu-logs
+  namespace: yanxi-validation
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  completions: 3
+  parallelism: 3
+  completionMode: Indexed
+  template:
+    metadata:
+      labels: { app: fetch-gpu-logs }
+    spec:
+      serviceAccountName: yanxi-runner
+      restartPolicy: Never
+      tolerations:
+        - { key: nvidia.com/gpu, operator: Equal, value: "true", effect: NoSchedule }
+      nodeSelector: { node.kubernetes.io/instance-type: p5en.48xlarge }
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels: { app: fetch-gpu-logs }
+      containers:
+        - name: fetch
+          image: amazon/aws-cli:2.18.1
+          env:
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eux
+              aws s3 cp /logs/${NODE_NAME}.csv s3://yanxi-validation-788668107894/gpu-stats/${NODE_NAME}.csv --region us-east-2
+              wc -l /logs/${NODE_NAME}.csv
+          volumeMounts:
+            - { name: logs, mountPath: /logs }
+      volumes:
+        - name: logs
+          hostPath: { path: /var/log/gpu-sampler, type: Directory }

@@ -1,5 +1,5 @@
 {
   "commands": [
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio exec -n efa-validation nccl-tests-efa-launcher-2tjrv -- bash -c \"nohup bash -c 'timeout 25 mpirun --allow-run-as-root --hostfile /etc/mpi/hostfile -np 2 --mca plm_base_verbose 10 --mca oob_base_verbose 10 --mca plm_rsh_no_tree_spawn 1 hostname > /tmp/mpi_verbose.log 2>&1' >/dev/null 2>&1 & sleep 30; cat /tmp/mpi_verbose.log 2>&1 | head -200\"'"
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio exec -n yanxi-validation nccl-tests-efa-launcher-2tjrv -- bash -c \"nohup bash -c 'timeout 25 mpirun --allow-run-as-root --hostfile /etc/mpi/hostfile -np 2 --mca plm_base_verbose 10 --mca oob_base_verbose 10 --mca plm_rsh_no_tree_spawn 1 hostname > /tmp/mpi_verbose.log 2>&1' >/dev/null 2>&1 & sleep 30; cat /tmp/mpi_verbose.log 2>&1 | head -200\"'"
   ]
 }

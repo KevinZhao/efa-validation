@@ -1,7 +1,7 @@
 {
   "commands": [
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n efa-validation uccl-ep-upstream-launcher-7v7w6 > /tmp/s2-full.log 2>&1; wc -l /tmp/s2-full.log'",
-    "sudo -iu ec2-user bash -lc 'aws s3 cp /tmp/s2-full.log s3://efa-validation-<AWS_ACCOUNT_ID>/logs/s2-uccl-upstream-full.log --region us-east-2'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n yanxi-validation uccl-ep-upstream-launcher-7v7w6 > /tmp/s2-full.log 2>&1; wc -l /tmp/s2-full.log'",
+    "sudo -iu ec2-user bash -lc 'aws s3 cp /tmp/s2-full.log s3://yanxi-validation-788668107894/logs/s2-uccl-upstream-full.log --region us-east-2'",
     "echo === non NCCL lines ===",
     "sudo -iu ec2-user bash -lc 'grep -v -E \"NCCL INFO|\\\\[Service thread\\\\]|Abort COMPLETE|NET/OFI MR cache\" /tmp/s2-full.log | head -120'"
   ]

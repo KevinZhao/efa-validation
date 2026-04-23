@@ -1,5 +1,5 @@
 {
   "commands": [
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio debug node/<GPU_NODE_0> --image=alpine:3 -q --profile=sysadmin -- sh -c \"chroot /host cat /etc/containerd/config.toml 2>&1 | grep -E -A2 nvidia\\|default_runtime 2>&1 | head -30\" 2>&1 | head -30 || true'"
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio debug node/ip-10-1-12-160.us-east-2.compute.internal --image=alpine:3 -q --profile=sysadmin -- sh -c \"chroot /host cat /etc/containerd/config.toml 2>&1 | grep -E -A2 nvidia\\|default_runtime 2>&1 | head -30\" 2>&1 | head -30 || true'"
   ]
 }

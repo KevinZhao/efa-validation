@@ -1,9 +1,9 @@
 {
   "commands": [
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods -n efa-validation -o wide | grep baseline'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods -n yanxi-validation -o wide | grep baseline'",
     "echo === new pod log tail ===",
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n efa-validation sglang-baseline-9dbf4b857-dn2qt --tail=50 2>&1 | tail -50'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n yanxi-validation sglang-baseline-9dbf4b857-dn2qt --tail=50 2>&1 | tail -50'",
     "echo === describe new pod events ===",
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio describe pod sglang-baseline-9dbf4b857-dn2qt -n efa-validation 2>&1 | tail -30'"
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio describe pod sglang-baseline-9dbf4b857-dn2qt -n yanxi-validation 2>&1 | tail -30'"
   ]
 }

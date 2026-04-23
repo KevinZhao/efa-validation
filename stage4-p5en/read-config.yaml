@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: read-cfg
+  namespace: yanxi-validation
+spec:
+  restartPolicy: Never
+  tolerations:
+    - {key: nvidia.com/gpu, operator: Equal, value: "true", effect: NoSchedule}
+  nodeSelector: {node.kubernetes.io/instance-type: p5en.48xlarge}
+  containers:
+    - name: c
+      image: alpine:3.20
+      command: ["sh", "-c", "head -70 /models/current/config.json; echo ===SIZE===; du -sh /models/current; echo ===FILES===; ls /models/current | head -15; echo ===COUNT===; ls /models/current | wc -l; sleep 5"]
+      volumeMounts:
+        - {name: m, mountPath: /models}
+  volumes:
+    - name: m
+      hostPath: {path: /var/lib/yanxi-models, type: Directory}

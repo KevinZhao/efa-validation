@@ -1,6 +1,6 @@
 # Stage 4 — SGLang PD 分离 1P:1D + Mooncake KV over EFA
 
-Stage 4 目标：SGLang PD 分离 1P:1D + Mooncake KV over EFA v2。
+对应 `../../EFA_Validation_Plan.md` 第 4.4 节。
 
 ## 目标
 
@@ -30,13 +30,13 @@ SLA 判据：**(b) 的 TTFT / TPOT ≤ (a) 的 1.3×**，OTPS 达 SLA 假设。
 
 ```bash
 # 在堡垒机 → builder 上跑（参考 RUNBOOK.md）
-cd <repo_root>
+cd /home/ec2-user/workspace/JD/YanxiInference/validation
 ./scripts/build-image.sh \
     common/Dockerfile.sglang-mooncake \
     sglang-mooncake \
     v1 \
-    --build-arg=BASE_IMAGE=<AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/base-cuda-efa:v1
-# 镜像推到：<AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/sglang-mooncake:v1
+    --build-arg=BASE_IMAGE=788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/base-cuda-efa:v1
+# 镜像推到：788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake:v1
 ```
 
 镜像构建期间可以并行做模型预热（见下节）。
@@ -45,18 +45,18 @@ cd <repo_root>
 
 ## 前置：模型权重预下载
 
-**强烈建议**先把 `<MODEL_ID>` 预拉到共享存储，避免两个实例各拉一次拖慢冷启动。
+**强烈建议**先把 `jdopensource/JoyAI-LLM-Flash` 预拉到共享存储，避免两个实例各拉一次拖慢冷启动。
 
 两种方案，按可用性选其一：
 
 1. **FSx for Lustre（推荐）**
-   - 在集群部署仓库中按 `scripts/option_install_csi_drivers.sh` 装 FSx CSI。
-   - 建一个 `StorageClass: fsx-sc` + `PVC: generic-model-weights`（ReadWriteMany，1.2 TB）。
-   - 起一个一次性 Pod 在 FSx 上跑 `huggingface-cli download <MODEL_ID> --local-dir /models/generic-model`。
-   - 把三个 LWS 里 `volumes.models.emptyDir` 全改成 `persistentVolumeClaim.claimName: generic-model-weights`，并把 `--model-path` 改为 `/models/generic-model`。
+   - 在 `eks-cluster-deployment` 中按 `scripts/option_install_csi_drivers.sh` 装 FSx CSI。
+   - 建一个 `StorageClass: fsx-sc` + `PVC: joyai-flash-weights`（ReadWriteMany，1.2 TB）。
+   - 起一个一次性 Pod 在 FSx 上跑 `huggingface-cli download jdopensource/JoyAI-LLM-Flash --local-dir /models/joyai-flash`。
+   - 把三个 LWS 里 `volumes.models.emptyDir` 全改成 `persistentVolumeClaim.claimName: joyai-flash-weights`，并把 `--model-path` 改为 `/models/joyai-flash`。
 
 2. **S3 预热到节点 NVMe**
-   - 在节点启动时通过 userdata / DaemonSet 把权重从 `s3://<bucket>/models/generic-model/` 同步到 `/mnt/nvme/models`。
+   - 在节点启动时通过 userdata / DaemonSet 把权重从 `s3://<bucket>/models/joyai-flash/` 同步到 `/mnt/nvme/models`。
    - hostPath 挂进去。
 
 > 当前 3 个 LWS 里的 `models` volume 都是 `emptyDir` placeholder，在阶段开始前必须替换。三个 YAML 里都已打上 `TODO: 阶段开始前换 FSx PVC` 标记。
@@ -65,12 +65,12 @@ cd <repo_root>
 
 ## 执行顺序
 
-所有命令在 Ohio 堡垒机 `<OHIO_BASTION_ID>` 上执行。Namespace 统一 `efa-validation`（已由 `common/00-namespace.yaml` 创建）。
+所有命令在 Ohio 堡垒机 `i-0341d214635c1ca74` 上执行。Namespace 统一 `yanxi-validation`（已由 `common/00-namespace.yaml` 创建）。
 
 ### 0. Sanity：确认集群就绪
 
 ```bash
-kubectl -n efa-validation get sa efa-runner
+kubectl -n yanxi-validation get sa yanxi-runner
 kubectl get nodes -l node.kubernetes.io/instance-type=p5.48xlarge \
   -o custom-columns=NAME:.metadata.name,GPU:.status.allocatable."nvidia\.com/gpu",EFA:.status.allocatable."vpc\.amazonaws\.com/efa"
 # 期望：2 节点都是 gpu=8 efa=32
@@ -81,15 +81,15 @@ kubectl get crd leaderworkersets.leaderworkerset.x-k8s.io
 
 ```bash
 kubectl apply -f lws-baseline-tp8.yaml
-kubectl -n efa-validation rollout status lws/sglang-baseline-tp8 --timeout=20m
+kubectl -n yanxi-validation rollout status lws/sglang-baseline-tp8 --timeout=20m
 # 跟 probe：initialDelaySeconds=180s，首次健康约 5 分钟
-kubectl -n efa-validation logs -f sglang-baseline-tp8-0 | tail -f
+kubectl -n yanxi-validation logs -f sglang-baseline-tp8-0 | tail -f
 
 # 发压（TARGET_SVC 默认已是 sglang-decode-svc，本步改成 baseline）
 sed -i 's|value: "sglang-decode-svc"|value: "sglang-baseline-svc"|' job-bench-serving.yaml
 kubectl apply -f job-bench-serving.yaml
-kubectl -n efa-validation wait --for=condition=complete job/sglang-bench-serving --timeout=2h
-kubectl -n efa-validation logs job/sglang-bench-serving | tail -200 | tee ../logs/stage4-baseline.log
+kubectl -n yanxi-validation wait --for=condition=complete job/sglang-bench-serving --timeout=2h
+kubectl -n yanxi-validation logs job/sglang-bench-serving | tail -200 | tee ../logs/stage4-baseline.log
 
 # 清理
 kubectl delete -f job-bench-serving.yaml
@@ -102,14 +102,14 @@ kubectl delete -f lws-baseline-tp8.yaml
 
 ```bash
 kubectl apply -f lws-prefill.yaml
-kubectl -n efa-validation rollout status lws/sglang-prefill --timeout=20m
+kubectl -n yanxi-validation rollout status lws/sglang-prefill --timeout=20m
 
 kubectl apply -f lws-decode.yaml
-kubectl -n efa-validation rollout status lws/sglang-decode --timeout=25m
+kubectl -n yanxi-validation rollout status lws/sglang-decode --timeout=25m
 
 # 两个实例都 Ready 后，复核 Mooncake 握手成功
-kubectl -n efa-validation logs sglang-prefill-0   | grep -iE "mooncake|efa|disagg" | tail -30
-kubectl -n efa-validation logs sglang-decode-0    | grep -iE "mooncake|efa|disagg" | tail -30
+kubectl -n yanxi-validation logs sglang-prefill-0   | grep -iE "mooncake|efa|disagg" | tail -30
+kubectl -n yanxi-validation logs sglang-decode-0    | grep -iE "mooncake|efa|disagg" | tail -30
 ```
 
 ### 3. 采 1P:1D 数据
@@ -118,8 +118,8 @@ kubectl -n efa-validation logs sglang-decode-0    | grep -iE "mooncake|efa|disag
 # 确保 TARGET_SVC 指回 decode
 sed -i 's|value: "sglang-baseline-svc"|value: "sglang-decode-svc"|' job-bench-serving.yaml
 kubectl apply -f job-bench-serving.yaml
-kubectl -n efa-validation wait --for=condition=complete job/sglang-bench-serving --timeout=2h
-kubectl -n efa-validation logs job/sglang-bench-serving | tail -200 | tee ../logs/stage4-pd.log
+kubectl -n yanxi-validation wait --for=condition=complete job/sglang-bench-serving --timeout=2h
+kubectl -n yanxi-validation logs job/sglang-bench-serving | tail -200 | tee ../logs/stage4-pd.log
 ```
 
 ### 4. 对比
@@ -152,6 +152,7 @@ kubectl -n efa-validation logs job/sglang-bench-serving | tail -200 | tee ../log
 
 ## 参考
 
+- 编排方案：`../../EFA_Validation_Plan.md` §4.4
 - RUNBOOK：`../RUNBOOK.md`
 - 构建脚本：`../scripts/build-image.sh`
 - LWS 示例：https://github.com/kubernetes-sigs/lws/tree/main/docs/examples（sglang 目录）

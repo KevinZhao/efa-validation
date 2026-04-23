@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build a Docker image on efa-builder and push to ECR.
+# Build a Docker image on yanxi-builder and push to ECR.
 # Usage:
 #   ./build-image.sh <dockerfile-rel-path-in-repo> <ecr-repo-short> <tag> [--build-arg=KEY=VAL ...]
 # Examples:
@@ -17,7 +17,7 @@ DOCKERFILE_LOCAL="${REPO_ROOT}/${DOCKERFILE_REL}"
 [ -f "$DOCKERFILE_LOCAL" ] || { echo "Dockerfile not found: $DOCKERFILE_LOCAL" >&2; exit 1; }
 
 DOCKERFILE_S3_KEY="dockerfiles/$(basename "$DOCKERFILE_REL")-$(ts)"
-ECR_IMAGE="${ECR_REG}/efa-validation/${REPO_SHORT}"
+ECR_IMAGE="${ECR_REG}/yanxi/${REPO_SHORT}"
 STAMP="$(ts)"
 LOG_S3_KEY="logs/build-${REPO_SHORT}-${STAMP}.log"
 

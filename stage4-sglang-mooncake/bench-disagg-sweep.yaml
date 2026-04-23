@@ -1,0 +1,88 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bench-disagg-sweep
+  namespace: yanxi-validation
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 7200
+  template:
+    spec:
+      restartPolicy: Never
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: bench
+          image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake:v1
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -ux
+              mkdir -p /results /hostlogs
+              TARGET="sglang-lb.yanxi-validation.svc:8000"
+              for i in $(seq 1 60); do
+                CODE=$(curl -o /dev/null -s -w "%{http_code}" http://${TARGET}/get_model_info 2>/dev/null || echo 000)
+                echo "wait lb attempt=$i code=$CODE"
+                [ "$CODE" = "200" ] && break
+                sleep 5
+              done
+
+              SUMMARY=/results/disagg-summary.tsv
+              printf 'rate\tprompts\tTTFT_mean_ms\tTTFT_p99_ms\tITL_mean_ms\tITL_p99_ms\tE2E_mean_ms\toutput_tps\trequest_tps\n' > "$SUMMARY"
+
+              for RATE in 2 4 8 16 inf; do
+                OUT=/results/disagg-rate-${RATE}.json
+                LOG=/results/disagg-rate-${RATE}.log
+                echo "=== RUN rate=${RATE} ==="
+                python3 -m sglang.bench_serving \
+                  --backend sglang \
+                  --host sglang-lb.yanxi-validation.svc --port 8000 \
+                  --model /models/current --tokenizer /models/current \
+                  --num-prompts 128 \
+                  --dataset-name random \
+                  --random-input-len 1024 \
+                  --random-output-len 256 \
+                  --request-rate ${RATE} \
+                  --pd-separated \
+                  --output-file "${OUT}" \
+                  > "${LOG}" 2>&1 || echo "(rate=${RATE} failed)"
+
+                TTFT=$(grep -oE "Mean TTFT \(ms\):[ ]+[0-9.]+"   "${LOG}" | tail -1 | grep -oE '[0-9.]+$')
+                T99=$(grep  -oE "P99 TTFT \(ms\):[ ]+[0-9.]+"    "${LOG}" | tail -1 | grep -oE '[0-9.]+$')
+                ITL=$(grep  -oE "Mean ITL \(ms\):[ ]+[0-9.]+"    "${LOG}" | tail -1 | grep -oE '[0-9.]+$')
+                I99=$(grep  -oE "P99 ITL \(ms\):[ ]+[0-9.]+"     "${LOG}" | tail -1 | grep -oE '[0-9.]+$')
+                E2E=$(grep  -oE "Mean E2E Latency \(ms\):[ ]+[0-9.]+" "${LOG}" | tail -1 | grep -oE '[0-9.]+$')
+                OTPS=$(grep -oE "Output token throughput \(tok/s\):[ ]+[0-9.]+" "${LOG}" | tail -1 | grep -oE '[0-9.]+$')
+                RTPS=$(grep -oE "Request throughput \(req/s\):[ ]+[0-9.]+"      "${LOG}" | tail -1 | grep -oE '[0-9.]+$')
+                printf '%s\t128\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                  "${RATE}" "${TTFT:-NA}" "${T99:-NA}" "${ITL:-NA}" "${I99:-NA}" "${E2E:-NA}" "${OTPS:-NA}" "${RTPS:-NA}" | tee -a "$SUMMARY"
+                sleep 5
+              done
+              echo "=== SWEEP DONE ==="
+              cat "$SUMMARY"
+              cp "$SUMMARY" /hostlogs/disagg-summary.tsv
+              cp /results/disagg-rate-*.log /hostlogs/ 2>/dev/null || true
+              ls -la /hostlogs/
+              sleep 1200
+          volumeMounts:
+            - name: results
+              mountPath: /results
+            - name: models
+              mountPath: /models
+            - name: hostlogs
+              mountPath: /hostlogs
+      volumes:
+        - name: results
+          emptyDir: {}
+        - name: models
+          hostPath:
+            path: /var/lib/yanxi-models
+            type: Directory
+        - name: hostlogs
+          hostPath:
+            path: /var/lib/yanxi-logs/stage4
+            type: DirectoryOrCreate

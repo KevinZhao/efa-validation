@@ -1,7 +1,7 @@
 {
   "commands": [
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n efa-validation uccl-ep-correctness-launcher-b5df5 > /tmp/s2-corr-final.log 2>&1; wc -l /tmp/s2-corr-final.log'",
-    "sudo -iu ec2-user bash -lc 'aws s3 cp /tmp/s2-corr-final.log s3://efa-validation-<AWS_ACCOUNT_ID>/logs/s2-correctness.log'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n yanxi-validation uccl-ep-correctness-launcher-b5df5 > /tmp/s2-corr-final.log 2>&1; wc -l /tmp/s2-corr-final.log'",
+    "sudo -iu ec2-user bash -lc 'aws s3 cp /tmp/s2-corr-final.log s3://yanxi-validation-788668107894/logs/s2-correctness.log'",
     "echo === last 100 lines ===",
     "sudo -iu ec2-user bash -lc 'tail -100 /tmp/s2-corr-final.log'"
   ]

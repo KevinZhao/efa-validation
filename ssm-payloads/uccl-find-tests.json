@@ -1,0 +1,3 @@
+{"commands":[
+  "sudo -iu ec2-user bash -lc 'kubectl -n yanxi-validation run uccl-probe --rm -i --restart=Never --image=788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/uccl-ep:v2 --overrides={\"spec\":{\"tolerations\":[{\"key\":\"nvidia.com/gpu\",\"operator\":\"Equal\",\"value\":\"true\",\"effect\":\"NoSchedule\"}],\"containers\":[{\"name\":\"x\",\"image\":\"788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/uccl-ep:v2\",\"command\":[\"bash\",\"-c\",\"find /opt/uccl -name test_*.py -o -name test_internode* -o -name test_low_latency* 2>/dev/null | head -20; echo ---; ls /opt/uccl/ep/ 2>&1; echo ---; python -c import uccl.ep 2>&1 || python3 -c import uccl 2>&1; echo ---; python3 -c \\\"import uccl.ep as ep; print(dir(ep))\\\" 2>&1\"]}]}} 2>&1 | tail -40'"
+]}

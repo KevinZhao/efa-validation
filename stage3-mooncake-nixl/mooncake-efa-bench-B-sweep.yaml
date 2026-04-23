@@ -1,0 +1,304 @@
+# Stage 3.1 Round B — DRAM→DRAM parameter sweep (Mooncake EFA)
+# 目标：找到 DRAM 路径最大吞吐，排除 CPU 并发度 / per-WR overhead 瓶颈。
+# sweep 在同一对 initiator/target 上连续跑，避免反复建链。
+apiVersion: v1
+kind: Service
+metadata:
+  name: mooncake-metadata
+  namespace: yanxi-validation
+spec:
+  selector:
+    app: mooncake-metadata
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mooncake-bench
+  namespace: yanxi-validation
+spec:
+  clusterIP: None
+  selector:
+    app: mooncake-bench
+  publishNotReadyAddresses: true
+  ports:
+    - name: dummy
+      port: 12345
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mooncake-metadata
+  namespace: yanxi-validation
+  labels:
+    app: mooncake-metadata
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mooncake-metadata
+  template:
+    metadata:
+      labels:
+        app: mooncake-metadata
+    spec:
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      nodeSelector:
+        node.kubernetes.io/instance-type: p5en.48xlarge
+      containers:
+        - name: metadata
+          image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/mooncake-nixl:v1
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -eux
+              mkdir -p /workspace/metadata-build
+              cp -r /opt/mooncake/mooncake-transfer-engine/example/http-metadata-server/. /workspace/metadata-build/
+              cd /workspace/metadata-build
+              export PATH="/usr/local/go/bin:${PATH}"
+              export GOCACHE=/workspace/.gocache
+              export GOMODCACHE=/workspace/.gomodcache
+              go mod tidy
+              go build -o /usr/local/bin/mooncake-metadata-server . 2>&1
+              exec /usr/local/bin/mooncake-metadata-server --addr=:8080
+          ports:
+            - containerPort: 8080
+          resources:
+            limits:
+              cpu: "2"
+              memory: 4Gi
+            requests:
+              cpu: "500m"
+              memory: 1Gi
+      volumes:
+        - name: workspace
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mooncake-target
+  namespace: yanxi-validation
+  labels:
+    app: mooncake-bench
+    role: target
+spec:
+  restartPolicy: Never
+  hostname: mooncake-target
+  subdomain: mooncake-bench
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values: [mooncake-bench, nixl-bench]
+          topologyKey: kubernetes.io/hostname
+  nodeSelector:
+    node.kubernetes.io/instance-type: p5en.48xlarge
+  containers:
+    - name: target
+      image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/mooncake-nixl:v1
+      imagePullPolicy: IfNotPresent
+      env:
+        - name: FI_PROVIDER
+          value: "efa"
+        - name: FI_EFA_USE_DEVICE_RDMA
+          value: "1"
+        - name: FI_EFA_FORK_SAFE
+          value: "1"
+      command: ["/bin/bash", "-lc"]
+      args:
+        - |
+          set -eux
+          for i in $(seq 1 120); do
+            CODE=$(curl -o /dev/null -s -w "%{http_code}" http://mooncake-metadata.yanxi-validation.svc:8080/metadata 2>/dev/null || echo 000)
+            [ "$CODE" = "404" ] || [ "$CODE" = "200" ] && { echo "metadata reachable code=$CODE"; break; }
+            echo "attempt=$i code=$CODE"; sleep 2
+          done
+          MY_IP=$(hostname -i | awk '{print $1}')
+          echo "target IP=$MY_IP"
+          cd /opt/mooncake/build/mooncake-transfer-engine/example
+          # 长时间 target，覆盖所有 sweep 运行
+          exec ./transfer_engine_bench \
+            --mode=target \
+            --protocol=efa \
+            --local_server_name="${MY_IP}:12345" \
+            --metadata_server="http://mooncake-metadata.yanxi-validation.svc:8080/metadata" \
+            --use_vram=false \
+            --gpu_id=0 \
+            --buffer_size=$((8<<30)) \
+            --duration=1200
+      securityContext:
+        capabilities:
+          add: [IPC_LOCK]
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+          vpc.amazonaws.com/efa: 16
+          hugepages-2Mi: 5120Mi
+          memory: 128Gi
+        requests:
+          nvidia.com/gpu: 1
+          vpc.amazonaws.com/efa: 16
+          hugepages-2Mi: 5120Mi
+          memory: 128Gi
+      volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+  volumes:
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 32Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mooncake-initiator
+  namespace: yanxi-validation
+  labels:
+    app: mooncake-bench
+    role: initiator
+spec:
+  restartPolicy: Never
+  hostname: mooncake-initiator
+  subdomain: mooncake-bench
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values: [mooncake-bench, nixl-bench]
+          topologyKey: kubernetes.io/hostname
+  nodeSelector:
+    node.kubernetes.io/instance-type: p5en.48xlarge
+  containers:
+    - name: initiator
+      image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/mooncake-nixl:v1
+      imagePullPolicy: IfNotPresent
+      env:
+        - name: FI_PROVIDER
+          value: "efa"
+        - name: FI_EFA_USE_DEVICE_RDMA
+          value: "1"
+        - name: FI_EFA_FORK_SAFE
+          value: "1"
+      command: ["/bin/bash", "-lc"]
+      args:
+        - |
+          set -eux
+          for i in $(seq 1 120); do
+            CODE=$(curl -o /dev/null -s -w "%{http_code}" http://mooncake-metadata.yanxi-validation.svc:8080/metadata 2>/dev/null || echo 000)
+            [ "$CODE" = "404" ] || [ "$CODE" = "200" ] && { echo "metadata reachable code=$CODE"; break; }
+            sleep 2
+          done
+          for i in $(seq 1 60); do
+            TARGET_IP=$(getent hosts mooncake-target.mooncake-bench.yanxi-validation.svc 2>/dev/null | awk '{print $1}' || true)
+            [ -n "$TARGET_IP" ] && break
+            sleep 3
+          done
+          [ -z "$TARGET_IP" ] && { echo "target DNS not resolvable"; exit 1; }
+          echo "target_ip=$TARGET_IP"
+          sleep 15
+          MY_IP=$(hostname -i | awk '{print $1}')
+          mkdir -p /workspace/out
+          cd /opt/mooncake/build/mooncake-transfer-engine/example
+
+          # Sweep matrix: (threads, batch_size, block_size)
+          # 当前基线 (12, 64, 4MiB) = 19.31 GB/s
+          # 扫 threads 看 CPU 并发度；扩 block 看 per-WR overhead
+          SWEEP=(
+            "12 64  4194304   baseline"
+            "24 64  4194304   t24"
+            "32 64  4194304   t32"
+            "48 64  4194304   t48"
+            "32 128 4194304   t32_b128"
+            "32 64  16777216  t32_blk16M"
+            "32 128 16777216  t32_b128_blk16M"
+            "64 128 4194304   t64_b128"
+            "16 64  1048576   t16_blk1M"
+            "32 64  67108864  t32_blk64M"
+          )
+          RESULTS=/workspace/out/sweep-results.txt
+          echo "# threads batch block tag duration_s batches throughput_GBs" > "$RESULTS"
+          for row in "${SWEEP[@]}"; do
+            read t b blk tag <<< "$row"
+            LOG=/workspace/out/run-${tag}.log
+            echo "=== RUN tag=$tag threads=$t batch=$b block=$blk ==="
+            ./transfer_engine_bench \
+              --mode=initiator \
+              --protocol=efa \
+              --local_server_name="${MY_IP}:12346" \
+              --segment_id="${TARGET_IP}:12345" \
+              --metadata_server="http://mooncake-metadata.yanxi-validation.svc:8080/metadata" \
+              --operation=write \
+              --use_vram=false \
+              --gpu_id=0 \
+              --buffer_size=$((8<<30)) \
+              --block_size=${blk} \
+              --batch_size=${b} \
+              --threads=${t} \
+              --duration=30 \
+              > "$LOG" 2>&1 || echo "(run $tag failed)"
+            # 解析结果行形如: Test completed: duration 60.11, batch count 4324, throughput 19.31 GB/s
+            LINE=$(grep -E "Test completed" "$LOG" | tail -1 || echo "FAIL")
+            DUR=$(echo "$LINE"    | grep -oE "duration [0-9.]+"    | awk '{print $2}')
+            CNT=$(echo "$LINE"    | grep -oE "batch count [0-9]+"  | awk '{print $3}')
+            TP=$(echo "$LINE"     | grep -oE "throughput [0-9.]+"  | awk '{print $2}')
+            echo "$t $b $blk $tag ${DUR:-NA} ${CNT:-NA} ${TP:-FAIL}" | tee -a "$RESULTS"
+            sleep 3
+          done
+          echo "=== SWEEP DONE ==="
+          cat "$RESULTS"
+      securityContext:
+        capabilities:
+          add: [IPC_LOCK]
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+          vpc.amazonaws.com/efa: 16
+          hugepages-2Mi: 5120Mi
+          memory: 128Gi
+        requests:
+          nvidia.com/gpu: 1
+          vpc.amazonaws.com/efa: 16
+          hugepages-2Mi: 5120Mi
+          memory: 128Gi
+      volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+        - name: workspace
+          mountPath: /workspace
+  volumes:
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 32Gi
+    - name: workspace
+      emptyDir: {}

@@ -1,12 +1,12 @@
 {
   "commands": [
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete mpijob -n efa-validation nccl-tests-efa --ignore-not-found=true'",
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete pod -n efa-validation --all --force --grace-period=0 2>&1 | tail -5'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete mpijob -n yanxi-validation nccl-tests-efa --ignore-not-found=true'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete pod -n yanxi-validation --all --force --grace-period=0 2>&1 | tail -5'",
     "sleep 10",
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods -n efa-validation'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods -n yanxi-validation'",
     "sudo -iu ec2-user bash -lc 'kubectl --context ohio apply -f /tmp/gpu-smoke.yaml'",
     "sleep 40",
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pod -n efa-validation gpu-smoke -o wide'",
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n efa-validation gpu-smoke 2>&1 | tail -40'"
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pod -n yanxi-validation gpu-smoke -o wide'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n yanxi-validation gpu-smoke 2>&1 | tail -40'"
   ]
 }

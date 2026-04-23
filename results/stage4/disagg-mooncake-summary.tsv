@@ -1,0 +1,6 @@
+rate	prompts	TTFT_mean_ms	TTFT_p99_ms	ITL_mean_ms	ITL_p99_ms	E2E_mean_ms	output_tps	request_tps	notes
+2	128	838.84	3076.11	2.80	5.23	22268.69	25.93	0.20	completed_w_queue_blowup_last_9
+4	128	0.00	0.00	0.00	0.00	443735.32	18.48	0.14	KV_transfer_timeouts_most_requests_stuck
+8	128	-	-	-	-	-	-	-	aborted_after_rate4_failure_pattern_clear
+16	128	-	-	-	-	-	-	-	aborted
+inf	128	-	-	-	-	-	-	-	aborted

@@ -5,9 +5,9 @@
     "STAMP=$(date -u +%Y%m%dT%H%M%SZ)",
     "DIR=/root/build/mooncake-nixl-${STAMP}",
     "mkdir -p $DIR && cd $DIR",
-    "aws s3 cp s3://efa-validation-<AWS_ACCOUNT_ID>/dockerfiles/Dockerfile.mooncake-nixl Dockerfile --region us-east-2",
-    "aws ecr get-login-password --region us-east-2 | docker login --username AWS --password-stdin <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com",
-    "nohup bash -c 'docker build --progress=plain --build-arg BASE_IMAGE=<AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/base-cuda-efa:v2 -t <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/mooncake-nixl:v1 -f Dockerfile . 2>&1 | tee build.log; docker tag <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/mooncake-nixl:v1 <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/mooncake-nixl:latest 2>&1; docker push <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/mooncake-nixl:v1 2>&1 | tee push.log; docker push <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/mooncake-nixl:latest 2>&1 | tee -a push.log' > build-orchestrator.log 2>&1 &",
+    "aws s3 cp s3://yanxi-validation-788668107894/dockerfiles/Dockerfile.mooncake-nixl Dockerfile --region us-east-2",
+    "aws ecr get-login-password --region us-east-2 | docker login --username AWS --password-stdin 788668107894.dkr.ecr.us-east-2.amazonaws.com",
+    "nohup bash -c 'docker build --progress=plain --build-arg BASE_IMAGE=788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/base-cuda-efa:v2 -t 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/mooncake-nixl:v1 -f Dockerfile . 2>&1 | tee build.log; docker tag 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/mooncake-nixl:v1 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/mooncake-nixl:latest 2>&1; docker push 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/mooncake-nixl:v1 2>&1 | tee push.log; docker push 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/mooncake-nixl:latest 2>&1 | tee -a push.log' > build-orchestrator.log 2>&1 &",
     "echo started build dir=$DIR",
     "ps -ef | grep 'docker build' | grep -v grep | head -3"
   ]

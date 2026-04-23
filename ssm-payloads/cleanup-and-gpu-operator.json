@@ -3,7 +3,7 @@
     "echo === delete existing nvidia-device-plugin DaemonSet ===",
     "sudo -iu ec2-user bash -lc 'kubectl --context ohio -n kube-system delete daemonset nvidia-device-plugin-daemonset --ignore-not-found=true'",
     "sudo -iu ec2-user bash -lc 'kubectl --context ohio -n kube-system delete pod -l name=nvidia-device-plugin-ds --force --grace-period=0 --ignore-not-found=true 2>&1 | tail -5'",
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio -n efa-validation delete pod gpu-smoke gpu-smoke-cdi --force --grace-period=0 --ignore-not-found=true 2>&1 | tail -3'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio -n yanxi-validation delete pod gpu-smoke gpu-smoke-cdi --force --grace-period=0 --ignore-not-found=true 2>&1 | tail -3'",
     "sleep 5",
     "echo === verify cleanup ===",
     "sudo -iu ec2-user bash -lc 'kubectl --context ohio -n kube-system get pods -l name=nvidia-device-plugin-ds 2>&1'",

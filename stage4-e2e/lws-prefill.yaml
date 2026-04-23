@@ -10,7 +10,7 @@ apiVersion: leaderworkerset.x-k8s.io/v1
 kind: LeaderWorkerSet
 metadata:
   name: sglang-prefill
-  namespace: efa-validation
+  namespace: yanxi-validation
   labels:
     app: sglang
     role: prefill
@@ -26,7 +26,7 @@ spec:
           app: sglang
           role: prefill
       spec:
-        serviceAccountName: efa-runner
+        serviceAccountName: yanxi-runner
         restartPolicy: Never
         terminationGracePeriodSeconds: 60
         hostIPC: true
@@ -48,7 +48,7 @@ spec:
         containers:
           - name: prefill
             # TODO: 阶段开始前确认 tag 已推到 ECR
-            image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/sglang-mooncake:v1
+            image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake:v1
             imagePullPolicy: IfNotPresent
             securityContext:
               capabilities:
@@ -62,7 +62,7 @@ spec:
                 containerPort: 8998        # SGLang disaggregation bootstrap
             env:
               - name: MODEL
-                value: "<MODEL_ID>"
+                value: "jdopensource/JoyAI-LLM-Flash"
               - name: ROLE
                 value: "prefill"
               - name: TP_SIZE
@@ -105,7 +105,7 @@ spec:
                     fieldPath: status.podIP
               - name: MOONCAKE_MASTER_SERVER
                 # Decode 也能发现 Prefill 的 mooncake 端点
-                value: "sglang-prefill-svc.efa-validation.svc.cluster.local:18000"
+                value: "sglang-prefill-svc.yanxi-validation.svc.cluster.local:18000"
               # ---- SGLang disaggregation handshake ----
               - name: DISAGG_BOOTSTRAP_HOST
                 valueFrom:
@@ -126,7 +126,7 @@ spec:
                 fi_info -p efa || true
                 echo "MODEL=$MODEL  ROLE=$ROLE  TP=$TP_SIZE"
 
-                # TODO: 若预热 FSx PVC，此处改为 --model-path /models/generic-model
+                # TODO: 若预热 FSx PVC，此处改为 --model-path /models/joyai-flash
                 # TODO: SGLang disaggregation CLI 以当前 main 为准，下列参数名需对齐：
                 #   --disaggregation-mode prefill
                 #   --disaggregation-transfer-backend mooncake
@@ -147,12 +147,12 @@ spec:
             resources:
               limits:
                 nvidia.com/gpu: 8
-                vpc.amazonaws.com/efa: 32
+                vpc.amazonaws.com/efa: 16
                 hugepages-2Mi: 5120Mi
                 memory: 1Ti
               requests:
                 nvidia.com/gpu: 8
-                vpc.amazonaws.com/efa: 32
+                vpc.amazonaws.com/efa: 16
                 hugepages-2Mi: 5120Mi
                 memory: 1Ti
             readinessProbe:
@@ -186,7 +186,7 @@ spec:
           - name: hugepage
             emptyDir:
               medium: HugePages-2Mi
-          # TODO: 阶段开始前换 FSx PVC（ReadWriteMany），预热 <MODEL_ID>
+          # TODO: 阶段开始前换 FSx PVC（ReadWriteMany），预热 jdopensource/JoyAI-LLM-Flash
           - name: models
             emptyDir:
               sizeLimit: 200Gi
@@ -200,7 +200,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: sglang-prefill-svc
-  namespace: efa-validation
+  namespace: yanxi-validation
   labels:
     app: sglang
     role: prefill

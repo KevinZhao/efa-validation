@@ -14,7 +14,7 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: sglang-bench-serving
-  namespace: efa-validation
+  namespace: yanxi-validation
   labels:
     app: sglang-bench
     stage: stage4-e2e
@@ -26,7 +26,7 @@ spec:
       labels:
         app: sglang-bench
     spec:
-      serviceAccountName: efa-runner
+      serviceAccountName: yanxi-runner
       restartPolicy: Never
       # 非 GPU 节点：回避 GPU taint，不容忍 nvidia.com/gpu=true:NoSchedule
       nodeSelector:
@@ -34,7 +34,7 @@ spec:
         node.kubernetes.io/instance-type: m7i.xlarge
       containers:
         - name: bench
-          image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/sglang-mooncake:v1
+          image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake:v1
           imagePullPolicy: IfNotPresent
           env:
             # ---- 目标 Service：切 baseline 或 PD ----
@@ -44,7 +44,7 @@ spec:
             - name: TARGET_PORT
               value: "30000"
             - name: MODEL
-              value: "<MODEL_ID>"
+              value: "jdopensource/JoyAI-LLM-Flash"
             - name: NUM_PROMPTS
               value: "500"
             - name: REQUEST_RATE
@@ -63,7 +63,7 @@ spec:
             - -lc
             - |
               set -euxo pipefail
-              TARGET_URL="http://${TARGET_SVC}.efa-validation.svc.cluster.local:${TARGET_PORT}"
+              TARGET_URL="http://${TARGET_SVC}.yanxi-validation.svc.cluster.local:${TARGET_PORT}"
               mkdir -p "$RESULT_DIR"
 
               # 健康检查：等服务起来
@@ -79,12 +79,12 @@ spec:
               BASENAME="bench-${TARGET_SVC}-${STAMP}"
 
               # ============================================================
-              # 1) ShareGPT 混合（short prompts, multi-turn conversations）
+              # 1) ShareGPT 混合（贴京东稳态：短 prompt、多轮对话）
               # ============================================================
               echo "===== ShareGPT, ${NUM_PROMPTS} prompts ====="
               python3 -m sglang.bench_serving \
                 --backend sglang \
-                --host "${TARGET_SVC}.efa-validation.svc.cluster.local" \
+                --host "${TARGET_SVC}.yanxi-validation.svc.cluster.local" \
                 --port "${TARGET_PORT}" \
                 --model "${MODEL}" \
                 --dataset-name sharegpt \
@@ -102,7 +102,7 @@ spec:
               #       或改用 sglang 的 --dataset-name random / --random-input-len 32768
               python3 -m sglang.bench_serving \
                 --backend sglang \
-                --host "${TARGET_SVC}.efa-validation.svc.cluster.local" \
+                --host "${TARGET_SVC}.yanxi-validation.svc.cluster.local" \
                 --port "${TARGET_PORT}" \
                 --model "${MODEL}" \
                 --dataset-name random \

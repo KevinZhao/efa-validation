@@ -2,7 +2,7 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: clean-model-dir
-  namespace: efa-validation
+  namespace: yanxi-validation
 spec:
   backoffLimit: 0
   ttlSecondsAfterFinished: 300
@@ -17,7 +17,7 @@ spec:
           value: "true"
           effect: NoSchedule
       nodeSelector:
-        node.kubernetes.io/instance-type: p5.48xlarge
+        node.kubernetes.io/instance-type: p5en.48xlarge
       affinity:
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -26,7 +26,7 @@ spec:
               topologyKey: kubernetes.io/hostname
       containers:
         - name: clean
-          image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/sglang-mooncake:v1
+          image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake:v1
           imagePullPolicy: IfNotPresent
           command: ["/bin/bash", "-lc"]
           args:
@@ -42,5 +42,5 @@ spec:
       volumes:
         - name: models
           hostPath:
-            path: /var/lib/efa-models
+            path: /var/lib/yanxi-models
             type: Directory

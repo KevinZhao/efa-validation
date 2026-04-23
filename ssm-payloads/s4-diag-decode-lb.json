@@ -1,9 +1,9 @@
 {
   "commands": [
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods -n efa-validation -o wide 2>&1 | grep sglang'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods -n yanxi-validation -o wide 2>&1 | grep sglang'",
     "echo === decode log ===",
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n efa-validation -l role=decode --tail=40 2>&1 | tail -40'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n yanxi-validation -l role=decode --tail=40 2>&1 | tail -40'",
     "echo === lb log ===",
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n efa-validation -l app=sglang-disagg-lb --tail=40 2>&1 | tail -40'"
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n yanxi-validation -l app=sglang-disagg-lb --tail=40 2>&1 | tail -40'"
   ]
 }

@@ -1,6 +1,6 @@
 {
   "commands": [
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n efa-validation -l training.kubeflow.org/job-name=uccl-ep-upstream,training.kubeflow.org/job-role=launcher 2>&1 > /tmp/s2-launcher.log; wc -l /tmp/s2-launcher.log'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n yanxi-validation -l training.kubeflow.org/job-name=uccl-ep-upstream,training.kubeflow.org/job-role=launcher 2>&1 > /tmp/s2-launcher.log; wc -l /tmp/s2-launcher.log'",
     "sudo -iu ec2-user bash -lc 'grep -i -E \"Traceback|Error|error:|AssertionError|RuntimeError|failed|\\\\[ERROR\\\\]|mpirun\" /tmp/s2-launcher.log | head -40'",
     "echo ===head===",
     "sudo -iu ec2-user bash -lc 'head -100 /tmp/s2-launcher.log'"

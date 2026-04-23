@@ -1,7 +1,7 @@
 {
   "commands": [
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods -n efa-validation | grep prefetch'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods -n yanxi-validation | grep prefetch'",
     "echo ---",
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n efa-validation -l job-name=model-prefetch --tail=30 2>&1'"
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n yanxi-validation -l job-name=model-prefetch --tail=30 2>&1'"
   ]
 }

@@ -1,9 +1,9 @@
 {
   "commands": [
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get svc,endpoints -n efa-validation 2>&1 | grep -E \"baseline|NAME\"'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get svc,endpoints -n yanxi-validation 2>&1 | grep -E \"baseline|NAME\"'",
     "echo === baseline pod ===",
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pod -n efa-validation -l app=sglang-baseline -o wide 2>&1'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pod -n yanxi-validation -l app=sglang-baseline -o wide 2>&1'",
     "echo === readinessProbe check ===",
-    "sudo -iu ec2-user bash -lc 'POD=$(kubectl --context ohio get pod -n efa-validation -l app=sglang-baseline -o jsonpath=\"{.items[0].metadata.name}\"); kubectl --context ohio describe pod $POD -n efa-validation 2>&1 | grep -A 5 -E \"Readiness|Conditions\" | head -30'"
+    "sudo -iu ec2-user bash -lc 'POD=$(kubectl --context ohio get pod -n yanxi-validation -l app=sglang-baseline -o jsonpath=\"{.items[0].metadata.name}\"); kubectl --context ohio describe pod $POD -n yanxi-validation 2>&1 | grep -A 5 -E \"Readiness|Conditions\" | head -30'"
   ]
 }

@@ -1,16 +1,16 @@
 {
   "commands": [
-    "sudo -iu ec2-user bash -lc 'aws s3 cp s3://efa-validation-<AWS_ACCOUNT_ID>/manifests/nvidia-device-plugin-legacy.yaml /tmp/dp-legacy.yaml'",
+    "sudo -iu ec2-user bash -lc 'aws s3 cp s3://yanxi-validation-788668107894/manifests/nvidia-device-plugin-legacy.yaml /tmp/dp-legacy.yaml'",
     "sudo -iu ec2-user bash -lc 'kubectl --context ohio apply -f /tmp/dp-legacy.yaml'",
     "sleep 25",
     "sudo -iu ec2-user bash -lc 'kubectl --context ohio -n kube-system get pods -l name=nvidia-device-plugin-ds'",
     "sudo -iu ec2-user bash -lc 'kubectl --context ohio get nodes -l workload-type=gpu -o custom-columns=NAME:.metadata.name,GPU:.status.allocatable.nvidia\\.com/gpu'",
     "echo === retry smoke ===",
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete pod -n efa-validation gpu-smoke --force --grace-period=0 --ignore-not-found=true 2>&1 | tail -2'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio delete pod -n yanxi-validation gpu-smoke --force --grace-period=0 --ignore-not-found=true 2>&1 | tail -2'",
     "sleep 5",
     "sudo -iu ec2-user bash -lc 'kubectl --context ohio apply -f /tmp/gpu-smoke.yaml'",
     "sleep 35",
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pod -n efa-validation gpu-smoke -o wide'",
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n efa-validation gpu-smoke 2>&1 | tail -40'"
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pod -n yanxi-validation gpu-smoke -o wide'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n yanxi-validation gpu-smoke 2>&1 | tail -40'"
   ]
 }

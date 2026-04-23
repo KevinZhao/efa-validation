@@ -1,0 +1,227 @@
+# Cross-node TP=16 baseline — forces TP all-reduce onto EFA every layer.
+# Two pods (rank 0 / rank 1), rank 0 also exposes the HTTP service.
+# Uses a headless service so rank 1 can reach rank 0 by DNS name.
+apiVersion: v1
+kind: Service
+metadata:
+  name: sglang-tp16-rank0
+  namespace: yanxi-validation
+spec:
+  publishNotReadyAddresses: true
+  selector:
+    app: sglang-tp16
+    role: rank0
+  ports:
+    - name: dist
+      port: 5000
+      targetPort: 5000
+    - name: http
+      port: 30000
+      targetPort: 30000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sglang-tp16
+  namespace: yanxi-validation
+spec:
+  selector:
+    app: sglang-tp16
+    role: rank0
+  ports:
+    - name: http
+      port: 30000
+      targetPort: 30000
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sglang-tp16-rank0
+  namespace: yanxi-validation
+  labels:
+    app: sglang-tp16
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sglang-tp16
+      role: rank0
+  template:
+    metadata:
+      labels:
+        app: sglang-tp16
+        role: rank0
+    spec:
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      nodeSelector:
+        node.kubernetes.io/instance-type: p5en.48xlarge
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values: ["sglang-tp16"]
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: server
+          image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake:v1
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: ROLE
+              value: "baseline"
+            - name: MODEL_PATH
+              value: "/models/current"
+            - name: TP
+              value: "16"
+            - name: PORT
+              value: "30000"
+            - name: NNODES
+              value: "2"
+            - name: NODE_RANK
+              value: "0"
+            - name: DIST_INIT_ADDR
+              value: "sglang-tp16-rank0.yanxi-validation.svc.cluster.local:5000"
+          command: ["/bin/bash", "-lc"]
+          args: ["exec /scripts/sglang-launcher.sh"]
+          readinessProbe:
+            httpGet:
+              path: /get_model_info
+              port: 30000
+            initialDelaySeconds: 120
+            periodSeconds: 10
+            failureThreshold: 120
+          ports:
+            - containerPort: 30000
+            - containerPort: 5000
+          securityContext:
+            capabilities:
+              add: [IPC_LOCK]
+          resources:
+            limits:
+              nvidia.com/gpu: 8
+              vpc.amazonaws.com/efa: 16
+              hugepages-2Mi: 5120Mi
+              memory: 256Gi
+            requests:
+              nvidia.com/gpu: 8
+              vpc.amazonaws.com/efa: 16
+              hugepages-2Mi: 5120Mi
+              memory: 256Gi
+          volumeMounts:
+            - name: models
+              mountPath: /models
+            - name: shm
+              mountPath: /dev/shm
+            - name: scripts
+              mountPath: /scripts
+      volumes:
+        - name: models
+          hostPath:
+            path: /var/lib/yanxi-models
+            type: Directory
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: scripts
+          configMap:
+            name: sglang-launcher-override
+            defaultMode: 0755
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sglang-tp16-rank1
+  namespace: yanxi-validation
+  labels:
+    app: sglang-tp16
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sglang-tp16
+      role: rank1
+  template:
+    metadata:
+      labels:
+        app: sglang-tp16
+        role: rank1
+    spec:
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      nodeSelector:
+        node.kubernetes.io/instance-type: p5en.48xlarge
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values: ["sglang-tp16"]
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: server
+          image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake:v1
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: ROLE
+              value: "baseline"
+            - name: MODEL_PATH
+              value: "/models/current"
+            - name: TP
+              value: "16"
+            - name: PORT
+              value: "30000"
+            - name: NNODES
+              value: "2"
+            - name: NODE_RANK
+              value: "1"
+            - name: DIST_INIT_ADDR
+              value: "sglang-tp16-rank0.yanxi-validation.svc.cluster.local:5000"
+          command: ["/bin/bash", "-lc"]
+          args: ["exec /scripts/sglang-launcher.sh"]
+          securityContext:
+            capabilities:
+              add: [IPC_LOCK]
+          resources:
+            limits:
+              nvidia.com/gpu: 8
+              vpc.amazonaws.com/efa: 16
+              hugepages-2Mi: 5120Mi
+              memory: 256Gi
+            requests:
+              nvidia.com/gpu: 8
+              vpc.amazonaws.com/efa: 16
+              hugepages-2Mi: 5120Mi
+              memory: 256Gi
+          volumeMounts:
+            - name: models
+              mountPath: /models
+            - name: shm
+              mountPath: /dev/shm
+            - name: scripts
+              mountPath: /scripts
+      volumes:
+        - name: models
+          hostPath:
+            path: /var/lib/yanxi-models
+            type: Directory
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: scripts
+          configMap:
+            name: sglang-launcher-override
+            defaultMode: 0755

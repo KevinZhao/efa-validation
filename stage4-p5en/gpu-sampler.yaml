@@ -1,0 +1,49 @@
+# GPU utilization sampler DaemonSet — runs on each p5en node during bench.
+# Uses nvidia-smi from the existing GPU Operator toolkit (available in sglang-mooncake image).
+# Writes CSV to /var/log/gpu-sampler/<node>.csv via hostPath (persists past pod lifecycle).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gpu-sampler
+  namespace: yanxi-validation
+spec:
+  selector:
+    matchLabels: { app: gpu-sampler }
+  template:
+    metadata:
+      labels: { app: gpu-sampler }
+    spec:
+      hostPID: true
+      tolerations:
+        - { key: nvidia.com/gpu, operator: Equal, value: "true", effect: NoSchedule }
+      nodeSelector: { node.kubernetes.io/instance-type: p5en.48xlarge }
+      containers:
+        - name: sampler
+          image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake:v2
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef: { fieldPath: spec.nodeName }
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -eu
+              mkdir -p /logs
+              OUT=/logs/${NODE_NAME}.csv
+              # nvidia-smi CSV: timestamp, gpu id, util%, mem used MB, mem total MB, power W, sm clock MHz, mem clock MHz, temp C
+              echo "timestamp,index,util_gpu,util_mem,mem_used_MB,mem_total_MB,power_W,sm_clock_MHz,mem_clock_MHz,temp_C,pstate" > ${OUT}
+              # Sample every 1s. Light — pulls <0.1 CPU core.
+              nvidia-smi --query-gpu=timestamp,index,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw,clocks.current.sm,clocks.current.memory,temperature.gpu,pstate \
+                         --format=csv,noheader,nounits \
+                         --loop=1 >> ${OUT} &
+              SMI_PID=$!
+              echo "sampler started pid=${SMI_PID} → ${OUT}"
+              wait ${SMI_PID}
+          volumeMounts:
+            - { name: logs, mountPath: /logs }
+      volumes:
+        - name: logs
+          hostPath: { path: /var/log/gpu-sampler, type: DirectoryOrCreate }

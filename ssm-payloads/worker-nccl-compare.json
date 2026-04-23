@@ -1,8 +1,8 @@
 {
   "commands": [
     "echo === nccl-tests worker pod spec ===",
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pod -n efa-validation nccl-tests-efa-worker-0 -o yaml 2>/dev/null | grep -A 20 \"name: worker\" | head -40 || echo no-nccl-pod'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pod -n yanxi-validation nccl-tests-efa-worker-0 -o yaml 2>/dev/null | grep -A 20 \"name: worker\" | head -40 || echo no-nccl-pod'",
     "echo === compare deleted uccl pods ===",
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get events -n efa-validation 2>&1 | grep uccl-ep | tail -15'"
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get events -n yanxi-validation 2>&1 | grep uccl-ep | tail -15'"
   ]
 }

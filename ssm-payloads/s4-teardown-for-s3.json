@@ -1,0 +1,11 @@
+{
+  "commands": [
+    "sudo -iu ec2-user bash -lc 'kubectl -n yanxi-validation delete deploy sglang-prefill sglang-decode sglang-lb --ignore-not-found --wait=false 2>&1'",
+    "sudo -iu ec2-user bash -lc 'kubectl -n yanxi-validation delete svc sglang-prefill sglang-decode sglang-lb --ignore-not-found --wait=false 2>&1'",
+    "sudo -iu ec2-user bash -lc 'kubectl -n yanxi-validation delete job model-prefetch node-cleanup-160 --ignore-not-found --wait=false 2>&1'",
+    "sudo -iu ec2-user bash -lc 'kubectl -n yanxi-validation delete pod --all --ignore-not-found --wait=false 2>&1 | head -40'",
+    "sleep 20",
+    "sudo -iu ec2-user bash -lc 'kubectl -n yanxi-validation get pods 2>&1'",
+    "sudo -iu ec2-user bash -lc 'kubectl describe node ip-10-1-12-160.us-east-2.compute.internal | grep -A3 \"Allocated resources\" | head -15; echo ---; kubectl describe node ip-10-1-12-221.us-east-2.compute.internal | grep -A3 \"Allocated resources\" | head -15'"
+  ]
+}

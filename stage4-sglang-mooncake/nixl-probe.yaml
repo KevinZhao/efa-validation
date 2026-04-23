@@ -1,0 +1,46 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nixl-probe
+  namespace: yanxi-validation
+spec:
+  restartPolicy: Never
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  nodeSelector:
+    node.kubernetes.io/instance-type: p5en.48xlarge
+  containers:
+    - name: probe
+      image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake:v1
+      command: ["/bin/bash", "-lc"]
+      args:
+        - |
+          echo === sglang disagg nixl source ===
+          grep -rn 'nixl' /usr/local/lib/python3.10/dist-packages/sglang/srt/disaggregation/ 2>/dev/null | grep -iE 'env|ETCD|BACKEND|class.*Nixl' | head -30
+          echo === nixl env expected ===
+          grep -rnE 'ETCD|NIXL_' /usr/local/lib/python3.10/dist-packages/sglang/srt/disaggregation/ 2>/dev/null | head -20
+          echo === NIXL python package ===
+          python3 -c "import nixl_cu12; print(dir(nixl_cu12))" 2>&1 | head -5
+          echo === files ===
+          find /opt/nixl -name 'libnixl*' -o -name '_api.py' 2>/dev/null | head -10
+          echo === try with LD_LIB + PYTHONPATH ===
+          export LD_LIBRARY_PATH=/opt/nixl/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}
+          export PYTHONPATH=/opt/nixl/lib/python3/dist-packages:${PYTHONPATH:-}
+          python3 -c "import nixl_cu12; print('import nixl_cu12 OK'); from nixl_cu12._api import nixl_agent; print('from nixl_cu12._api OK')" 2>&1 | tail -10
+          echo === remove prior nixl shim ===
+          rm -rf /opt/nixl/lib/python3/dist-packages/nixl
+          ln -s /opt/nixl/lib/python3/dist-packages/nixl_cu12 /opt/nixl/lib/python3/dist-packages/nixl
+          echo === plugin dir fix ===
+          mkdir -p /opt/nixl/lib/plugins
+          ln -sfn /opt/nixl/lib/x86_64-linux-gnu/plugins/libplugin_UCX.so /opt/nixl/lib/plugins/libplugin_UCX.so
+          ln -sfn /opt/nixl/lib/x86_64-linux-gnu/plugins/libplugin_LIBFABRIC.so /opt/nixl/lib/plugins/libplugin_LIBFABRIC.so
+          ls -la /opt/nixl/lib/plugins/
+          echo === test nixl agent creation ===
+          export NIXL_PLUGIN_DIR=/opt/nixl/lib/plugins
+          python3 -c "from nixl._api import nixl_agent; a=nixl_agent('test-agent'); print('agent created:', a)" 2>&1 | tail -15
+          echo === sglang nixl conn top ===
+          head -30 /usr/local/lib/python3.10/dist-packages/sglang/srt/disaggregation/nixl/conn.py
+          sleep 600

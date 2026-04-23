@@ -1,0 +1,87 @@
+# Prepare p5en NVMe instance store as model scratch.
+# p5en.48xlarge ships 8× NVMe SSDs (3.84TB each = ~30TB raw) under /dev/nvme{2..9}n1.
+# We RAID0 them into /mnt/instance-store and bind-mount /var/lib/yanxi-models there.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nvme-setup
+  namespace: yanxi-validation
+spec:
+  selector:
+    matchLabels: { app: nvme-setup }
+  template:
+    metadata:
+      labels: { app: nvme-setup }
+    spec:
+      hostPID: true
+      hostNetwork: true
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      nodeSelector:
+        node.kubernetes.io/instance-type: p5en.48xlarge
+      containers:
+        - name: setup
+          image: alpine:3.20
+          securityContext:
+            privileged: true
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              apk add --no-cache util-linux
+              # Run the real work in host netns/pid/mnt
+              nsenter -t 1 -m -p -- /bin/bash -eux <<'HOST'
+              # 1. Discover NVMe SSDs that are NOT the root disk or already mounted.
+              #    Amazon EC2 NVMe instance-store show up as `Amazon EC2 NVMe Instance Storage`.
+              mapfile -t DEVS < <(lsblk -ndo NAME,MODEL | awk '/Amazon EC2 NVMe Instance Storage/ {print "/dev/" $1}')
+              echo "Found instance-store devices: ${DEVS[*]}"
+              if [ "${#DEVS[@]}" -eq 0 ]; then
+                echo "No instance-store NVMe; nothing to do."
+                exit 0
+              fi
+
+              # 2. Idempotent: if /mnt/instance-store already mounted with enough space, exit.
+              if mountpoint -q /mnt/instance-store; then
+                FREE_GB=$(df --output=avail -BG /mnt/instance-store | tail -1 | tr -d 'G ')
+                echo "/mnt/instance-store already mounted, free=${FREE_GB}G"
+                [ "${FREE_GB}" -gt 500 ] && exit 0
+              fi
+
+              # 3. Build raid0 if >1 device, else mkfs single.
+              if [ "${#DEVS[@]}" -gt 1 ]; then
+                [ -b /dev/md0 ] || mdadm --create /dev/md0 --level=0 --raid-devices=${#DEVS[@]} --force --run "${DEVS[@]}" || true
+                TARGET=/dev/md0
+              else
+                TARGET=${DEVS[0]}
+              fi
+              # Check if filesystem exists.
+              if ! blkid "${TARGET}" >/dev/null 2>&1; then
+                mkfs.xfs -f "${TARGET}" || mkfs.ext4 -F "${TARGET}"
+              fi
+              mkdir -p /mnt/instance-store
+              mount "${TARGET}" /mnt/instance-store || true
+
+              # 4. Move existing yanxi-models content if any, then bind-mount.
+              mkdir -p /mnt/instance-store/yanxi-models
+              if [ -d /var/lib/yanxi-models ] && ! mountpoint -q /var/lib/yanxi-models; then
+                if [ -n "$(ls -A /var/lib/yanxi-models 2>/dev/null)" ]; then
+                  echo "Moving existing /var/lib/yanxi-models content to instance store"
+                  cp -a /var/lib/yanxi-models/. /mnt/instance-store/yanxi-models/ || true
+                  rm -rf /var/lib/yanxi-models/*
+                fi
+              fi
+              mkdir -p /var/lib/yanxi-models
+              mountpoint -q /var/lib/yanxi-models || mount --bind /mnt/instance-store/yanxi-models /var/lib/yanxi-models
+              df -h /var/lib/yanxi-models
+              echo "NVME_SETUP_DONE"
+              HOST
+              # Keep pod alive so the DS stays up but does nothing more.
+              sleep infinity
+          volumeMounts:
+            - { name: hostroot, mountPath: /host, mountPropagation: Bidirectional }
+      volumes:
+        - name: hostroot
+          hostPath: { path: / }

@@ -23,12 +23,18 @@
 #                                           src/plugins/libfabric (surfaces EFA via
 #                                           the libfabric provider layer).
 # -----------------------------------------------------------------------------
-ARG BASE_IMAGE=<AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/base-cuda-efa:v1
+ARG BASE_IMAGE=788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/base-cuda-efa:v1
 FROM ${BASE_IMAGE}
 
 # Pinned refs (verified upstream). Override only after a follow-up run validates
 # a newer tag end-to-end.
-ARG MOONCAKE_REF=v0.3.10.post1
+# v0.3.10.post2 tag commit (2026-04-22) — contains all Henan EFA contributions:
+#   #1509 (2026-02-08) AWS EFA transport initial
+#   #1523 (2026-02-11) TCP fallback + docs
+#   #1821 (2026-04-16) fi_read + LRU eviction + multi-NIC striping
+#   #1912 (2026-04-20) PTE-aware auto-split large MR registration
+# Pinned to SHA to avoid tag drift.
+ARG MOONCAKE_REF=e1d6d6f6f4
 ARG NIXL_REF=v1.0.1
 # NIXL depends on a recent UCX; the base image does NOT ship UCX, so we build it here.
 # v1.18.0 is the last release tested against aws-ofi-nccl 1.19.0 / libfabric 1.22.
@@ -127,6 +133,7 @@ RUN mkdir -p /opt/mooncake/build && cd /opt/mooncake/build && \
       -DUSE_CUDA=ON \
       -DWITH_TE=ON \
       -DWITH_STORE=OFF \
+      -DWITH_STORE_RUST=OFF \
       -DWITH_P2P_STORE=OFF \
       -DWITH_EP=OFF \
       -DSTORE_USE_ETCD=OFF \

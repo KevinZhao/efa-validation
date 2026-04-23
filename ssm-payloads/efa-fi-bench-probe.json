@@ -1,0 +1,3 @@
+{"commands":[
+  "sudo -iu ec2-user bash -lc 'kubectl -n yanxi-validation exec deploy/mooncake-metadata -- bash -c \"which fi_info fi_pingpong fi_rdm_tagged_bw fi_rdm_pingpong; ls /opt/amazon/efa/bin/ 2>/dev/null | head -30; echo ---; find / -xdev -name fi_rdm_tagged_bw 2>/dev/null; find / -xdev -name fi_pingpong 2>/dev/null\" 2>&1 | head -40'"
+]}

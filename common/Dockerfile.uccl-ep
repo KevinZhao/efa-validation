@@ -8,7 +8,7 @@
 # Base provides: CUDA 12.6 devel + cuDNN, EFA installer 1.47, libfabric,
 # OpenMPI (/opt/amazon/openmpi), NCCL v2.23.4, aws-ofi-nccl v1.19.0.
 # -----------------------------------------------------------------------------
-ARG BASE_IMAGE=<AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/base-cuda-efa:v1
+ARG BASE_IMAGE=788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/base-cuda-efa:v1
 FROM ${BASE_IMAGE}
 
 # UCCL main ships ep/ subpackage; pin a recent commit once validated.

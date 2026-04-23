@@ -8,7 +8,7 @@ apiVersion: leaderworkerset.x-k8s.io/v1
 kind: LeaderWorkerSet
 metadata:
   name: sglang-baseline-tp8
-  namespace: efa-validation
+  namespace: yanxi-validation
   labels:
     app: sglang
     role: baseline
@@ -24,7 +24,7 @@ spec:
           app: sglang
           role: baseline
       spec:
-        serviceAccountName: efa-runner
+        serviceAccountName: yanxi-runner
         restartPolicy: Never
         terminationGracePeriodSeconds: 60
         hostIPC: true
@@ -35,7 +35,7 @@ spec:
             effect: NoSchedule
         containers:
           - name: baseline
-            image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/sglang-mooncake:v1
+            image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake:v1
             imagePullPolicy: IfNotPresent
             securityContext:
               capabilities:
@@ -45,7 +45,7 @@ spec:
                 containerPort: 30000
             env:
               - name: MODEL
-                value: "<MODEL_ID>"
+                value: "jdopensource/JoyAI-LLM-Flash"
               - name: TP_SIZE
                 value: "8"
               # ---- EFA + NCCL + OMPI（baseline 单机仅需 NVLink，但保留一致以避免镜像差异）----
@@ -98,12 +98,12 @@ spec:
             resources:
               limits:
                 nvidia.com/gpu: 8
-                vpc.amazonaws.com/efa: 32
+                vpc.amazonaws.com/efa: 16
                 hugepages-2Mi: 5120Mi
                 memory: 1Ti
               requests:
                 nvidia.com/gpu: 8
-                vpc.amazonaws.com/efa: 32
+                vpc.amazonaws.com/efa: 16
                 hugepages-2Mi: 5120Mi
                 memory: 1Ti
             readinessProbe:
@@ -137,7 +137,7 @@ spec:
           - name: hugepage
             emptyDir:
               medium: HugePages-2Mi
-          # TODO: 阶段开始前换 FSx PVC（ReadWriteMany），预热 <MODEL_ID>
+          # TODO: 阶段开始前换 FSx PVC（ReadWriteMany），预热 jdopensource/JoyAI-LLM-Flash
           - name: models
             emptyDir:
               sizeLimit: 200Gi
@@ -150,7 +150,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: sglang-baseline-svc
-  namespace: efa-validation
+  namespace: yanxi-validation
   labels:
     app: sglang
     role: baseline

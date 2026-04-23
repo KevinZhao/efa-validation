@@ -1,0 +1,70 @@
+# Stage 4 p5en — Kimi K2 1T MoE bench sweep
+# 比 Llama-3.1-8B 缩：16 prompts × 3 rates，因为 Kimi K2 prefill 计算量大。
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sglang-bench-kimi
+  namespace: yanxi-validation
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 7200
+  template:
+    spec:
+      restartPolicy: Never
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      nodeSelector:
+        node.kubernetes.io/instance-type: p5en.48xlarge
+      containers:
+        - name: bench
+          image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake:v2
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: TARGET_HOST, value: "sglang-lb.yanxi-validation.svc" }
+            - { name: TARGET_PORT, value: "8000" }
+            - { name: MODEL, value: "/models/current" }
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -eu
+              mkdir -p /results
+              for i in $(seq 1 60); do
+                CODE=$(curl -o /dev/null -s -w "%{http_code}" http://${TARGET_HOST}:${TARGET_PORT}/v1/models 2>/dev/null || echo 000)
+                echo "wait lb attempt=$i code=$CODE"
+                [ "$CODE" = "200" ] && break
+                sleep 5
+              done
+              # Kimi K2: start with 16 prompts × short rate sweep to avoid multi-hour bench.
+              for RATE in 1 2 4; do
+                echo "====== Kimi K2 rate=${RATE} ======"
+                python3 -m sglang.bench_serving \
+                  --backend sglang-oai-chat \
+                  --host "${TARGET_HOST}" --port "${TARGET_PORT}" \
+                  --model "${MODEL}" \
+                  --tokenizer "${MODEL}" \
+                  --num-prompts 16 \
+                  --dataset-name random \
+                  --random-input-len 512 \
+                  --random-output-len 128 \
+                  --request-rate "${RATE}" \
+                  --pd-separated \
+                  --output-file /results/kimi-r${RATE}.json \
+                  2>&1 | tee /results/kimi-r${RATE}.log
+              done
+              echo "=== DONE ==="
+              echo "========== SUMMARY =========="
+              for RATE in 1 2 4; do
+                echo "--- Kimi K2 rate=${RATE} ---"
+                grep -E "Successful requests|Benchmark duration|Request throughput|Output token throughput|Total token throughput|Mean TTFT|Median TTFT|P99 TTFT|Mean TPOT|Mean ITL" /results/kimi-r${RATE}.log || true
+              done
+          volumeMounts:
+            - { name: results, mountPath: /results }
+            - { name: models, mountPath: /models }
+      volumes:
+        - name: results
+          emptyDir: {}
+        - name: models
+          hostPath: { path: /var/lib/yanxi-models, type: Directory }

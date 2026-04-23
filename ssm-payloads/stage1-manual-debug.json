@@ -1,5 +1,5 @@
 {
   "commands": [
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio exec -n efa-validation nccl-tests-efa-launcher-jwht9 -- bash -c \"cat /tmp/hostfile 2>&1 | head -5; echo; echo ===TEST1: mpirun hostname via plm verbose===; timeout 30 mpirun --allow-run-as-root --hostfile /tmp/hostfile -np 2 --mca pml_base_verbose 0 --mca plm_base_verbose 10 hostname 2>&1 | tail -40\" 2>&1'"
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio exec -n yanxi-validation nccl-tests-efa-launcher-jwht9 -- bash -c \"cat /tmp/hostfile 2>&1 | head -5; echo; echo ===TEST1: mpirun hostname via plm verbose===; timeout 30 mpirun --allow-run-as-root --hostfile /tmp/hostfile -np 2 --mca pml_base_verbose 0 --mca plm_base_verbose 10 hostname 2>&1 | tail -40\" 2>&1'"
   ]
 }

@@ -1,8 +1,8 @@
 {
   "commands": [
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pod -n efa-validation nccl-tests-efa-worker-0 -o yaml | grep -E runtime_name\\|NVIDIA_VISIBLE\\|/dev/nvidia'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pod -n yanxi-validation nccl-tests-efa-worker-0 -o yaml | grep -E runtime_name\\|NVIDIA_VISIBLE\\|/dev/nvidia'",
     "echo ---",
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio exec -n efa-validation nccl-tests-efa-worker-0 -- bash -lc \"env | grep -iE nvidia_or_cuda || env | head -15; echo; ls /dev | head -40; echo; ls /proc/driver/ 2>&1\"'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio exec -n yanxi-validation nccl-tests-efa-worker-0 -- bash -lc \"env | grep -iE nvidia_or_cuda || env | head -15; echo; ls /dev | head -40; echo; ls /proc/driver/ 2>&1\"'",
     "echo ---host info---",
     "sudo -iu ec2-user bash -lc 'kubectl --context ohio get ds -n kube-system nvidia-device-plugin-daemonset -o yaml | grep -E image: | head -3'"
   ]

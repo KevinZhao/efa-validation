@@ -1,0 +1,98 @@
+# Unified launcher override with tuned flags (warmup, chunked-prefill, overlap-schedule).
+# Both baseline and 1P:1D manifests reference this ConfigMap.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sglang-launcher-override
+  namespace: yanxi-validation
+data:
+  sglang-launcher.sh: |
+    #!/usr/bin/env bash
+    set -eu
+    # NIXL runtime setup — required when KV backend is nixl.
+    # Site-packages-level install avoids PYTHONPATH dropping in subprocesses.
+    SITE=/usr/local/lib/python3.10/dist-packages
+    if [ ! -L "${SITE}/nixl" ]; then
+      rm -rf "${SITE}/nixl" "${SITE}/nixl_cu12"
+      ln -s /opt/nixl/lib/python3/dist-packages/nixl_cu12 "${SITE}/nixl_cu12"
+      ln -s /opt/nixl/lib/python3/dist-packages/nixl_cu12 "${SITE}/nixl"
+    fi
+    # Only expose LIBFABRIC plugin — UCX on EFA has broken CUDA support (<1.19 warning, KV transfer hangs).
+    mkdir -p /opt/nixl/lib/plugins
+    rm -f /opt/nixl/lib/plugins/libplugin_UCX.so
+    ln -sfn /opt/nixl/lib/x86_64-linux-gnu/plugins/libplugin_LIBFABRIC.so /opt/nixl/lib/plugins/libplugin_LIBFABRIC.so
+    # ensure ldconfig can find libnixl.so everywhere
+    echo /opt/nixl/lib/x86_64-linux-gnu > /etc/ld.so.conf.d/nixl.conf
+    ldconfig
+    export LD_LIBRARY_PATH="/opt/nixl/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
+    export NIXL_PLUGIN_DIR="/opt/nixl/lib/plugins"
+    # Force LIBFABRIC backend (sglang reads this via nixl_agent config).
+    export NIXL_BACKEND="LIBFABRIC"
+    # Strip is_sorted= kwargs from sglang nixl conn — NIXL v1.0.1 doesn't accept them.
+    sed -i 's/, is_sorted=False//g' /usr/local/lib/python3.10/dist-packages/sglang/srt/disaggregation/nixl/conn.py || true
+    # Force LIBFABRIC backend — default UCX <1.19 has no CUDA support on EFA and hangs KV transfer.
+    sed -i 's|self.agent = nixl_agent(str(uuid.uuid4()))|from nixl._api import nixl_agent_config as _nac; self.agent = nixl_agent(str(uuid.uuid4()), nixl_conf=_nac(backends=["LIBFABRIC"]))|' /usr/local/lib/python3.10/dist-packages/sglang/srt/disaggregation/nixl/conn.py || true
+    ROLE="${ROLE:-baseline}"
+    MODEL_PATH="${MODEL_PATH:-/models/current}"
+    TP="${TP:-8}"
+    HOST="${HOST:-0.0.0.0}"
+    PORT="${PORT:-30000}"
+    KV_BACKEND="${KV_TRANSPORT_BACKEND:-mooncake}"
+    BOOTSTRAP_PORT="${BOOTSTRAP_PORT:-8998}"
+    CHUNKED_PREFILL="${CHUNKED_PREFILL:-8192}"
+    MAX_RUNNING="${MAX_RUNNING:-64}"
+
+    TORCH_LIB=$(python3 -c 'import torch, os; print(os.path.join(os.path.dirname(torch.__file__), "lib"))')
+    export LD_LIBRARY_PATH="${TORCH_LIB}:${LD_LIBRARY_PATH:-}"
+
+    COMMON_ARGS=(
+      --model-path "${MODEL_PATH}"
+      --tp "${TP}"
+      --host "${HOST}"
+      --port "${PORT}"
+      --trust-remote-code
+      --mem-fraction-static 0.85
+      --chunked-prefill-size "${CHUNKED_PREFILL}"
+      --max-running-requests "${MAX_RUNNING}"
+    )
+    # Multi-node TP: pass NNODES/NODE_RANK/DIST_INIT_ADDR to enable --nnodes mode.
+    if [ -n "${NNODES:-}" ] && [ "${NNODES}" != "1" ]; then
+      COMMON_ARGS+=(
+        --nnodes "${NNODES}"
+        --node-rank "${NODE_RANK:?need NODE_RANK}"
+        --dist-init-addr "${DIST_INIT_ADDR:?need DIST_INIT_ADDR}"
+      )
+    fi
+
+    case "${ROLE}" in
+      baseline)
+        exec python3 -m sglang.launch_server "${COMMON_ARGS[@]}"
+        ;;
+      prefill)
+        exec python3 -m sglang.launch_server \
+          "${COMMON_ARGS[@]}" \
+          --disaggregation-mode prefill \
+          --disaggregation-transfer-backend "${KV_BACKEND}" \
+          --disaggregation-bootstrap-port "${BOOTSTRAP_PORT}"
+        ;;
+      decode)
+        exec python3 -m sglang.launch_server \
+          "${COMMON_ARGS[@]}" \
+          --disaggregation-mode decode \
+          --disaggregation-transfer-backend "${KV_BACKEND}" \
+          --disaggregation-bootstrap-port "${BOOTSTRAP_PORT}"
+        ;;
+      lb)
+        : "${PREFILL_URL:?need PREFILL_URL}"
+        : "${DECODE_URL:?need DECODE_URL}"
+        LB_PORT="${LB_PORT:-8000}"
+        exec python3 -m sglang.srt.disaggregation.launch_lb \
+          --prefill "${PREFILL_URL}" \
+          --decode "${DECODE_URL}" \
+          --host 0.0.0.0 \
+          --port "${LB_PORT}"
+        ;;
+      *)
+        echo "unknown ROLE=${ROLE}"; exit 2
+        ;;
+    esac

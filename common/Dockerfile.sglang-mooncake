@@ -1,7 +1,7 @@
 # -----------------------------------------------------------------------------
 # Stage-4 image: SGLang + Mooncake (for PD 1P:1D disaggregation)
 #
-# Built on top of efa-validation/mooncake-nixl:v1 which already includes:
+# Built on top of yanxi/mooncake-nixl:v1 which already includes:
 #   - Mooncake v0.3.10.post1 (transfer_engine_bench, python package)
 #   - NIXL v1.0.1 (C++ libs, python binding)
 #   - EFA / libfabric / aws-ofi-nccl / OpenMPI / NCCL 2.23
@@ -12,12 +12,14 @@
 # SGLang:
 #   - 0.4.5 is the pinned baseline (cu124 wheel, Python 3.10).
 #   - Starting 0.4.3 it exposes `--disaggregation-mode` CLI + Mooncake KV
-#     transfer backend, which aligns with production SGLang disaggregation deployments.
+#     transfer backend, which is exactly what JD's prod stack uses.
 # -----------------------------------------------------------------------------
-ARG BASE_IMAGE=<AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/mooncake-nixl:v1
+ARG BASE_IMAGE=788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/mooncake-nixl:v2
 FROM ${BASE_IMAGE}
 
-ARG SGLANG_VERSION=0.4.10.post2
+# Customer's production version (JD JoyAI prod stack). 0.5.x changes several
+# disaggregation CLI flags vs 0.4.x but launcher script auto-adapts.
+ARG SGLANG_VERSION=0.5.10
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
@@ -37,9 +39,9 @@ RUN python3 -c "import sglang as sgl; print('sglang', sgl.__version__)" && \
 RUN python3 -c "import mooncake; print('mooncake import OK')"
 
 # Tiny wrapper: given env ROLE={prefill|decode|baseline}, launches sglang with
-# the appropriate CLI. Caller provides MODEL, TP, HOST, etc. via env.
-COPY sglang-launcher.sh /usr/local/bin/sglang-launcher.sh
-RUN chmod +x /usr/local/bin/sglang-launcher.sh
+# the appropriate CLI. Embedded via base64 so no external COPY/ADD needed.
+RUN echo "IyEvdXNyL2Jpbi9lbnYgYmFzaAojIFRoaW4gd3JhcHBlciBhcm91bmQgYHB5dGhvbiAtbSBzZ2xhbmcubGF1bmNoX3NlcnZlcmAuIFRoZSByb2xlIC8gdHJhbnNwb3J0CiMgd2lyaW5nIGlzIGRvbmUgaGVyZSBzbyB0aGUgazhzIG1hbmlmZXN0cyBzdGF5IGRlY2xhcmF0aXZlLgojCiMgU0dMYW5nIDAuNC4xMCBQRCBtb2RlbDoKIyAgICogcHJlZmlsbCBzZXJ2ZXIgIDogLS1kaXNhZ2dyZWdhdGlvbi1tb2RlIHByZWZpbGwgLS1kaXNhZ2dyZWdhdGlvbi1ib290c3RyYXAtcG9ydCA4OTk4CiMgICAqIGRlY29kZSBzZXJ2ZXIgICA6IC0tZGlzYWdncmVnYXRpb24tbW9kZSBkZWNvZGUgIC0tZGlzYWdncmVnYXRpb24tYm9vdHN0cmFwLXBvcnQgODk5OAojICAgKiBtaW5pX2xiIChyb3V0ZXIpOiBweXRob24gLW0gc2dsYW5nLnNydC5kaXNhZ2dyZWdhdGlvbi5sYXVuY2hfbGIKIyAgICAgICAgICAgICAgICAgICAgICAgICAtLXByZWZpbGwgaHR0cDovLzxwcmVmaWxsPjozMDAwMCAtLWRlY29kZSBodHRwOi8vPGRlY29kZT46MzAwMDAKIyAgIGRlY29kZSBkb2VzIE5PVCBkaXJlY3RseSBrbm93IHByZWZpbGw7IG1pbmlfbGIgZmFub3V0cyByZXF1ZXN0cy4Kc2V0IC1ldQoKUk9MRT0iJHtST0xFOi1iYXNlbGluZX0iCk1PREVMX1BBVEg9IiR7TU9ERUxfUEFUSDotL21vZGVscy9jdXJyZW50fSIKVFA9IiR7VFA6LTh9IgpIT1NUPSIke0hPU1Q6LTAuMC4wLjB9IgpQT1JUPSIke1BPUlQ6LTMwMDAwfSIKS1ZfQkFDS0VORD0iJHtLVl9UUkFOU1BPUlRfQkFDS0VORDotbW9vbmNha2V9IgpCT09UU1RSQVBfUE9SVD0iJHtCT09UU1RSQVBfUE9SVDotODk5OH0iCiMgRUZBIGRldmljZSBuYW1lLCBlLmcuIHJkbWFwODBzMDsgZGVmYXVsdCB0byAiYWxsIiAobW9vbmNha2UgZGVmYXVsdCkuCklCX0RFVklDRT0iJHtESVNBR0dfSUJfREVWSUNFOi19IgoKIyB0b3JjaC9saWIgb24gTERfTElCUkFSWV9QQVRIIHNvIGxpYmMxMC5zbyBpcyBmaW5kYWJsZSAoU3RhZ2UgMiBmaXgpClRPUkNIX0xJQj0kKHB5dGhvbjMgLWMgJ2ltcG9ydCB0b3JjaCwgb3M7IHByaW50KG9zLnBhdGguam9pbihvcy5wYXRoLmRpcm5hbWUodG9yY2guX19maWxlX18pLCAibGliIikpJykKZXhwb3J0IExEX0xJQlJBUllfUEFUSD0iJHtUT1JDSF9MSUJ9OiR7TERfTElCUkFSWV9QQVRIOi19IgoKQ09NTU9OX0FSR1M9KAogIC0tbW9kZWwtcGF0aCAiJHtNT0RFTF9QQVRIfSIKICAtLXRwICIke1RQfSIKICAtLWhvc3QgIiR7SE9TVH0iCiAgLS1wb3J0ICIke1BPUlR9IgogIC0tdHJ1c3QtcmVtb3RlLWNvZGUKICAtLW1lbS1mcmFjdGlvbi1zdGF0aWMgMC44NQopCgpESVNBR0dfRVhUUkE9KCkKaWYgWyAtbiAiJHtJQl9ERVZJQ0V9IiBdOyB0aGVuCiAgRElTQUdHX0VYVFJBKz0oLS1kaXNhZ2dyZWdhdGlvbi1pYi1kZXZpY2UgIiR7SUJfREVWSUNFfSIpCmZpCgpjYXNlICIke1JPTEV9IiBpbgogIGJhc2VsaW5lKQogICAgZWNobyAiW3NnbGFuZy1sYXVuY2hlcl0gcm9sZT1iYXNlbGluZSBzaW5nbGUtbm9kZSBUUD0ke1RQfSIKICAgIGV4ZWMgcHl0aG9uMyAtbSBzZ2xhbmcubGF1bmNoX3NlcnZlciAiJHtDT01NT05fQVJHU1tAXX0iCiAgICA7OwogIHByZWZpbGwpCiAgICBlY2hvICJbc2dsYW5nLWxhdW5jaGVyXSByb2xlPXByZWZpbGwgVFA9JHtUUH0ga3Y9JHtLVl9CQUNLRU5EfSBib290c3RyYXA9JHtCT09UU1RSQVBfUE9SVH0gaWI9JHtJQl9ERVZJQ0U6LTxhbGw+fSIKICAgIGV4ZWMgcHl0aG9uMyAtbSBzZ2xhbmcubGF1bmNoX3NlcnZlciBcCiAgICAgICIke0NPTU1PTl9BUkdTW0BdfSIgXAogICAgICAtLWRpc2FnZ3JlZ2F0aW9uLW1vZGUgcHJlZmlsbCBcCiAgICAgIC0tZGlzYWdncmVnYXRpb24tdHJhbnNmZXItYmFja2VuZCAiJHtLVl9CQUNLRU5EfSIgXAogICAgICAtLWRpc2FnZ3JlZ2F0aW9uLWJvb3RzdHJhcC1wb3J0ICIke0JPT1RTVFJBUF9QT1JUfSIgXAogICAgICAiJHtESVNBR0dfRVhUUkFbQF19IgogICAgOzsKICBkZWNvZGUpCiAgICBlY2hvICJbc2dsYW5nLWxhdW5jaGVyXSByb2xlPWRlY29kZSBUUD0ke1RQfSBrdj0ke0tWX0JBQ0tFTkR9IGJvb3RzdHJhcD0ke0JPT1RTVFJBUF9QT1JUfSBpYj0ke0lCX0RFVklDRTotPGFsbD59IgogICAgZXhlYyBweXRob24zIC1tIHNnbGFuZy5sYXVuY2hfc2VydmVyIFwKICAgICAgIiR7Q09NTU9OX0FSR1NbQF19IiBcCiAgICAgIC0tZGlzYWdncmVnYXRpb24tbW9kZSBkZWNvZGUgXAogICAgICAtLWRpc2FnZ3JlZ2F0aW9uLXRyYW5zZmVyLWJhY2tlbmQgIiR7S1ZfQkFDS0VORH0iIFwKICAgICAgLS1kaXNhZ2dyZWdhdGlvbi1ib290c3RyYXAtcG9ydCAiJHtCT09UU1RSQVBfUE9SVH0iIFwKICAgICAgIiR7RElTQUdHX0VYVFJBW0BdfSIKICAgIDs7CiAgbGIpCiAgICA6ICIke1BSRUZJTExfVVJMOj9sYiByb2xlIHJlcXVpcmVzIFBSRUZJTExfVVJMIChlLmcuIGh0dHA6Ly9zZ2xhbmctcHJlZmlsbDozMDAwMCl9IgogICAgOiAiJHtERUNPREVfVVJMOj9sYiByb2xlIHJlcXVpcmVzIERFQ09ERV9VUkwgKGUuZy4gaHR0cDovL3NnbGFuZy1kZWNvZGU6MzAwMDApfSIKICAgIExCX1BPUlQ9IiR7TEJfUE9SVDotODAwMH0iCiAgICBlY2hvICJbc2dsYW5nLWxhdW5jaGVyXSByb2xlPWxiIHByZWZpbGw9JHtQUkVGSUxMX1VSTH0gZGVjb2RlPSR7REVDT0RFX1VSTH0gbGlzdGVuPSR7TEJfUE9SVH0iCiAgICBleGVjIHB5dGhvbjMgLW0gc2dsYW5nLnNydC5kaXNhZ2dyZWdhdGlvbi5sYXVuY2hfbGIgXAogICAgICAtLXByZWZpbGwgIiR7UFJFRklMTF9VUkx9IiBcCiAgICAgIC0tZGVjb2RlICIke0RFQ09ERV9VUkx9IiBcCiAgICAgIC0taG9zdCAwLjAuMC4wIFwKICAgICAgLS1wb3J0ICIke0xCX1BPUlR9IgogICAgOzsKICAqKQogICAgZWNobyAiW3NnbGFuZy1sYXVuY2hlcl0gdW5rbm93biBST0xFPSR7Uk9MRX0iOyBleGl0IDIKICAgIDs7CmVzYWMK" | base64 -d > /usr/local/bin/sglang-launcher.sh && \
+    chmod +x /usr/local/bin/sglang-launcher.sh
 
 ENV SGLANG_USE_CUDA_GRAPH=1 \
     HF_HUB_ENABLE_HF_TRANSFER=1

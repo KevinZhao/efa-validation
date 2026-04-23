@@ -1,11 +1,10 @@
 {"commands":[
-  "# Same template as bastion-push-env-ohio.json (second region).",
-  "sudo -iu ec2-user bash -lc 'echo <BASE64_ENV_BLOB> | base64 -d > ~/workspace/cluster-deployment/.env.oregon'",
-  "sudo -iu ec2-user bash -lc 'cp -f ~/workspace/cluster-deployment/.env.oregon ~/workspace/cluster-deployment/.env && grep -E \"^(CLUSTER_NAME|AWS_REGION|VPC_ID)\" ~/workspace/cluster-deployment/.env'",
-  "sudo -iu ec2-user bash -lc 'aws eks update-kubeconfig --name <EKS_CLUSTER_NAME> --region <AWS_REGION> --alias oregon 2>&1'",
+  "sudo -iu ec2-user bash -lc 'echo IyBPcmVnb24gRUtTIENsdXN0ZXIgLSBHUFUgQ2x1c3RlciBEZXBsb3ltZW50IFRlc3QKQ0xVU1RFUl9OQU1FPWdwdS1jbHVzdGVyLW9yZWdvbgpBV1NfUkVHSU9OPXVzLXdlc3QtMgpBV1NfREVGQVVMVF9SRUdJT049dXMtd2VzdC0yCgojIFZQQyBhbmQgU3VibmV0cyAoNCBBWnMgLSBmdWxsIHJlZ2lvbiBjb3ZlcmFnZSkKVlBDX0lEPXZwYy0wODFlYTkyOWRhNjFiMjFkNwoKIyBQcml2YXRlIFN1Ym5ldHMKUFJJVkFURV9TVUJORVRfQT1zdWJuZXQtMDkyZWM2OTFmMzc1NTU3NGUKUFJJVkFURV9TVUJORVRfQj1zdWJuZXQtMDM0MzY5NjE3MWNlNGNkYzkKUFJJVkFURV9TVUJORVRfQz1zdWJuZXQtMDEyYjFmMjVhZTQ2N2FiNmMKUFJJVkFURV9TVUJORVRfRD1zdWJuZXQtMGU0ZGM2ZWQ4NjMxMjMwMmYKCiMgUHVibGljIFN1Ym5ldHMKUFVCTElDX1NVQk5FVF9BPXN1Ym5ldC0wMTMwMzkwODc0N2VmNGE3OQpQVUJMSUNfU1VCTkVUX0I9c3VibmV0LTA1MDAyNDdkM2MyNTRkNDEwClBVQkxJQ19TVUJORVRfQz1zdWJuZXQtMDUwNTZlMjAwYmFlNzEyNWMKUFVCTElDX1NVQk5FVF9EPXN1Ym5ldC0wOWQ4NDA3MTY1MGUwYTY2ZgoKIyBBWnMKQVpfQT11cy13ZXN0LTJhCkFaX0I9dXMtd2VzdC0yYgpBWl9DPXVzLXdlc3QtMmMKQVpfRD11cy13ZXN0LTJkCgojIFN5c3RlbSBub2RlZ3JvdXAKU1lTVEVNX05PREVfSU5TVEFOQ0VfVFlQRT1tN2cubGFyZ2UKU1lTVEVNX05PREVfREVTSVJFRF9DQVBBQ0lUWT0yClNZU1RFTV9OT0RFX01JTl9TSVpFPTIKU1lTVEVNX05PREVfTUFYX1NJWkU9NApTWVNURU1fTk9ERV9ST09UX1ZPTFVNRV9TSVpFPTUwClNZU1RFTV9OT0RFX0RBVEFfVk9MVU1FX1NJWkU9MTAwClNZU1RFTV9OT0RFX0xBQkVMX0tFWT1hcHAKU1lTVEVNX05PREVfTEFCRUxfVkFMVUU9ZWtzLXV0aWxzCgojIEthcnBlbnRlcgpJTlNUQUxMX0tBUlBFTlRFUj1mYWxzZQoKIyBLOHMgVmVyc2lvbiAobGF0ZXN0KQpLOFNfVkVSU0lPTj0xLjM1CgojIEdQVQpHUFVfSU5TVEFOQ0VfVFlQRVM9Cg== | base64 -d > ~/workspace/eks-cluster-deployment/.env.oregon'",
+  "sudo -iu ec2-user bash -lc 'cp -f ~/workspace/eks-cluster-deployment/.env.oregon ~/workspace/eks-cluster-deployment/.env && grep -E \"^(CLUSTER_NAME|AWS_REGION|VPC_ID)\" ~/workspace/eks-cluster-deployment/.env'",
+  "sudo -iu ec2-user bash -lc 'aws eks update-kubeconfig --name gpu-cluster-oregon --region us-west-2 --alias oregon 2>&1'",
   "sudo -iu ec2-user bash -lc 'kubectl --context oregon get nodes -o wide 2>&1'",
   "echo --- ns ---",
   "sudo -iu ec2-user bash -lc 'kubectl --context oregon get ns 2>&1'",
   "echo --- nodegroups ---",
-  "sudo -iu ec2-user bash -lc 'aws eks list-nodegroups --cluster-name <EKS_CLUSTER_NAME> --region <AWS_REGION>'"
+  "sudo -iu ec2-user bash -lc 'aws eks list-nodegroups --cluster-name gpu-cluster-oregon --region us-west-2'"
 ]}

@@ -6,7 +6,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: model-prefetch-script
-  namespace: efa-validation
+  namespace: yanxi-validation
 data:
   prefetch.sh: |
     #!/usr/bin/env bash
@@ -35,7 +35,7 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: model-prefetch
-  namespace: efa-validation
+  namespace: yanxi-validation
 spec:
   backoffLimit: 0
   completions: 2
@@ -44,7 +44,7 @@ spec:
   template:
     metadata:
       labels:
-        app: efa-validation-model-prefetch
+        app: yanxi-model-prefetch
     spec:
       restartPolicy: Never
       tolerations:
@@ -53,7 +53,7 @@ spec:
           value: "true"
           effect: NoSchedule
       nodeSelector:
-        node.kubernetes.io/instance-type: p5.48xlarge
+        node.kubernetes.io/instance-type: p5en.48xlarge
       # Use topologySpreadConstraints (hard maxSkew=1) so the scheduler
       # guarantees one pod per node, even when pods terminate quickly and
       # would otherwise re-land on the same node.
@@ -63,10 +63,10 @@ spec:
           whenUnsatisfiable: DoNotSchedule
           labelSelector:
             matchLabels:
-              app: efa-validation-model-prefetch
+              app: yanxi-model-prefetch
       containers:
         - name: prefetch
-          image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-2.amazonaws.com/efa-validation/sglang-mooncake:v1
+          image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake:v1
           imagePullPolicy: IfNotPresent
           env:
             - name: MODEL_ID
@@ -82,7 +82,7 @@ spec:
       volumes:
         - name: models
           hostPath:
-            path: /var/lib/efa-models
+            path: /var/lib/yanxi-models
             type: DirectoryOrCreate
         - name: scripts
           configMap:

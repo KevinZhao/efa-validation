@@ -1,9 +1,9 @@
 {
   "commands": [
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n efa-validation deploy/mooncake-metadata --tail=60 2>&1'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n yanxi-validation deploy/mooncake-metadata --tail=60 2>&1'",
     "echo === target tail ===",
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n efa-validation mooncake-target --tail=40 2>&1'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n yanxi-validation mooncake-target --tail=40 2>&1'",
     "echo === initiator tail ===",
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n efa-validation mooncake-initiator --tail=40 2>&1'"
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio logs -n yanxi-validation mooncake-initiator --tail=40 2>&1'"
   ]
 }

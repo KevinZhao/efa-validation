@@ -5,7 +5,6 @@
 
 # Runtime logs / results — keep only templates/summaries in git
 logs/
-results/
 *.log
 *.cid
 

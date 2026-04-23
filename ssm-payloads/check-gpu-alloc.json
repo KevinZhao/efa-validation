@@ -1,6 +1,6 @@
 {
   "commands": [
-    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods -A -o wide' 2>&1 | grep -E 'efa-validation|nvidia-device'",
+    "sudo -iu ec2-user bash -lc 'kubectl --context ohio get pods -A -o wide' 2>&1 | grep -E 'yanxi|nvidia-device'",
     "echo ---",
     "sudo -iu ec2-user bash -lc 'kubectl --context ohio get nodes -l workload-type=gpu -o custom-columns=NAME:.metadata.name,GPU-ALLOCATABLE:.status.allocatable.nvidia\\.com/gpu,GPU-CAPACITY:.status.capacity.nvidia\\.com/gpu,READY:.status.conditions[-1].type'"
   ]

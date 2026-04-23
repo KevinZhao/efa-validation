@@ -1,0 +1,85 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: model-swap-script
+  namespace: yanxi-validation
+data:
+  swap.sh: |
+    #!/usr/bin/env bash
+    set -eux
+    MODEL_ID="${MODEL_ID:-mistralai/Mistral-7B-Instruct-v0.2}"
+    BASE=/models
+    # Wipe old
+    rm -rf "${BASE}/current" "${BASE}/tmp"
+    mkdir -p "${BASE}/tmp"
+    df -h "${BASE}"
+    # Fetch weights (ignore onnx / runs / checkpoints / pytorch_model* / *.msgpack variants)
+    pip install --no-cache-dir 'huggingface_hub[cli,hf_transfer]==0.26.2'
+    export HF_HUB_ENABLE_HF_TRANSFER=1
+    huggingface-cli download "${MODEL_ID}" \
+      --local-dir "${BASE}/tmp" \
+      --local-dir-use-symlinks False \
+      --exclude '*.onnx' '*.msgpack' 'onnx/*' 'runs/*' 'pytorch_model*.bin' \
+                '*.h5' '*.tflite' '*.gguf' '*.pt' 'coreml/*' 'consolidated.*'
+    ls -la "${BASE}/tmp"
+    # Clean stale index file
+    find "${BASE}/tmp" -name '*.safetensors.index.json' -delete || true
+    mv "${BASE}/tmp" "${BASE}/current"
+    du -sh "${BASE}/current"
+    ls -la "${BASE}/current" | head -20
+    df -h "${BASE}"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: model-swap
+  namespace: yanxi-validation
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  completions: 2
+  parallelism: 2
+  completionMode: Indexed
+  template:
+    metadata:
+      labels:
+        job: model-swap
+    spec:
+      restartPolicy: Never
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              job: model-swap
+      nodeSelector:
+        node.kubernetes.io/instance-type: p5en.48xlarge
+      containers:
+        - name: swap
+          image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake:v1
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MODEL_ID
+              value: "mistralai/Mistral-7B-Instruct-v0.2"
+          command: ["/bin/bash", "-lc"]
+          args: ["exec /scripts/swap.sh"]
+          volumeMounts:
+            - name: models
+              mountPath: /models
+            - name: scripts
+              mountPath: /scripts
+      volumes:
+        - name: models
+          hostPath:
+            path: /var/lib/yanxi-models
+            type: Directory
+        - name: scripts
+          configMap:
+            name: model-swap-script
+            defaultMode: 0755

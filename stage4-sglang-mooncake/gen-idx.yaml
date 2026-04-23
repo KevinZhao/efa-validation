@@ -1,0 +1,55 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gen-idx
+  namespace: yanxi-validation
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  completions: 2
+  parallelism: 2
+  completionMode: Indexed
+  template:
+    metadata:
+      labels:
+        job: gen-idx
+    spec:
+      restartPolicy: Never
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              job: gen-idx
+      nodeSelector:
+        node.kubernetes.io/instance-type: p5en.48xlarge
+      containers:
+        - name: gen
+          image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake:v1
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash","-lc"]
+          args:
+            - |
+              set -eux
+              cd /m/current
+              ls -la
+              # re-download only the index file
+              pip install --no-cache-dir 'huggingface_hub[cli,hf_transfer]==0.26.2'
+              export HF_HUB_ENABLE_HF_TRANSFER=1
+              huggingface-cli download mistralai/Mistral-7B-Instruct-v0.2 \
+                model.safetensors.index.json --local-dir /m/current --local-dir-use-symlinks False
+              ls -la /m/current/*.index.json || true
+          volumeMounts:
+            - name: m
+              mountPath: /m
+      volumes:
+        - name: m
+          hostPath:
+            path: /var/lib/yanxi-models
+            type: Directory

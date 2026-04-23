@@ -1,0 +1,72 @@
+# Heavier Kimi-K2 bench to load GPU for steady-state analysis.
+# 128 prompts × 1024 in / 512 out × 4 rates {2, 4, 8, 16}.
+# While this runs, gpu-sampler DaemonSet records nvidia-smi per node.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sglang-bench-kimi-stress
+  namespace: yanxi-validation
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 7200
+  template:
+    spec:
+      restartPolicy: Never
+      tolerations:
+        - { key: nvidia.com/gpu, operator: Equal, value: "true", effect: NoSchedule }
+      nodeSelector: { node.kubernetes.io/instance-type: p5en.48xlarge }
+      containers:
+        - name: bench
+          image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake:v2
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: TARGET_HOST, value: "sglang-lb.yanxi-validation.svc" }
+            - { name: TARGET_PORT, value: "8000" }
+            - { name: MODEL, value: "/models/current" }
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -eu
+              mkdir -p /results
+              for i in $(seq 1 60); do
+                CODE=$(curl -o /dev/null -s -w "%{http_code}" http://${TARGET_HOST}:${TARGET_PORT}/v1/models 2>/dev/null || echo 000)
+                [ "$CODE" = "200" ] && break
+                sleep 5
+              done
+              # Mark start time so gpu-sampler logs can be windowed.
+              date +%s > /results/start_epoch
+              for RATE in 2 4 8 16; do
+                echo "====== Kimi K2 stress rate=${RATE} ======"
+                date -u +%FT%TZ
+                python3 -m sglang.bench_serving \
+                  --backend sglang-oai-chat \
+                  --host "${TARGET_HOST}" --port "${TARGET_PORT}" \
+                  --model "${MODEL}" \
+                  --tokenizer "${MODEL}" \
+                  --num-prompts 128 \
+                  --dataset-name random \
+                  --random-input-len 1024 \
+                  --random-output-len 512 \
+                  --request-rate "${RATE}" \
+                  --pd-separated \
+                  --output-file /results/kimi-stress-r${RATE}.json \
+                  2>&1 | tee /results/kimi-stress-r${RATE}.log
+                date -u +%FT%TZ
+                # Cooldown between rates so sampler can clearly separate phases.
+                sleep 15
+              done
+              date +%s > /results/end_epoch
+              echo "=== DONE ==="
+              echo "========== SUMMARY =========="
+              for RATE in 2 4 8 16; do
+                echo "--- Kimi K2 rate=${RATE} ---"
+                grep -E "Successful requests|Benchmark duration|Request throughput|Output token throughput|Total token throughput|Mean TTFT|Median TTFT|P95 TTFT|P99 TTFT|Mean TPOT|Median TPOT|Mean ITL|Median ITL" /results/kimi-stress-r${RATE}.log || true
+              done
+          volumeMounts:
+            - { name: results, mountPath: /results }
+            - { name: models, mountPath: /models }
+      volumes:
+        - name: results
+          emptyDir: {}
+        - name: models
+          hostPath: { path: /var/lib/yanxi-models, type: Directory }
