@@ -141,6 +141,37 @@ Re-run with `PRIVATE_SUBNET_A/B/C` = only the supported AZs, and
 can attempt either. Requires minor script change (script currently creates a
 separate nodegroup per type rather than one mixed-type NG).
 
+## Fix for p6-b300 EFA bug — applied 2026-04-23
+
+PR opened: https://github.com/KevinZhao/eks-cluster-deployment/pull/1
+
+**Root cause**: p6-b300.48xlarge is the only current GPU instance where
+`MaximumNetworkCards > MaximumEfaInterfaces` (17 vs 16). Network Card 0 is a
+dedicated ENA slot; EFA is only allowed on NICs 1–16. Original script hardcoded
+`InterfaceType=efa` on NIC 0 for every GPU type, producing `AttachmentLimitExceeded:
+Network Card 0 (requested: 1, limit: 0)`.
+
+**Fix**: conditional in the LT builder — when `instance_type == p6-b300.48xlarge`,
+primary NIC 0 becomes `InterfaceType=interface` (pure ENA). EFA-only count stays
+at 16 (NICs 1–16). No change for p5 / p5en / p6-b200 / g7e.
+
+**LT-level validation (pre-ASG)**:
+```
+instance_type=p6-b300.48xlarge
+primary NIC 0 InterfaceType=interface
+efa-only count (NIC 1..16)=16
+total EFA ENIs = 16 (matches AWS MaxEFA=16)
+total NICs = 17 (matches AWS MaxNICs=17)
+```
+`aws ec2 create-launch-template` with the new NIC layout was **accepted by AWS
+API** (LT id `lt-08434dd6af895ab7a`, test-and-delete). The previous
+`AttachmentLimitExceeded` no longer fires — the LT validator passes the NIC
+structure that would have been rejected before.
+
+End-to-end Spot probe of the fix is blocked only by the lingering NG teardown
+(still `DELETING` at 06:28 UTC, 24+ min in) — AWS control plane timing, not a
+config issue. Ready to re-run as soon as NG slots free up.
+
 ## Artifacts
 
 - `.env` on bastion: `/home/ec2-user/eks-cluster-deployment/.env`
