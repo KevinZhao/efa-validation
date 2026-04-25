@@ -1,0 +1,99 @@
+# Shared SGLang launcher ConfigMap used by all Stage 5 disaggregation runs
+# (R1a/b/c/d/e, R2, R3, R4, R5). Applied once per cluster — subsequent runs
+# just reference it by name. Not used by R0 (single-node smoke has its own).
+#
+# All behavioral knobs are driven by env vars on the Deployment container; this
+# keeps a single launcher.sh stable across all runs.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sglang-stage5-launcher
+  namespace: yanxi-validation
+data:
+  sglang-launcher.sh: |
+    #!/usr/bin/env bash
+    set -eu
+    ROLE="${ROLE:?need ROLE=prefill|decode|lb|baseline}"
+    MODEL_PATH="${MODEL_PATH:?need MODEL_PATH}"
+    TP="${TP:-8}"
+    PORT="${PORT:-30000}"
+    BOOTSTRAP_PORT="${BOOTSTRAP_PORT:-8998}"
+    CTX_LEN="${CONTEXT_LEN:-131072}"
+    MEM_FRAC="${MEM_FRAC_STATIC:-0.92}"
+    CHUNKED="${CHUNKED_PREFILL:-4096}"
+    FP8_BACKEND="${FP8_BACKEND:-cutlass}"
+    ATTN_BACKEND="${ATTENTION_BACKEND:-flashinfer}"
+    KV_BACKEND="${KV_TRANSPORT_BACKEND:-mooncake}"
+    EXTRA_ARGS="${EXTRA_ARGS:-}"
+
+    TORCH_LIB=$(python3 -c 'import torch, os; print(os.path.join(os.path.dirname(torch.__file__), "lib"))')
+    export LD_LIBRARY_PATH="${TORCH_LIB}:${LD_LIBRARY_PATH:-}"
+    export FI_PROVIDER="${FI_PROVIDER:-efa}"
+    export FI_EFA_USE_DEVICE_RDMA="${FI_EFA_USE_DEVICE_RDMA:-1}"
+    export FI_EFA_FORK_SAFE="${FI_EFA_FORK_SAFE:-1}"
+    export MOONCAKE_PROTOCOL="${MOONCAKE_PROTOCOL:-rdma}"
+    export MOONCAKE_DEVICE="${MOONCAKE_DEVICE:-auto-discovery}"
+
+    IB_DEVICE="${IB_DEVICE:-}"
+    if [ -z "${IB_DEVICE}" ] && command -v fi_info >/dev/null 2>&1; then
+      IB_DEVICE=$(fi_info -p efa 2>/dev/null | awk '/domain:/ {print $2}' | sed 's/-rdm$//;s/-dgrm$//' | sort -u | paste -sd, -)
+    fi
+    [ -n "${IB_DEVICE}" ] && echo "[launcher] IB_DEVICE=${IB_DEVICE}"
+
+    # SGLang 0.5.10 hardcodes mooncake protocol="rdma" (RC-verbs only). On EFA
+    # we need "efa" → Mooncake EfaTransport. Harmless when KV_BACKEND=nixl.
+    MC_PY=/usr/local/lib/python3.10/dist-packages/sglang/srt/distributed/device_communicators/mooncake_transfer_engine.py
+    if [ -f "${MC_PY}" ] && grep -q '"rdma",' "${MC_PY}"; then
+      echo "[launcher] patching ${MC_PY}: rdma -> efa"
+      sed -i 's/"rdma",$/"efa",/' "${MC_PY}"
+      rm -f /usr/local/lib/python3.10/dist-packages/sglang/srt/distributed/device_communicators/__pycache__/mooncake_transfer_engine.cpython-310.pyc 2>/dev/null || true
+    fi
+
+    COMMON_ARGS=(
+      --model-path "${MODEL_PATH}"
+      --tp "${TP}"
+      --host 0.0.0.0 --port "${PORT}"
+      --trust-remote-code
+      --context-length "${CTX_LEN}"
+      --mem-fraction-static "${MEM_FRAC}"
+      --chunked-prefill-size "${CHUNKED}"
+      --fp8-gemm-backend "${FP8_BACKEND}"
+      --attention-backend "${ATTN_BACKEND}"
+      --skip-server-warmup
+    )
+    # shellcheck disable=SC2206
+    COMMON_ARGS+=(${EXTRA_ARGS})
+
+    case "${ROLE}" in
+      baseline)
+        exec python3 -m sglang.launch_server "${COMMON_ARGS[@]}"
+        ;;
+      prefill|decode)
+        DISAGG_EXTRA=()
+        [ -n "${IB_DEVICE}" ] && DISAGG_EXTRA+=(--disaggregation-ib-device "${IB_DEVICE}")
+        exec python3 -m sglang.launch_server \
+          "${COMMON_ARGS[@]}" \
+          --disaggregation-mode "${ROLE}" \
+          --disaggregation-transfer-backend "${KV_BACKEND}" \
+          --disaggregation-bootstrap-port "${BOOTSTRAP_PORT}" \
+          "${DISAGG_EXTRA[@]}"
+        ;;
+      lb)
+        : "${PREFILL_URL:?need PREFILL_URL}"
+        : "${DECODE_URL:?need DECODE_URL}"
+        LB_PORT="${LB_PORT:-8000}"
+        if ! python3 -c "import sglang_router" 2>/dev/null; then
+          pip install --no-cache-dir "sglang-router==0.3.2" || exit 3
+        fi
+        PREFILL_ARGS=()
+        for u in ${PREFILL_URL//,/ }; do PREFILL_ARGS+=(--prefill "${u}"); done
+        DECODE_ARGS=()
+        for u in ${DECODE_URL//,/ }; do DECODE_ARGS+=(--decode "${u}"); done
+        exec python3 -m sglang_router.launch_router \
+          --pd-disaggregation \
+          "${PREFILL_ARGS[@]}" "${DECODE_ARGS[@]}" \
+          --host 0.0.0.0 --port "${LB_PORT}"
+        ;;
+      *) echo "unknown ROLE=${ROLE}"; exit 2 ;;
+    esac

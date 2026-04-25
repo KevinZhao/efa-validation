@@ -1,0 +1,104 @@
+# Stage 5 preflight — Ohio ECR, v5 tag (Mooncake @634b7097 contains Henan #1944)
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: stage5-preflight
+  namespace: yanxi-validation
+  labels: { app: stage5-preflight }
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/arch: amd64
+  tolerations:
+    - { key: nvidia.com/gpu, operator: Equal, value: "true", effect: NoSchedule }
+  containers:
+    - name: check
+      image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake:v5
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set +e
+          fail=0
+          echo "=== Stage 5 image pre-flight (Ohio v5) ==="
+
+          echo "[1/6] Mooncake version (via pip metadata)"
+          mc_ver=$(pip show mooncake-transfer-engine 2>/dev/null | awk '/^Version:/ {print $2}')
+          [ -z "${mc_ver}" ] && mc_ver=$(pip show mooncake 2>/dev/null | awk '/^Version:/ {print $2}')
+          [ -z "${mc_ver}" ] && mc_ver="NOT-FOUND"
+          echo "  mooncake pkg version = ${mc_ver}"
+          case "${mc_ver}" in
+            0.3.10.post2|0.3.10.post3|0.3.11*|0.3.10*) echo "  PASS";;
+            NOT-FOUND) echo "  WARN";;
+            *) echo "  FAIL"; fail=1;;
+          esac
+
+          echo "[2/6] Henan EFA SO symbols"
+          so=$(python3 -c "import mooncake, os; print(os.path.dirname(mooncake.__file__))")
+          echo "  mooncake dir: ${so}"
+          found=$(find "${so}" -name '*.so' -exec strings {} \; 2>/dev/null | grep -cE 'EfaTransport|libfabric.*efa|Chunk registered' || true)
+          echo "  symbols: ${found}"
+          [ "${found}" -gt 0 ] && echo "  PASS" || { echo "  FAIL"; fail=1; }
+
+          echo "[3/6] MC_LEGACY_RPC_PORT_BINDING"
+          legacy=$(find "${so}" -name '*.so' -exec strings {} \; 2>/dev/null | grep -c 'MC_LEGACY_RPC_PORT_BINDING' || true)
+          echo "  count: ${legacy}"
+          [ "${legacy}" -gt 0 ] && echo "  PASS" || { echo "  FAIL"; fail=1; }
+
+          echo "[4/6] SGLang rdma hardcode (launcher sed target)"
+          MC_PY=/usr/local/lib/python3.10/dist-packages/sglang/srt/distributed/device_communicators/mooncake_transfer_engine.py
+          if [ -f "${MC_PY}" ]; then
+            line=$(grep -n '"rdma",' "${MC_PY}" | head -1)
+            if [ -n "${line}" ]; then
+              echo "  hardcode at: ${line}"
+              echo "  PASS"
+            else
+              efa_line=$(grep -n '"efa",' "${MC_PY}" | head -1)
+              [ -n "${efa_line}" ] && echo "  PASS (already patched: ${efa_line})" || { echo "  FAIL"; fail=1; }
+            fi
+          else
+            echo "  FAIL: MC_PY not present"; fail=1
+          fi
+
+          echo "[5/6] SGLang version"
+          sgl_ver=$(python3 -c "import sglang; print(sglang.__version__)" 2>&1)
+          echo "  sglang.__version__ = ${sgl_ver}"
+          case "${sgl_ver}" in
+            0.5.10*) echo "  PASS";;
+            *) echo "  FAIL"; fail=1;;
+          esac
+
+          echo "[6/6] PR #1944 SRD shared-endpoint refactor present"
+          # Prior to #1944, Mooncake used per-peer fid_ep model. #1944 introduces
+          # AV-based addressing (fi_addr_t) and a single shared endpoint per NIC.
+          # Check for the canonical symbol name that appears only after #1944.
+          srd_syms=$(find "${so}" -name '*.so' -exec strings {} \; 2>/dev/null | grep -cE 'fi_addr_t|warmup_efa_segment|SharedEndpoint|av_insert_sync' || true)
+          # Also check for the new Python binding introduced by #1944:
+          has_warmup=$(python3 -c "import mooncake; print('OK' if hasattr(mooncake, 'warmup_efa_segment') else 'MISSING')" 2>&1)
+          echo "  SRD-ish symbols in .so: ${srd_syms}"
+          echo "  mooncake.warmup_efa_segment: ${has_warmup}"
+          # Check git commit ref if the source survived image build:
+          if [ -d /opt/mooncake/.git ]; then
+            commit=$(cd /opt/mooncake && git log --oneline -1 2>/dev/null)
+            echo "  /opt/mooncake HEAD: ${commit}"
+            case "${commit}" in
+              *634b709*|*#1944*) echo "  PASS (commit includes #1944)";;
+              *) echo "  WARN (commit not #1944; may still be post-#1944)";;
+            esac
+          else
+            echo "  /opt/mooncake .git not present in image; relying on symbols only"
+            [ "${srd_syms}" -gt 0 ] && echo "  PASS (symbols found)" || { echo "  FAIL"; fail=1; }
+          fi
+
+          echo
+          if [ ${fail} -eq 0 ]; then
+            echo "=== PREFLIGHT PASS ==="
+            exit 0
+          else
+            echo "=== PREFLIGHT FAIL ==="
+            exit 1
+          fi
+      resources:
+        requests: { cpu: "500m", memory: "2Gi" }
+        limits:   { cpu: "1",    memory: "4Gi" }

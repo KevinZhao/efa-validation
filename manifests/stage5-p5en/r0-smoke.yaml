@@ -1,0 +1,117 @@
+# Stage 5 · R0 smoke — single-node p5en, Qwen3-Next-80B-A3B FP8.
+# Purpose: verify FSx mount + EFA + SGLang 0.5.10 + Mooncake upstream are ready
+# end-to-end on a fresh p5en node before spending GPU time on the big runs.
+#
+# What this exercises:
+#   - PVC yanxi-model-cache (FSx) mounts readable Qwen3-Next weights
+#   - SGLang launches with --fp8-gemm-backend cutlass (avoid DeepGEMM JIT)
+#   - EFA is visible inside the pod (vpc.amazonaws.com/efa=16)
+#   - /health, /get_model_info, and a 1-prompt /generate succeed
+#
+# Not exercised here: disaggregation, cross-node traffic, Mooncake KV transfer.
+# Those start from R1a onwards.
+#
+# Apply:
+#   kubectl apply -f manifests/stage5-p5en/r0-smoke.yaml
+#   kubectl -n yanxi-validation logs -f pod/sglang-r0-smoke -c server
+# Cleanup:
+#   kubectl delete -f manifests/stage5-p5en/r0-smoke.yaml
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sglang-r0-smoke-launcher
+  namespace: yanxi-validation
+data:
+  sglang-launcher.sh: |
+    #!/usr/bin/env bash
+    set -eu
+    MODEL_PATH="${MODEL_PATH:-/models/Qwen3-Next-80B-A3B-Instruct}"
+    TP="${TP:-8}"
+    PORT="${PORT:-30000}"
+    CTX_LEN="${CONTEXT_LEN:-131072}"
+    MEM_FRAC="${MEM_FRAC_STATIC:-0.85}"
+    CHUNKED="${CHUNKED_PREFILL:-8192}"
+
+    echo "[r0] model=${MODEL_PATH} tp=${TP} ctx=${CTX_LEN} mem=${MEM_FRAC}"
+    ls -la "${MODEL_PATH}" | head -5
+    test -f "${MODEL_PATH}/config.json" || { echo "config.json missing"; exit 3; }
+
+    # EFA sanity
+    if command -v fi_info >/dev/null 2>&1; then
+      echo "[r0] fi_info -p efa devices:"
+      fi_info -p efa 2>/dev/null | awk '/domain:/ {print $2}' | sort -u || true
+    fi
+
+    TORCH_LIB=$(python3 -c 'import torch, os; print(os.path.join(os.path.dirname(torch.__file__), "lib"))')
+    export LD_LIBRARY_PATH="${TORCH_LIB}:${LD_LIBRARY_PATH:-}"
+
+    exec python3 -m sglang.launch_server \
+      --model-path "${MODEL_PATH}" \
+      --tp "${TP}" \
+      --host 0.0.0.0 --port "${PORT}" \
+      --trust-remote-code \
+      --context-length "${CTX_LEN}" \
+      --mem-fraction-static "${MEM_FRAC}" \
+      --chunked-prefill-size "${CHUNKED}" \
+      --fp8-gemm-backend cutlass \
+      --attention-backend fa3 \
+      --skip-server-warmup
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sglang-r0-smoke
+  namespace: yanxi-validation
+spec:
+  selector: { app: sglang-r0-smoke }
+  ports:
+    - { name: http, port: 30000, targetPort: 30000 }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sglang-r0-smoke
+  namespace: yanxi-validation
+  labels: { app: sglang-r0-smoke }
+spec:
+  restartPolicy: Never
+  tolerations:
+    - { key: nvidia.com/gpu, operator: Equal, value: "true", effect: NoSchedule }
+  nodeSelector: { node.kubernetes.io/instance-type: p5en.48xlarge }
+  containers:
+    - name: server
+      # Image tag pinned to v2 in both regions' ECR. The launcher only ever
+      # reads /models (FSx PVC) — no hostPath needed for R0.
+      image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake:v2
+      imagePullPolicy: IfNotPresent
+      env:
+        - { name: MODEL_PATH, value: "/models/Qwen3-Next-80B-A3B-Instruct" }
+        - { name: TP, value: "8" }
+        - { name: CONTEXT_LEN, value: "131072" }
+        - { name: MEM_FRAC_STATIC, value: "0.85" }
+        - { name: CHUNKED_PREFILL, value: "8192" }
+      command: ["/bin/bash", "-lc"]
+      args: ["exec /scripts/sglang-launcher.sh"]
+      readinessProbe:
+        httpGet: { path: /get_model_info, port: 30000 }
+        initialDelaySeconds: 180
+        periodSeconds: 10
+        failureThreshold: 90
+      ports:
+        - { containerPort: 30000, name: http }
+      securityContext: { capabilities: { add: [IPC_LOCK] } }
+      resources:
+        limits:   { nvidia.com/gpu: 8, vpc.amazonaws.com/efa: 16, hugepages-2Mi: 5120Mi, memory: 500Gi }
+        requests: { nvidia.com/gpu: 8, vpc.amazonaws.com/efa: 16, hugepages-2Mi: 5120Mi, memory: 500Gi }
+      volumeMounts:
+        - { name: models, mountPath: /models }
+        - { name: shm,    mountPath: /dev/shm }
+        - { name: scripts, mountPath: /scripts }
+  volumes:
+    - name: models
+      persistentVolumeClaim: { claimName: yanxi-model-cache }
+    - name: shm
+      emptyDir: { medium: Memory, sizeLimit: 64Gi }
+    - name: scripts
+      configMap: { name: sglang-r0-smoke-launcher, defaultMode: 0755 }

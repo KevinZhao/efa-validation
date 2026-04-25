@@ -1,0 +1,78 @@
+# Prefetch GLM-4.6-FP8 from HuggingFace to each Oregon p5 node's /data.
+# 93 shards / ~370 GB FP8 compressed-tensors, moe_intermediate_size=1536.
+# Parallel 3-way via Indexed Job.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: glm46-prefetch-hf-script
+  namespace: yanxi-validation
+data:
+  prefetch.sh: |
+    #!/usr/bin/env bash
+    set -eux
+    MODEL_ID="${MODEL_ID:-zai-org/GLM-4.6-FP8}"
+    DEST="${DEST:-/data/models/GLM-4.6-FP8}"
+    SENTINEL="$DEST/.nvme-prefetch-done"
+    if [ -f "$SENTINEL" ]; then
+      echo "$(date -u +%FT%TZ) already complete at $DEST"; du -sh "$DEST"; exit 0
+    fi
+    mkdir -p "$DEST"
+    export HF_HUB_ENABLE_HF_TRANSFER=1
+    export HF_HOME=/data/.hf-cache
+    mkdir -p "$HF_HOME"
+    echo "$(date -u +%FT%TZ) starting hf download $MODEL_ID -> $DEST"
+    if command -v hf >/dev/null 2>&1; then
+      time hf download "$MODEL_ID" --local-dir "$DEST" --max-workers 16
+    else
+      time huggingface-cli download "$MODEL_ID" --local-dir "$DEST" --local-dir-use-symlinks False --max-workers 16
+    fi
+    touch "$SENTINEL"
+    echo "$(date -u +%FT%TZ) done"
+    du -sh "$DEST"; ls "$DEST" | wc -l
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: glm46-prefetch-hf
+  namespace: yanxi-validation
+spec:
+  backoffLimit: 3
+  completions: 3
+  parallelism: 3
+  completionMode: Indexed
+  template:
+    metadata:
+      labels: { app: glm46-prefetch-hf }
+    spec:
+      restartPolicy: Never
+      tolerations:
+        - { key: nvidia.com/gpu, operator: Equal, value: "true", effect: NoSchedule }
+      nodeSelector:
+        node.kubernetes.io/instance-type: p5.48xlarge
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector: { matchLabels: { app: glm46-prefetch-hf } }
+      containers:
+        - name: prefetch
+          image: 788668107894.dkr.ecr.us-west-2.amazonaws.com/yanxi/sglang-mooncake:v5
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: MODEL_ID, value: "zai-org/GLM-4.6-FP8" }
+            - { name: DEST,     value: "/data/models/GLM-4.6-FP8" }
+          command: ["/bin/bash", "/scripts/prefetch.sh"]
+          volumeMounts:
+            - { name: local-data, mountPath: /data }
+            - { name: scripts,    mountPath: /scripts }
+          resources:
+            requests: { cpu: "8", memory: "16Gi" }
+            limits:   { cpu: "32", memory: "64Gi" }
+      volumes:
+        - name: local-data
+          hostPath: { path: /data, type: Directory }
+        - name: scripts
+          configMap:
+            name: glm46-prefetch-hf-script
+            defaultMode: 0755

@@ -1,0 +1,88 @@
+# Oregon variant of the image preflight check — points at us-west-2 ECR.
+# Apply from Oregon bastion before any Stage 5 GPU run in Oregon.
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: stage5-preflight
+  namespace: yanxi-validation
+  labels: { app: stage5-preflight }
+spec:
+  restartPolicy: Never
+  # Image is x86_64; eks-utils NG is arm64 (m7g). Force onto a p5en node,
+  # which we already have 1 of for R0. Preflight container is tiny (CPU only,
+  # no GPU request) so it won't block the R0 pod from the same node.
+  nodeSelector:
+    kubernetes.io/arch: amd64
+  tolerations:
+    - { key: nvidia.com/gpu, operator: Equal, value: "true", effect: NoSchedule }
+  containers:
+    - name: check
+      image: 788668107894.dkr.ecr.us-west-2.amazonaws.com/yanxi/sglang-mooncake:v2
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set +e
+          fail=0
+          echo "=== Stage 5 image pre-flight (Oregon) ==="
+
+          echo "[1/5] Mooncake version (via pip metadata)"
+          # Use pip show, which doesn't require the package to expose __version__
+          mc_ver=$(pip show mooncake-transfer-engine 2>/dev/null | awk '/^Version:/ {print $2}')
+          [ -z "${mc_ver}" ] && mc_ver=$(pip show mooncake_transfer_engine 2>/dev/null | awk '/^Version:/ {print $2}')
+          [ -z "${mc_ver}" ] && mc_ver=$(pip show mooncake 2>/dev/null | awk '/^Version:/ {print $2}')
+          [ -z "${mc_ver}" ] && mc_ver="NOT-FOUND"
+          echo "  mooncake pkg version = ${mc_ver}"
+          case "${mc_ver}" in
+            0.3.10.post2|0.3.10.post3|0.3.11*|0.3.10*) echo "  PASS";;
+            NOT-FOUND) echo "  WARN: no pip metadata (Mooncake may be built-in, not pip installed)";;
+            *) echo "  FAIL: expected >= 0.3.10.post2"; fail=1;;
+          esac
+
+          echo "[2/5] Henan EfaTransport in Mooncake binary"
+          so=$(python3 -c "import mooncake, os; print(os.path.dirname(mooncake.__file__))")
+          echo "  mooncake dir: ${so}"
+          found=$(find "${so}" -name '*.so' -exec strings {} \; 2>/dev/null | grep -cE 'EfaTransport|libfabric.*efa|Chunk registered' || true)
+          echo "  EfaTransport/libfabric-efa/Chunk-registered count: ${found}"
+          [ "${found}" -gt 0 ] && echo "  PASS" || { echo "  FAIL"; fail=1; }
+
+          echo "[3/5] MC_LEGACY_RPC_PORT_BINDING support"
+          legacy=$(find "${so}" -name '*.so' -exec strings {} \; 2>/dev/null | grep -c 'MC_LEGACY_RPC_PORT_BINDING' || true)
+          echo "  reference count: ${legacy}"
+          [ "${legacy}" -gt 0 ] && echo "  PASS" || { echo "  FAIL"; fail=1; }
+
+          echo "[4/5] SGLang rdma hardcode point"
+          MC_PY=/usr/local/lib/python3.10/dist-packages/sglang/srt/distributed/device_communicators/mooncake_transfer_engine.py
+          if [ -f "${MC_PY}" ]; then
+            line=$(grep -n '"rdma",' "${MC_PY}" | head -1 || true)
+            if [ -n "${line}" ]; then
+              echo "  hardcode at: ${line}"
+              echo "  PASS (launcher will sed rdma→efa)"
+            else
+              efa_line=$(grep -n '"efa",' "${MC_PY}" | head -1 || true)
+              [ -n "${efa_line}" ] && echo "  PASS (already patched: ${efa_line})" || { echo "  FAIL"; fail=1; }
+            fi
+          else
+            echo "  FAIL: ${MC_PY} not present"; fail=1
+          fi
+
+          echo "[5/5] SGLang version"
+          sgl_ver=$(python3 -c "import sglang; print(sglang.__version__)" 2>&1)
+          echo "  sglang.__version__ = ${sgl_ver}"
+          case "${sgl_ver}" in
+            0.5.10*) echo "  PASS";;
+            *) echo "  FAIL"; fail=1;;
+          esac
+
+          echo
+          if [ ${fail} -eq 0 ]; then
+            echo "=== PREFLIGHT PASS ==="
+            exit 0
+          else
+            echo "=== PREFLIGHT FAIL — DO NOT start GPU runs ==="
+            exit 1
+          fi
+      resources:
+        requests: { cpu: "500m", memory: "2Gi" }
+        limits:   { cpu: "1",    memory: "4Gi" }

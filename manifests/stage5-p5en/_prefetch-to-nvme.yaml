@@ -1,0 +1,105 @@
+# Prefetch Kimi-K2 from FSx PVC to each p5en node's local NVMe RAID0 (/mnt/nvme).
+# Serial prefetch: two independent Pods pinned via nodeName. Apply pod-a first,
+# wait for .nvme-prefetch-done, then apply pod-b. Running concurrently triggers
+# FSx OST contention and drops throughput from 593 MB/s -> 27 MB/s per pod.
+# Using sentinel ".nvme-prefetch-done" (instead of ".prefetch-complete") because
+# the FSx source copy already contains a ".prefetch-complete" marker and rsync -a
+# would carry it over, producing a false-positive complete signal.
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kimi-k2-prefetch-a
+  namespace: yanxi-validation
+  labels: { app: kimi-k2-prefetch, slot: a }
+spec:
+  restartPolicy: Never
+  nodeName: ip-10-1-11-6.us-east-2.compute.internal
+  tolerations:
+    - { key: nvidia.com/gpu, operator: Equal, value: "true", effect: NoSchedule }
+  containers:
+    - name: rsync
+      image: public.ecr.aws/amazonlinux/amazonlinux:2023
+      command:
+        - /bin/bash
+        - -c
+        - |
+          set -eux
+          dnf install -y -q --allowerasing rsync
+          SRC=/models/Kimi-K2-Instruct-0905
+          DST=/host-nvme/models/Kimi-K2-Instruct-0905
+          SENTINEL="$DST/.nvme-prefetch-done"
+          if [ -f "$SENTINEL" ]; then
+            echo "already complete at $DST"
+            du -sh "$DST"
+          else
+            mkdir -p "$DST"
+            echo "starting rsync $SRC -> $DST (resumable)"
+            time rsync -a --info=progress2 "$SRC/" "$DST/"
+            touch "$SENTINEL"
+            echo "done"
+            du -sh "$DST"
+            ls "$DST" | wc -l
+          fi
+          echo "sleeping 3600s for inspection"
+          sleep 3600
+      volumeMounts:
+        - { name: fsx-models, mountPath: /models, readOnly: true }
+        - { name: local-nvme, mountPath: /host-nvme }
+      resources:
+        requests: { cpu: "4", memory: "8Gi" }
+        limits:   { cpu: "16", memory: "32Gi" }
+  volumes:
+    - name: fsx-models
+      persistentVolumeClaim: { claimName: yanxi-model-cache, readOnly: true }
+    - name: local-nvme
+      hostPath: { path: /mnt/nvme, type: Directory }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kimi-k2-prefetch-b
+  namespace: yanxi-validation
+  labels: { app: kimi-k2-prefetch, slot: b }
+spec:
+  restartPolicy: Never
+  nodeName: ip-10-1-11-89.us-east-2.compute.internal
+  tolerations:
+    - { key: nvidia.com/gpu, operator: Equal, value: "true", effect: NoSchedule }
+  containers:
+    - name: rsync
+      image: public.ecr.aws/amazonlinux/amazonlinux:2023
+      command:
+        - /bin/bash
+        - -c
+        - |
+          set -eux
+          dnf install -y -q --allowerasing rsync
+          SRC=/models/Kimi-K2-Instruct-0905
+          DST=/host-nvme/models/Kimi-K2-Instruct-0905
+          SENTINEL="$DST/.nvme-prefetch-done"
+          if [ -f "$SENTINEL" ]; then
+            echo "already complete at $DST"
+            du -sh "$DST"
+          else
+            mkdir -p "$DST"
+            echo "starting rsync $SRC -> $DST (resumable)"
+            time rsync -a --info=progress2 "$SRC/" "$DST/"
+            touch "$SENTINEL"
+            echo "done"
+            du -sh "$DST"
+            ls "$DST" | wc -l
+          fi
+          echo "sleeping 3600s for inspection"
+          sleep 3600
+      volumeMounts:
+        - { name: fsx-models, mountPath: /models, readOnly: true }
+        - { name: local-nvme, mountPath: /host-nvme }
+      resources:
+        requests: { cpu: "4", memory: "8Gi" }
+        limits:   { cpu: "16", memory: "32Gi" }
+  volumes:
+    - name: fsx-models
+      persistentVolumeClaim: { claimName: yanxi-model-cache, readOnly: true }
+    - name: local-nvme
+      hostPath: { path: /mnt/nvme, type: Directory }

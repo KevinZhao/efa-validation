@@ -1,0 +1,94 @@
+# Stage 5 pre-flight — verify the sglang-mooncake image contains the right
+# Mooncake + Henan EFA PRs + SGLang rdma→efa patch point BEFORE starting any
+# Stage 5 GPU run. Runs on an eks-utils (CPU, On-Demand) node — cheap, fast.
+#
+# Apply from Ohio bastion:
+#   kubectl apply -f manifests/stage5-p5en/_preflight-image.yaml
+#   kubectl -n yanxi-validation logs -f pod/stage5-preflight
+#
+# Expected output (all 5 checks PASS):
+#   [1/5] mooncake.__version__ = 0.3.10.post2
+#   [2/5] EfaTransport symbol found in libmooncake_store.so
+#   [3/5] MC_LEGACY_RPC_PORT_BINDING env support: present
+#   [4/5] SGLang rdma hardcode still at line ... (launcher will sed to efa)
+#   [5/5] sglang version = 0.5.10.post1
+#
+# If any check FAILS → stop, rebuild/rollback image, do NOT proceed with GPU runs.
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: stage5-preflight
+  namespace: yanxi-validation
+  labels: { app: stage5-preflight }
+spec:
+  restartPolicy: Never
+  # Land on an eks-utils / non-GPU node; no GPU toleration needed.
+  containers:
+    - name: check
+      image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake:v2
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set +e
+          fail=0
+          echo "=== Stage 5 image pre-flight ==="
+
+          echo "[1/5] Mooncake version check"
+          mc_ver=$(python3 -c "import mooncake; print(mooncake.__version__)" 2>&1)
+          echo "  mooncake.__version__ = ${mc_ver}"
+          case "${mc_ver}" in
+            0.3.10.post2|0.3.10.post3|0.3.11*) echo "  PASS";;
+            *) echo "  FAIL: expected >= 0.3.10.post2"; fail=1;;
+          esac
+
+          echo "[2/5] Henan EfaTransport present in Mooncake binary"
+          so=$(python3 -c "import mooncake, os; print(os.path.dirname(mooncake.__file__))")
+          echo "  mooncake dir: ${so}"
+          found=$(find "${so}" -name '*.so' -exec strings {} \; 2>/dev/null | grep -cE 'EfaTransport|libfabric.*efa|Chunk registered' || true)
+          echo "  EfaTransport/libfabric-efa/Chunk-registered symbol count: ${found}"
+          [ "${found}" -gt 0 ] && echo "  PASS" || { echo "  FAIL: Henan EFA PR not in image"; fail=1; }
+
+          echo "[3/5] MC_LEGACY_RPC_PORT_BINDING env support"
+          # Check the binary references the env name
+          legacy=$(find "${so}" -name '*.so' -exec strings {} \; 2>/dev/null | grep -c 'MC_LEGACY_RPC_PORT_BINDING' || true)
+          echo "  MC_LEGACY_RPC_PORT_BINDING references: ${legacy}"
+          [ "${legacy}" -gt 0 ] && echo "  PASS" || { echo "  FAIL: legacy port binding PR missing"; fail=1; }
+
+          echo "[4/5] SGLang 0.5.10 rdma hardcode point (launcher sed target)"
+          MC_PY=/usr/local/lib/python3.10/dist-packages/sglang/srt/distributed/device_communicators/mooncake_transfer_engine.py
+          if [ -f "${MC_PY}" ]; then
+            line=$(grep -n '"rdma",' "${MC_PY}" | head -1 || true)
+            if [ -n "${line}" ]; then
+              echo "  found hardcode at: ${line}"
+              echo "  PASS (launcher will sed rdma→efa)"
+            else
+              # Maybe the image already has it patched
+              efa_line=$(grep -n '"efa",' "${MC_PY}" | head -1 || true)
+              [ -n "${efa_line}" ] && echo "  PASS (already patched: ${efa_line})" || { echo "  FAIL: neither rdma nor efa literal found"; fail=1; }
+            fi
+          else
+            echo "  FAIL: ${MC_PY} not present"
+            fail=1
+          fi
+
+          echo "[5/5] SGLang version"
+          sgl_ver=$(python3 -c "import sglang; print(sglang.__version__)" 2>&1)
+          echo "  sglang.__version__ = ${sgl_ver}"
+          case "${sgl_ver}" in
+            0.5.10*) echo "  PASS";;
+            *) echo "  FAIL: expected 0.5.10.x"; fail=1;;
+          esac
+
+          echo
+          if [ ${fail} -eq 0 ]; then
+            echo "=== PREFLIGHT PASS — safe to start GPU runs ==="
+            exit 0
+          else
+            echo "=== PREFLIGHT FAIL — DO NOT start GPU runs; rebuild/rollback image ==="
+            exit 1
+          fi
+      resources:
+        requests: { cpu: "500m", memory: "2Gi" }
+        limits:   { cpu: "1",    memory: "4Gi" }

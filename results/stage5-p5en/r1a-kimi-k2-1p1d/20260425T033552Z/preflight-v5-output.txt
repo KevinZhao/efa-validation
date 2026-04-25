@@ -1,0 +1,25 @@
+=== Stage 5 image pre-flight (Ohio v5) ===
+[1/6] Mooncake version (via pip metadata)
+  mooncake pkg version = 0.3.10.post2
+  PASS
+[2/6] Henan EFA SO symbols
+  mooncake dir: /usr/local/lib/python3.10/dist-packages/mooncake
+  symbols: 103
+  PASS
+[3/6] MC_LEGACY_RPC_PORT_BINDING
+  count: 1
+  PASS
+[4/6] SGLang rdma hardcode (launcher sed target)
+  hardcode at: 195:                "rdma",
+  PASS
+[5/6] SGLang version
+  sglang.__version__ = 0.5.10
+  PASS
+[6/6] PR #1944 SRD shared-endpoint refactor present
+  SRD-ish symbols in .so: 4
+  mooncake.warmup_efa_segment: MISSING
+  /opt/mooncake HEAD: 634b709 [TE] EFA SRD shared-endpoint refactor: drop per-peer fid_ep model (#1944)
+  PASS (commit includes #1944)
+
+=== PREFLIGHT PASS ===
+
