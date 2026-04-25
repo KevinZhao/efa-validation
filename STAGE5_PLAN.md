@@ -10,6 +10,19 @@
 
 ## Changelog
 
+### 2026-04-25 晚 — Day 1 执行结果回填 + Day 2+ 重排
+
+**Day 1 产出**：R1a（Kimi-K2 1P:1D @ 2×p5en Ohio）PASS；R3（GLM-4.6-FP8 1P:1D @ 2×p5 Oregon same-AZ）PASS；R1b/R3 1P:2D/R4 三个 abort 带 ABORT.md。详见 `results/stage5-p5en/2026-04-25_DAY1_SUMMARY.md`。
+
+**5 条新约束纳入**：
+- 跨 AZ FSx PVC 不能用于大模型（OST locking + RTT 放大）→ 全部走 HF hostPath
+- Spot 回收擦 /mnt/nvme → 每 run 从 HF 重取，不依赖 NVMe 持久化
+- **PD-disagg Mooncake KV 必须同 AZ**（跨 AZ 首请求 TransferEncodingError）→ 所有 1P:ND manifest 加 `nodeSelector: topology.kubernetes.io/zone=<az>` 约束；Day 2 Lane K microbench 验证 Mooncake 层是否也挂
+- sglang 0.5.10 + Qwen3-235B-A22B-FP8 TP=8 block-FP8 alignment bug（192 % 128 ≠ 0）→ R4 从 Day 1 移到 Day 4，等上游修或换替代模型
+- Oregon p5 LT v4 已是新版 auto-mount `/data` 27.6 TB（`KevinZhao/eks-cluster-deployment` 仓库的 `GPU_ENABLE_LOCAL_LVM=true`）；Ohio p5en LT v1 是旧版需手动 mdadm
+
+**Day 2+ 重排要点**：R1b/R1c 前移到 Day 2（条件：Ohio p5en SPS 恢复，当晚已观察到 use2-az2=9）；R3 长 ctx sweep 和 Lane K microbench 同日并行；R4 挪到 Day 4 等 upstream；Day 5/6/7 保持不变。
+
 ### 2026-04-25 — 方案 review 后加入的修订（Stage 5 Day 1 当日）
 
 本次修订基于方案 review 指出的结论置信度缺口，全部在当前窗口内用文档 / 脚本调度调整闭合，不新增 GPU 节点，不砍 R3/R4：
@@ -502,38 +515,38 @@ Lane K 原方案只测性能差值，未测正确性 —— 但 KV 传输在 ren
 | 10:06 | EC2 Fleet `capacity-optimized` 起两 region m7i Spot prefetcher（m6in 无容量） | Ohio `i-0e559f242487cc5f7` m7i.16x / Oregon `i-02606615a4464114a` m7i.24x |
 | — | **Prefetcher 在跑** 5 模型（Qwen3-Next → Qwen3-235B-FP8 → GLM-4.6 → DeepSeek-V3.1 → Kimi-K2，~2.26 TB/region） | 完成后 self-terminate |
 
-### Day 1（2026-04-25）— 集群起 + R0 + R1a + UCCL-EP pre-task
-| Time UTC | Action |
-|---|---|
-| 00:00 | us-east-2a 起 **4 node** p5en Spot（SPS=8 @ cap=7，Ohio 首选）；4 node = 768 vCPU，现有 quota 1152 够用；确认 prefetcher 已完成（`.prefetch-complete` × 5） |
-| 01:30 | 镜像：`yanxi/sglang-mooncake:v2`（upstream 基线） |
-| 02:30 | **R0** smoke + Qwen3-Next 单机 |
-| 06:00 | **R1a** Kimi-K2 1P:1D（2 node） |
-| **并行（跨 Day 1-2）** | **Pre-task（2026-04-25 晚 新增）**：查 UCCL-EP 在 SGLang 0.5.10 的接入路径（§12 第 2 条四档决策），**Day 2 晚之前闭合**。产出 `results/stage5-p5en/lane-e/SGLANG_INTEGRATION.md`：记录 SGLang main 分支 `--moe-a2a-backend` 枚举现状 / UCCL 上游 PR 是否有 open / 客户 fork 是否有 patch / 决定走 (a)/(b)/(c)/(d) 哪一档；若走 (a)/(b) 则在 builder EC2 上启动 `sglang-mooncake:v5-uccl` build（~20 min） |
+### Day 1（2026-04-25）— 实际执行
+**战绩（详见 `results/stage5-p5en/2026-04-25_DAY1_SUMMARY.md`）**：
+- ✅ **R1a** Kimi-K2 1P:1D on 2×p5en Ohio use2-az1 — 128/128 req PASS，1412 tok/s，TPOT P99 101ms
+- ✅ **R3** GLM-4.6-FP8 1P:1D on 2×p5 Oregon usw2-az2 — 128/128 req PASS，2315 tok/s，TPOT P99 35ms（对 R5 GLM-5.1 FP16 是形状等价前置）
+- ⚠️ R1b Kimi-K2 1P:2D abort — Ohio Spot 3 台同时回收，丢 /mnt/nvme
+- ⚠️ R3 1P:2D 跨 AZ abort — 首请求 TransferEncodingError，**发现 Mooncake KV 必须同 AZ**
+- ⚠️ R4 Qwen3-235B-A22B-FP8 abort — sglang 0.5.10 block-FP8 fused MoE 不支持 `moe_intermediate_size=1536` + TP=8（192 % 128 ≠ 0），需要上游修复
 
-### Day 2（2026-04-26）— R1b + Lane K microbench + v5-uccl build 收尾
-| Time | Action |
-|---|---|
-| 00:00 | **R1b** Kimi-K2 1P:2D（3 node）|
-| 04:00 | **Lane K microbench**：`nixlbench` + `transfer_engine_bench` 2 node 参数扫（背靠背采样） |
-| 12:00 | 产出 `nixl-sweep.csv` / `mooncake-baseline.csv` |
-| **20:00** | **UCCL-EP SGLang 接入 pre-task 闭合 deadline**：`SGLANG_INTEGRATION.md` 必须 commit，决策档 (a)/(b)/(c)/(d) 写死；若走 (a)/(b) 则 `sglang-mooncake:v5-uccl` 镜像已 push ECR；否则 Day 5 Lane E microbench 按 (c)/(d) 档执行 |
+**新增 5 条工程约束（入 memory 库）**：跨 AZ FSx 大模型不能挂 PVC / Spot 回收擦 NVMe / 永远 Spot / PD 同 AZ / Qwen3-235B FP8 TP=8 park
+
+### Day 2（2026-04-26）— R1b + R3 长 ctx + Lane K microbench（**2026-04-25 晚重排**）
+| Time | Action | 机型 / AZ | 说明 |
+|---|---|---|---|
+| 00:00 | **R1b Kimi-K2 1P:2D 3 node 重做** | Ohio p5en use2-az2 (SPS=9 @ cap=3) | 当日早上 SPS=1 阻塞，22:00 回 9；HF hub 重预取 ~15 min |
+| 04:00 | **R1c Kimi-K2 1P:3D 4 node** | Ohio p5en use2-az2 (SPS=9 @ cap=4 为 8，勉强) | 若容量紧再降回 Day 3 |
+| 08:00 | **R3 长 ctx sweep** ISL=8k/32k/128k | Oregon p5 usw2-az2 same-AZ | 2 node 即可，利用 today's same-AZ fix |
+| 12:00 | **Lane K microbench**：`transfer_engine_bench` 同 AZ + **跨 AZ 对照** | Oregon p5 (azA + azB) | 验证今日 R3 1P:2D 跨 AZ 挂是否发生在 Mooncake KV microbench 层（若是 → 报 upstream）|
+| **20:00** | UCCL-EP SGLang 接入 pre-task 闭合（见 §9 原条目）| builder EC2 | `sglang-mooncake:v5-uccl` push ECR 或走 (c)/(d) 档 |
 
 ### Day 3（2026-04-27）— Lane K E2E + R2
-| Time | Action |
-|---|---|
-| 00:00 | **Lane K E2E**：K-E1 Kimi-K2 + NIXL 最优点 |
-| 04:00 | **Lane K E2E**：K-E2（最差参数）+ K-E3 DeepSeek-V3.1 |
-| 08:00 | **R2** DeepSeek-V3.1 reasoning on/off（Mooncake 基线） |
+| Time | Action | 机型 / AZ |
+|---|---|---|
+| 00:00 | **Lane K E2E**：K-E1 Kimi-K2 + NIXL 最优点 | Ohio p5en same-AZ |
+| 04:00 | **Lane K E2E**：K-E2（最差参数）+ K-E3 DeepSeek-V3.1 | Ohio p5en same-AZ |
+| 08:00 | **R2** DeepSeek-V3.1 reasoning on/off（Mooncake 基线） | Ohio p5en 或 **Oregon p6-b300** (192G HBM, SPS=9) 备选，B300 更宽裕 |
 
-### Day 4（2026-04-28）— R1c PD 扫右端 + R3/R4 + 故障恢复专项
+### Day 4（2026-04-28）— R4 重试 + 故障恢复专项（**R4 从 Day 1 移到此处**）
 | Time | Action |
 |---|---|
-| 00:00 | **R1c** 1P:3D（4 node）—— PD 曲线右端点 |
-| 04:00 | ~~R1d 2P:5D + R1e 3P:4D（7 node）~~ —— **砍**（4 节点规模上限，prefill 扩展放弃） |
-| 04:00 | **R3** GLM-4.6 长 ctx + **R4** Qwen3-235B |
-| 08:00 | Buffer / R1a-c 高并发补跑（如果 R3/R4 未占满此时段） |
-| **20:00** | **故障恢复专项 4 h**（2026-04-25 扩容）：NIXL 栈 2h + Mooncake 栈 2h，三场景 (kill pod / 断 EFA / OOM) × ≥3 次复测，写 `LANE_K_FAILURE.md` |
+| 00:00 | **R4 Qwen3-235B-A22B-FP8 重试**：先看 sglang 有没有 upstream fix（`fused_moe_triton` block-FP8 padding）；否则 park，跑 **R4' Qwen3-30B-A3B-FP8** 作替代（`moe_intermediate_size=768`，TP=8 → 96 也不整除，但 TP=2 可跑；或者直接跑 Qwen3-235B TP=4）|
+| 04:00 | Buffer / R1a-c 高并发补跑 |
+| **16:00** | **故障恢复专项 4 h**（kill pod / 断 EFA / OOM 各 ≥3 次复测）：NIXL 栈 2h + Mooncake 栈 2h，写 `LANE_K_FAILURE.md` |
 
 ### Day 5（2026-04-29）— Lane E microbench + 正确性
 | Time | Action |
