@@ -28,13 +28,18 @@ FROM ${BASE_IMAGE}
 
 # Pinned refs (verified upstream). Override only after a follow-up run validates
 # a newer tag end-to-end.
-# v0.3.10.post2 tag commit (2026-04-22) — contains all Henan EFA contributions:
+#
+# v5 baseline (ECR tag :v5, 2026-04-23 post-SRD-refactor), Henan 5 EFA PRs:
 #   #1509 (2026-02-08) AWS EFA transport initial
 #   #1523 (2026-02-11) TCP fallback + docs
 #   #1821 (2026-04-16) fi_read + LRU eviction + multi-NIC striping
 #   #1912 (2026-04-20) PTE-aware auto-split large MR registration
-# Pinned to SHA to avoid tag drift.
-ARG MOONCAKE_REF=e1d6d6f6f4
+#   #1944 (2026-04-23) SRD shared-endpoint refactor — cold submit ~4×, warmup ~15×,
+#                      eliminates per-peer QP wall, fixes teardown fi_av_remove crash
+#                      + VRAM preTouchMemory segfault. REMOVES MC_EFA_STRIPING_THRESHOLD.
+# History: v2 = e1d6d6f6f4 (v0.3.10.post2 tag, 4 Henan PRs; Stage 1-4 baseline).
+# Pinned to short SHA; use full SHA in rebuilds to avoid tag drift.
+ARG MOONCAKE_REF=634b7097
 ARG NIXL_REF=v1.0.1
 # NIXL depends on a recent UCX; the base image does NOT ship UCX, so we build it here.
 # v1.18.0 is the last release tested against aws-ofi-nccl 1.19.0 / libfabric 1.22.
@@ -217,7 +222,8 @@ ENV NIXL_HOME=/opt/nixl \
 RUN (/opt/amazon/efa/bin/fi_info -p efa -t FI_EP_RDM | head -n 40 || \
       echo "NOTE: no EFA device visible in build environment; will be present at runtime") && \
     ls -l /opt/mooncake/build/mooncake-transfer-engine/example/transfer_engine_bench && \
-    ls -l /opt/mooncake/mooncake-transfer-engine/example/efa_latency_bench.py && \
+    (ls -l /opt/mooncake/mooncake-transfer-engine/example/efa_latency_bench.py 2>/dev/null || \
+      echo "NOTE: efa_latency_bench.py not at legacy path (#1944+ reorganised examples; tolerated)") && \
     ls -l /opt/nixl/lib/x86_64-linux-gnu/plugins/ && \
     (ls -l /opt/nixl/bin/ 2>&1 | head -20 || true) && \
     python3 -c "import mooncake; print('mooncake OK', mooncake.__file__)" && \

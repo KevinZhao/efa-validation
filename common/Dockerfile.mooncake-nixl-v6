@@ -1,0 +1,271 @@
+# -----------------------------------------------------------------------------
+# Stage-3 image v6: Mooncake + NIXL + actually-usable benchmark binaries.
+#
+# Built on top of `yanxi/base-cuda-efa:v1` (CUDA 12.6 + EFA installer 1.47 +
+# libfabric under /opt/amazon/efa + OpenMPI + NCCL + aws-ofi-nccl).
+#
+# v6 delta vs v5 (results/stage5-p5en/lane-k/LANE_K_ATTEMPT_LOG.md findings):
+#
+#   1. BUILD `nixlbench` binary (v5 only built plugins + nixl_example).
+#      - Requires etcd-cpp-apiv3 library (built from source), libcpprest-dev,
+#        libgflags-dev, tomlplusplus (fetched by meson subproject).
+#      - nixlbench lives in /opt/nixl-src/benchmark/nixlbench/, separate meson project.
+#
+#   2. PATCH Mooncake `transfer_engine_bench.cpp` so that `--use_vram=false` truly
+#      skips all `cudaPointerGetAttributes` / `cudaSetDevice` calls, making the
+#      bench usable in pods where `/dev/nvidia*` is not injected (container
+#      runtime / driver whitelist mismatch).
+#      Patch is applied BEFORE the cmake build, so the shipped binary has the fix.
+#
+#   3. ENV `NVIDIA_DISABLE_REQUIRE=1` at image level — prevents
+#      nvidia-container-runtime from hard-failing on `NVIDIA_REQUIRE_CUDA=
+#      driver<576` when host driver is 580+. (Still requires valid GPU device
+#      injection for GPU-mode runs; only removes the pre-flight whitelist check.)
+#
+#   4. Keep NIXL_REF=v1.0.1 (latest stable release as of 2026-04-26 — no later
+#      tag exists; main branch post-v1.0.1 has fixes but is unreleased).
+#
+# Target binaries / entrypoints:
+#   /opt/mooncake/build/mooncake-transfer-engine/example/transfer_engine_bench  (patched)
+#   /opt/mooncake/mooncake-transfer-engine/example/efa_per_transfer_latency_bench.py
+#   /opt/nixl/bin/nixlbench                               (ETCD-coordinated, v6 new)
+#   /opt/nixl/bin/nixl_example
+#   python3 -c "import mooncake"
+# -----------------------------------------------------------------------------
+ARG BASE_IMAGE=788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/base-cuda-efa:v1
+FROM ${BASE_IMAGE}
+
+ARG MOONCAKE_REF=634b7097
+ARG NIXL_REF=v1.0.1
+ARG UCX_VERSION=v1.18.0
+ARG ETCD_CPP_REF=v0.15.4
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
+
+# Image-level: stop nvidia-container-runtime from rejecting pods when host driver
+# doesn't match the CUDA 12.6 require_cuda whitelist. Required on Ohio p5en nodes
+# running driver 580+ (whitelist tops at 575).
+ENV NVIDIA_DISABLE_REQUIRE=1
+
+# ---- additional system deps for Mooncake + NIXL + nixlbench + etcd-cpp-api ----
+#   Mooncake: see v5 list (kept identical for build cache reuse).
+#   NIXL: cmake, meson, ninja, pybind11, UCX (built below), libfabric (base).
+#   nixlbench (v6 new):
+#     - libcpprest-dev    : needed by etcd-cpp-apiv3 (REST backend before gRPC)
+#     - libhwloc-dev      : nixlbench meson looks for hwloc
+#     - liburing-dev      : nixlbench POSIX/GDS backends (unused here, but cheap)
+#     - libaio-dev        : ditto
+#     - autoconf libtool  : etcd-cpp-apiv3 autotools bootstrap
+#   etcd-cpp-apiv3: depends on libcpprest, boost (already have), openssl (have),
+#                   protobuf + grpc (already have).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      cmake ninja-build meson pkg-config patchelf \
+      libyaml-cpp-dev libgflags-dev libgoogle-glog-dev \
+      libboost-all-dev libjsoncpp-dev libssl-dev \
+      libgtest-dev libgmock-dev libjemalloc-dev \
+      libcurl4-openssl-dev uuid-dev \
+      libgrpc-dev libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc \
+      pybind11-dev python3-pybind11 \
+      python3-setuptools python3-wheel python3-venv python3-dev \
+      wget unzip \
+      libcpprest-dev libhwloc-dev liburing-dev libaio-dev \
+      autoconf libtool flex \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m pip install --no-cache-dir --upgrade \
+      pip setuptools wheel \
+      "pybind11>=2.11" "numpy<2" "torch==2.4.*" \
+      meson ninja \
+      "grpcio>=1.60" "grpcio-tools>=1.60" \
+      "etcd3>=0.12" "protobuf>=4.25"
+
+# -----------------------------------------------------------------------------
+# UCX v1.18.0 — unchanged from v5.
+# -----------------------------------------------------------------------------
+RUN git clone --depth 1 -b ${UCX_VERSION} https://github.com/openucx/ucx.git /opt/ucx-src && \
+    cd /opt/ucx-src && \
+    ./autogen.sh && \
+    ./contrib/configure-release \
+      --prefix=/opt/ucx \
+      --with-cuda=/usr/local/cuda \
+      --with-verbs \
+      --with-rdmacm \
+      --enable-mt && \
+    make -j"$(nproc)" && make install && \
+    ldconfig && \
+    rm -rf /opt/ucx-src
+
+ENV PATH="/opt/ucx/bin:${PATH}" \
+    LD_LIBRARY_PATH="/opt/ucx/lib:${LD_LIBRARY_PATH}" \
+    PKG_CONFIG_PATH="/opt/ucx/lib/pkgconfig:/opt/amazon/efa/lib/pkgconfig:${PKG_CONFIG_PATH}"
+
+# -----------------------------------------------------------------------------
+# etcd-cpp-apiv3 — required by nixlbench for worker coordination (v6 new).
+# Upstream: https://github.com/etcd-cpp-apiv3/etcd-cpp-apiv3
+# v0.15.4 is the latest release (tested against protobuf 3.21 / grpc 1.51).
+# Installs headers + .so into /usr/local; pkg-config `etcd-cpp-api.pc` drop-in.
+# -----------------------------------------------------------------------------
+RUN git clone --depth 1 -b ${ETCD_CPP_REF} https://github.com/etcd-cpp-apiv3/etcd-cpp-apiv3.git /opt/etcd-cpp-src && \
+    mkdir -p /opt/etcd-cpp-src/build && cd /opt/etcd-cpp-src/build && \
+    cmake .. -GNinja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -DBUILD_ETCD_CORE_ONLY=ON \
+      -DBUILD_ETCD_TESTS=OFF && \
+    ninja -j"$(nproc)" && ninja install && \
+    ldconfig && \
+    ls /usr/local/lib/libetcd*.so && \
+    ls /usr/local/include/etcd/ | head
+
+# -----------------------------------------------------------------------------
+# Mooncake Transfer Engine — with v6 patch to skip cudaPointerGetAttributes
+# when --use_vram=false. The bench otherwise aborts on pods without /dev/nvidia*.
+# -----------------------------------------------------------------------------
+RUN git clone --recursive https://github.com/kvcache-ai/Mooncake.git /opt/mooncake && \
+    cd /opt/mooncake && git checkout ${MOONCAKE_REF} && \
+    git submodule update --init --recursive
+
+RUN cd /opt/mooncake && \
+    if [ -x dependencies.sh ]; then yes | ./dependencies.sh || ./dependencies.sh -y || true; fi
+
+ENV PATH="/usr/local/go/bin:${PATH}"
+
+# PATCH transfer_engine_bench.cpp: the real bug at 634b7097 is in freeMemoryPool()
+# around lines 217-223. It calls cudaPointerGetAttributes on EVERY free, even
+# when FLAGS_use_vram=false, which aborts the process on pods without GPU
+# device access (malloc corruption in reportPeakMemoryUsage's cleanup path).
+#
+# Fix: guard the `else` branch (non-nvlink/non-ubshmem path) in freeMemoryPool
+# with `if (!FLAGS_use_vram) { numa_free; return; }`. The allocate path already
+# goes through numa_alloc_onnode when use_vram=false, so the free side just
+# mirrors that.
+#
+# Patch script lives at common/patch-mooncake-bench-v6.py — supplied to build
+# context via `./build-image.sh ... --context=common/patch-mooncake-bench-v6.py`.
+COPY common/patch-mooncake-bench-v6.py /opt/patch-mooncake-bench-v6.py
+RUN BENCH_CPP=/opt/mooncake/mooncake-transfer-engine/example/transfer_engine_bench.cpp && \
+    cp "$BENCH_CPP" "${BENCH_CPP}.v5-orig" && \
+    python3 /opt/patch-mooncake-bench-v6.py && \
+    head -3 "$BENCH_CPP" && \
+    diff -u "${BENCH_CPP}.v5-orig" "$BENCH_CPP" | head -40
+
+# Mooncake cmake: USE_STORE/ETCD OFF (bench doesn't need store, transfer_engine's
+# metadata_server=P2PHANDSHAKE is enough). Keeping v5 flags for determinism.
+RUN mkdir -p /opt/mooncake/build && cd /opt/mooncake/build && \
+    cmake .. \
+      -GNinja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/opt/mooncake/install \
+      -DUSE_EFA=ON \
+      -DUSE_CUDA=ON \
+      -DWITH_TE=ON \
+      -DWITH_STORE=OFF \
+      -DWITH_STORE_RUST=OFF \
+      -DWITH_P2P_STORE=OFF \
+      -DWITH_EP=OFF \
+      -DSTORE_USE_ETCD=OFF \
+      -DSTORE_USE_REDIS=OFF \
+      -DBUILD_UNIT_TESTS=OFF && \
+    ninja -j"$(nproc)" && \
+    ninja install && \
+    ldconfig
+
+RUN cd /opt/mooncake && \
+    if [ -d mooncake-wheel ]; then \
+        pip install --no-cache-dir ./mooncake-wheel ; \
+    elif [ -f mooncake-transfer-engine/python/setup.py ]; then \
+        pip install --no-cache-dir ./mooncake-transfer-engine/python ; \
+    else \
+        echo "ERROR: Mooncake python package not found at expected path" >&2 ; exit 1 ; \
+    fi
+
+ENV MOONCAKE_HOME=/opt/mooncake \
+    PATH="/opt/mooncake/install/bin:/opt/mooncake/build/mooncake-transfer-engine/example:${PATH}" \
+    LD_LIBRARY_PATH="/opt/mooncake/install/lib:/opt/mooncake/install/lib64:${LD_LIBRARY_PATH}"
+
+# -----------------------------------------------------------------------------
+# NIXL v1.0.1 core (library + plugins). Same tag as v5 — no later release exists.
+# Main branch has post-v1.0.1 commits (thread-safety, libfabric notification,
+# EP teardown) but they are unreleased; we'll bump once a tag appears.
+# -----------------------------------------------------------------------------
+RUN git clone --recursive https://github.com/ai-dynamo/nixl.git /opt/nixl-src && \
+    cd /opt/nixl-src && git checkout ${NIXL_REF} && \
+    git submodule update --init --recursive
+
+RUN cd /opt/nixl-src && \
+    meson setup build \
+      --prefix=/opt/nixl \
+      --buildtype=release \
+      -Ducx_path=/opt/ucx \
+      -Dlibfabric_path=/opt/amazon/efa \
+      -Dcudapath_inc=/usr/local/cuda/include \
+      -Dcudapath_lib=/usr/local/cuda/lib64 \
+      -Denable_plugins=UCX,LIBFABRIC \
+      -Ddisable_gds_backend=true \
+      -Dbuild_tests=false \
+      -Dbuild_examples=true && \
+    ninja -C build -j"$(nproc)" && \
+    ninja -C build install && \
+    ldconfig
+
+ENV PYTHONPATH="/opt/nixl/lib/python3/dist-packages:${PYTHONPATH}"
+
+ENV NIXL_HOME=/opt/nixl \
+    PATH="/opt/nixl/bin:${PATH}" \
+    LD_LIBRARY_PATH="/opt/nixl/lib:/opt/nixl/lib/x86_64-linux-gnu:/opt/nixl/lib64:${LD_LIBRARY_PATH}" \
+    NIXL_PLUGIN_DIR="/opt/nixl/lib/x86_64-linux-gnu/plugins"
+
+# Register NIXL libs in ld.so cache so subprocesses that reset LD_LIBRARY_PATH
+# (e.g. kubectl exec with explicit env) still find libnixl.so / plugins.
+RUN echo "/opt/nixl/lib" > /etc/ld.so.conf.d/nixl.conf && \
+    echo "/opt/nixl/lib/x86_64-linux-gnu" >> /etc/ld.so.conf.d/nixl.conf && \
+    ldconfig
+
+# -----------------------------------------------------------------------------
+# nixlbench — subproject under /opt/nixl-src/benchmark/nixlbench (v6 new).
+# Separate meson project. Needs:
+#   - NIXL libs installed at /opt/nixl
+#   - etcd-cpp-apiv3 at /usr/local
+#   - gflags + tomlplusplus (meson WrapDB auto-fetches tomlplusplus)
+# Fails build if --werror=true hits; we override to be tolerant for our env.
+# -----------------------------------------------------------------------------
+RUN cd /opt/nixl-src/benchmark/nixlbench && \
+    meson setup build \
+      --prefix=/opt/nixl \
+      --buildtype=release \
+      -Dwerror=false \
+      -Dcudapath_inc=/usr/local/cuda/include \
+      -Dcudapath_lib=/usr/local/cuda/lib64 \
+      -Dnixl_path=/opt/nixl \
+      -Detcd_inc_path=/usr/local/include \
+      -Detcd_lib_path=/usr/local/lib && \
+    ninja -C build -j"$(nproc)" && \
+    ninja -C build install && \
+    ldconfig && \
+    ls -l /opt/nixl/bin/nixlbench
+
+# -----------------------------------------------------------------------------
+# Sanity checks — fail build if any critical artifact is missing.
+# -----------------------------------------------------------------------------
+RUN (/opt/amazon/efa/bin/fi_info -p efa -t FI_EP_RDM | head -n 40 || \
+      echo "NOTE: no EFA device visible in build environment; will be present at runtime") && \
+    echo "=== Mooncake bench binary ===" && \
+    ls -l /opt/mooncake/build/mooncake-transfer-engine/example/transfer_engine_bench && \
+    grep -q "v6 patch" /opt/mooncake/mooncake-transfer-engine/example/transfer_engine_bench.cpp \
+      || { echo "FATAL: v6 cuda-skip patch sentinel not found"; exit 1; } && \
+    echo "=== NIXL plugins ===" && \
+    ls -l /opt/nixl/lib/x86_64-linux-gnu/plugins/ && \
+    echo "=== nixlbench binary (v6 key artifact) ===" && \
+    ls -l /opt/nixl/bin/nixlbench && \
+    /opt/nixl/bin/nixlbench --help 2>&1 | head -20 && \
+    echo "=== Python bindings ===" && \
+    python3 -c "import mooncake; print('mooncake OK', mooncake.__file__)" && \
+    (python3 -c "import nixl_cu12; print('nixl_cu12 OK', nixl_cu12.__file__)" || \
+      echo "NOTE: nixl python binding not importable (tolerated)") && \
+    echo "=== etcd-cpp-apiv3 ===" && \
+    ls /usr/local/lib/libetcd-cpp-api* 2>&1 || ls /usr/local/lib/libetcd* | head
+
+WORKDIR /workspace
+CMD ["/bin/bash"]
