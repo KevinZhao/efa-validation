@@ -117,6 +117,7 @@
 | 数字 | 值 | 来源 |
 |---|---|---|
 | v6 image ECR digest | `sha256:6271698d52b3b6c63d265b6255dbdc8193556e6bfcce993d4ce3b50663028403` | 2026-04-26 07:39 UTC build |
+| **v6.1 image ECR digest** | `sha256:0970bdb3d70729bc0d34a8f8060c3cf12d7d16bf168428d1ce23946387d227f2` | 2026-04-26 09:47 UTC build，**含 libcuda stub symlink，下次 Lane K 使用这个 tag** |
 | Mooncake DRAM→DRAM write peak | **211.08 GB/s** at 16 MB block / threads=4 / batch=8 | MOONCAKE_CPU_SWEEP.md |
 | Mooncake EFA 16×200G 理论线速 | 400 GB/s/node | physical |
 | Mooncake 实测占线速 | ~53% (CPU-DRAM) | 计算 |
@@ -132,7 +133,7 @@
 
 | # | 问题 | 解 | 下次 rebuild |
 |---|---|---|---|
-| L1 | libcuda stub 目前靠 runtime `ln -s`（`libcuda-stub.sh`），不够干净 | Dockerfile 里已加 `ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so.1` | v6.1 build（`./scripts/build-image.sh common/Dockerfile.mooncake-nixl-v6 mooncake-nixl v6.1 --context=common/patch-mooncake-bench-v6.py`） |
+| L1 | ~~libcuda stub 目前靠 runtime~~ **已在 v6.1 解决** | Dockerfile 里 `ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so.1` 已 baked in | ✅ v6.1 built 2026-04-26 09:47 UTC (digest `0970bdb3...227f2`) |
 | L2 | v6 image 里的 Mooncake 还是 `634b7097`（v0.3.10.post2 + 5 Henan PRs），如果 Henan 后续有 PR #1944 后的 follow-up 需要 bump `MOONCAKE_REF` | n/a | 视 upstream |
 | L3 | NIXL stuck at v1.0.1；main 后续 commits 有 thread-safety 修复但没打 tag | n/a | 等 NIXL v1.0.2 release |
 
