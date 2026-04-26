@@ -1,0 +1,110 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kimi-k2-prefetch-hf-4x-script
+  namespace: yanxi-validation
+data:
+  prefetch.sh: |
+    #!/usr/bin/env bash
+    set -eux
+    MODEL_ID="${MODEL_ID:-moonshotai/Kimi-K2-Instruct-0905}"
+    DEST="${DEST:-/host-nvme/models/Kimi-K2-Instruct-0905}"
+    SENTINEL="$DEST/.nvme-prefetch-done"
+
+    if [ -f "$SENTINEL" ]; then
+      echo "$(date -u +%FT%TZ) [$(hostname)] already complete at $DEST"
+      du -sh "$DEST"
+      exit 0
+    fi
+
+    mkdir -p "$DEST"
+    export HF_HUB_ENABLE_HF_TRANSFER=1
+    export HF_HOME=/host-nvme/.hf-cache
+    mkdir -p "$HF_HOME"
+
+    echo "$(date -u +%FT%TZ) [$(hostname)] starting hf download $MODEL_ID -> $DEST (HF_TOKEN set: ${HF_TOKEN:+yes})"
+    if command -v hf >/dev/null 2>&1; then
+      time hf download "$MODEL_ID" --local-dir "$DEST" --max-workers 16
+    else
+      time huggingface-cli download "$MODEL_ID" --local-dir "$DEST" --local-dir-use-symlinks False --max-workers 16
+    fi
+
+    touch "$SENTINEL"
+    echo "$(date -u +%FT%TZ) [$(hostname)] done"
+    du -sh "$DEST"
+    ls "$DEST" | wc -l
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kimi-k2-prefetch-hf-4x
+  namespace: yanxi-validation
+spec:
+  backoffLimit: 4
+  completions: 4
+  parallelism: 4
+  completionMode: Indexed
+  template:
+    metadata:
+      labels:
+        app: kimi-k2-prefetch-hf-4x
+    spec:
+      restartPolicy: Never
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Equal
+        value: 'true'
+        effect: NoSchedule
+      nodeSelector:
+        node.kubernetes.io/instance-type: p5en.48xlarge
+        topology.kubernetes.io/zone: us-east-2b
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector:
+          matchLabels:
+            app: kimi-k2-prefetch-hf-4x
+      containers:
+      - name: prefetch
+        image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake:v5
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: MODEL_ID
+          value: moonshotai/Kimi-K2-Instruct-0905
+        - name: DEST
+          value: /host-nvme/models/Kimi-K2-Instruct-0905
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: token
+        - name: HUGGING_FACE_HUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: token
+        command:
+        - /bin/bash
+        - /scripts/prefetch.sh
+        volumeMounts:
+        - name: local-nvme
+          mountPath: /host-nvme
+        - name: scripts
+          mountPath: /scripts
+        resources:
+          requests:
+            cpu: '8'
+            memory: 16Gi
+          limits:
+            cpu: '32'
+            memory: 64Gi
+      volumes:
+      - name: local-nvme
+        hostPath:
+          path: /mnt/nvme
+          type: Directory
+      - name: scripts
+        configMap:
+          name: kimi-k2-prefetch-hf-4x-script
+          defaultMode: 0755
