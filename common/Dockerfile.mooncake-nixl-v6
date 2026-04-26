@@ -223,6 +223,18 @@ RUN echo "/opt/nixl/lib" > /etc/ld.so.conf.d/nixl.conf && \
     echo "/opt/nixl/lib/x86_64-linux-gnu" >> /etc/ld.so.conf.d/nixl.conf && \
     ldconfig
 
+# libcuda.so.1 stub symlink (v6.1 fix, 2026-04-26 Lane K NIXL finding):
+# nixlbench binary links against libcuda even in --initiator_seg_type=DRAM mode;
+# without this, nixlbench fails to load on pods where gpu-operator did not inject
+# /dev/nvidia* (driver whitelist mismatch between image CUDA 12.6 and host 580+).
+# The CUDA runtime stub shipped at /usr/local/cuda/lib64/stubs/libcuda.so is a
+# no-op lib that satisfies the dynamic loader. On a real GPU pod where nvidia-
+# container-runtime is wired in, the actual libcuda.so.1 is bind-mounted and
+# takes precedence via LD_LIBRARY_PATH — so this symlink is only ever loaded
+# on CPU-only runs where we don't actually call CUDA.
+RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so.1 && \
+    ls -l /usr/lib/x86_64-linux-gnu/libcuda.so.1
+
 # -----------------------------------------------------------------------------
 # nixlbench — subproject under /opt/nixl-src/benchmark/nixlbench (v6 new).
 # Separate meson project. Needs:
