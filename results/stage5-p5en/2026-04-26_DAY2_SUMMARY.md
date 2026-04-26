@@ -81,6 +81,15 @@
 - 预取权重 `/mnt/nvme/models/Kimi-K2-Instruct-0905` **已丢失**（Spot 节点 terminate 即擦除）
 - Day 2 Spot 用量：4 × p5en × ~2.5h = **10 node-hour**
 
+## Commit 汇总（Day 2）
+
+| SHA | Subject |
+|---|---|
+| `80ac27c` | R1c Kimi-K2 1P:3D PASS — completes PD scaling curve |
+| `8baca30` | R1c rate sweep — Kimi-K2 1P:3D ceiling ≈ 3500 tok/s |
+| `3a08fee` | R1c ISL sweep — prefill ceiling ≈ 10k input tok/s at ISL=4096 |
+| `9841da0` | R2 Kimi-K2 2P:2D negative result — 1P:3D > 2P:2D for same 4-node budget |
+
 ## 文件索引（Day 2 新增）
 
 ```
