@@ -35,7 +35,7 @@ spec:
       effect: NoSchedule
   containers:
     - name: bench
-      image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/mooncake-nixl:v5
+      image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/mooncake-nixl:v6
       imagePullPolicy: IfNotPresent
       command: ["/bin/bash", "-lc", "sleep infinity"]
       env:
@@ -118,7 +118,7 @@ spec:
       effect: NoSchedule
   containers:
     - name: bench
-      image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/mooncake-nixl:v5
+      image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/mooncake-nixl:v6
       imagePullPolicy: IfNotPresent
       command: ["/bin/bash", "-lc", "sleep infinity"]
       env:

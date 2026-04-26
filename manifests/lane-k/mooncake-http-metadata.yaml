@@ -36,11 +36,12 @@ spec:
     spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
-      # Pin to one of the two GPU nodes (use node 10.1.12.94; the other is 10.1.12.143).
-      # We avoid running the metadata server on the same node as the target pod (143)
-      # so that the target<->metadata traffic also crosses the network like the
-      # initiator<->metadata traffic, avoiding loopback shortcut bias.
-      nodeName: ip-10-1-12-94.us-east-2.compute.internal
+      # Run metadata server on any p5en in the NG (use zone nodeSelector so it
+      # lands in use2-az2 alongside bench pods). HostNetwork port 8080 doesn't
+      # clash with bench pods which use dynamic RPC ports.
+      nodeSelector:
+        node.kubernetes.io/instance-type: p5en.48xlarge
+        topology.kubernetes.io/zone: us-east-2b
       tolerations:
         - key: nvidia.com/gpu
           operator: Equal
