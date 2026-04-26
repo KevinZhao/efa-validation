@@ -1,0 +1,68 @@
+# Lane K microbench scan matrix — pruned to ≈120 tuples (~2 h at 60s/point)
+#
+# Reduction from 14,400 → 120:
+#   - UCX_TLS fixed to 'rc,cuda_copy' (all TLS collapse to libfabric-efa on EFA anyway)
+#   - UCX_MEMTYPE_CACHE fixed to 'n' (Stage 5 reference config)
+#   - CUDA stream fixed to 'per-transfer' (microbench idiom)
+#   - Memory reg fixed to 'pinned' (client production default)
+#   - NIC × rails are COUPLED (can't run 16 rails on 4 NICs)
+#   - GPU_DIRECT_RDMA fixed to 'y' (p5en/H200 production default)
+#   - Operation fixed to 'write' for symmetric NIXL/Mooncake comparison
+#
+# Scan dimensions:
+#   tool             : 2 (nixlbench, transfer_engine_bench)
+#   nic_rails_pair   : 3 (16x16, 8x8, 4x4)
+#   msg_size         : 5 (64K, 256K, 1M, 4M, 16M)
+#   concurrency      : 4 (1, 4, 16, 64)
+#   => 2 * 3 * 5 * 4 = 120 tuples
+#
+# Execution protocol:
+#   - For each (nic_rails, msg, conc) combo: run NIXL then Mooncake back-to-back
+#     (same RUN_ID, <5 min gap as required by plan §4.3).
+#   - Each point: 10s warmup + 30s measurement + 5s cooldown = 45s per invocation.
+#   - Total: 60 pairs × (45s + 45s) = 90 minutes wall clock.
+
+global:
+  operation: write
+  warmup_s: 10
+  duration_s: 30
+  cooldown_s: 5
+  report_unit: GB
+
+fixed_env:
+  FI_PROVIDER: efa
+  FI_EFA_USE_DEVICE_RDMA: "1"
+  FI_EFA_FORK_SAFE: "1"
+  FI_MR_HMEM: "1"
+  UCX_TLS: rc,cuda_copy
+  UCX_MEMTYPE_CACHE: "n"
+  UCX_IB_GPU_DIRECT_RDMA: "y"
+
+scan:
+  nic_rails_pairs:
+    - nic: 16
+      rails: 16
+      net_devices: "rdmap0s0,rdmap1s0,rdmap2s0,rdmap3s0,rdmap4s0,rdmap5s0,rdmap6s0,rdmap7s0,rdmap8s0,rdmap9s0,rdmap10s0,rdmap11s0,rdmap12s0,rdmap13s0,rdmap14s0,rdmap15s0"
+    - nic: 8
+      rails: 8
+      net_devices: "rdmap0s0,rdmap1s0,rdmap2s0,rdmap3s0,rdmap4s0,rdmap5s0,rdmap6s0,rdmap7s0"
+    - nic: 4
+      rails: 4
+      net_devices: "rdmap0s0,rdmap1s0,rdmap2s0,rdmap3s0"
+
+  msg_sizes:
+    - 65536        # 64K
+    - 262144       # 256K
+    - 1048576      # 1M
+    - 4194304      # 4M
+    - 16777216     # 16M
+
+  concurrencies:
+    - 1
+    - 4
+    - 16
+    - 64
+
+output:
+  csv_header: "run_id,tool,backend,nic_count,rails,msg_size,concurrency,operation,gbps_mean,gbps_p50,rtt_us_p50,rtt_us_p99,samples,started_at,duration_s,notes"
+  csv_path: /out/lane-k-sweep.csv
