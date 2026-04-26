@@ -55,6 +55,12 @@ spec:
           value: "2"
         - name: MC_NUM_CQ_PER_CTX
           value: "2"
+        - name: NVIDIA_DISABLE_REQUIRE
+          value: "1"
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: "all"
+        - name: NVIDIA_DRIVER_CAPABILITIES
+          value: "compute,utility"
       securityContext:
         capabilities:
           add: [IPC_LOCK]
@@ -132,6 +138,12 @@ spec:
           value: "2"
         - name: MC_NUM_CQ_PER_CTX
           value: "2"
+        - name: NVIDIA_DISABLE_REQUIRE
+          value: "1"
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: "all"
+        - name: NVIDIA_DRIVER_CAPABILITIES
+          value: "compute,utility"
       securityContext:
         capabilities:
           add: [IPC_LOCK]

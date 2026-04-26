@@ -1,0 +1,71 @@
+# Mooncake HTTP metadata server Deployment for Lane K microbench.
+# transfer_engine_bench accepts schemes: etcd:// / redis:// / http:// / https://
+# Our mooncake-nixl:v5 image has USE_ETCD=OFF, USE_REDIS=OFF, USE_HTTP=ON
+# (WITH_STORE=OFF trims etcd/redis metadata plugins).
+# So we stand up mooncake's own http_metadata_server and point the bench at it.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mooncake-meta
+  namespace: yanxi-validation
+spec:
+  selector:
+    app: mooncake-meta
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mooncake-meta
+  namespace: yanxi-validation
+  labels:
+    app: mooncake-meta
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mooncake-meta
+  template:
+    metadata:
+      labels:
+        app: mooncake-meta
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      # Pin to one of the two GPU nodes (use node 10.1.12.94; the other is 10.1.12.143).
+      # We avoid running the metadata server on the same node as the target pod (143)
+      # so that the target<->metadata traffic also crosses the network like the
+      # initiator<->metadata traffic, avoiding loopback shortcut bias.
+      nodeName: ip-10-1-12-94.us-east-2.compute.internal
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: server
+          image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/mooncake-nixl:v5
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              exec python3 -m mooncake.http_metadata_server --port 8080 --host 0.0.0.0 --log-level INFO
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
