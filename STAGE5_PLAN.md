@@ -440,11 +440,15 @@ Lane K 原方案只测性能差值，未测正确性 —— 但 KV 传输在 ren
 - 我们已经实现了 `UCCL_EP_CPU_TIMEOUT_SECS` 环境变量 runtime 覆盖，需要在 AWS p5en 上**实测验证**才能说服 UCCL 团队 merge
 - 验证成功后，同一手段将继续用于 P0 combine-signal / P1 dispatch early-release 等后续 PR —— 本轮建立的 benchmark 基建是**跨 PR 可复用**的工具链
 
-**PR #904 实际改动**（基于 HEAD `f1ecbaf7` + 两个 commit）：
+**PR #904 实际改动**（基于 HEAD `f1ecbaf7` + 四个 commit；2026-04-27 更新，镜像实际锁 `ef7460cc`）：
 | Commit | 内容 | 风险 |
 |---|---|---|
 | `0ce1a22f` | 加 `UCCL_EP_CPU_TIMEOUT_SECS` env var，override `NUM_CPU_TIMEOUT_SECS` | 低（纯 env 扩展，默认行为不变） |
 | `a7eb743e` | Helper 移 `common.hpp`，`atoi` → `strtol` + 验证 | 低（refactor，无语义变化） |
+| `17fdb8d3` | Merge upstream main（含 #902 oob refactor 等） | 低（上游非 EP-core 改动） |
+| `ef7460cc` | Trim CPU timeout env helper comment | 零（仅注释）|
+
+**镜像 SHA 锚点**：`sglang-mooncake:v5-uccl` (Ohio ECR, 2026-04-27 build) 内嵌 `/opt/uccl/.build-sha = ef7460ccd09a511c3c9681df04112a6e6feb2baa`，用于 §5.7 PR comment 证据链。
 
 #### 5.7.1 测试目标
 

@@ -30,8 +30,13 @@ FROM ${BASE_IMAGE}
 ARG UCCL_REPO=https://github.com/KevinZhao/uccl.git
 ARG UCCL_REF=ep-warmup-cpu-timeout-env
 
-# Base has torch 2.4 cu124 (sm_90), pinned by mooncake-nixl:v5. UCCL-EP kernels
-# compile against torch ABI + CUDA 12.6 runtime. p5en H200 targets sm_90 only.
+# Base :v5 ships CUDA 13.0 nvcc + torch 2.9.1+cu128 (sglang[all] extras forced
+# the torch upgrade over Mooncake's torch 2.4 pin). UCCL's torch extension build
+# calls torch.utils.cpp_extension._check_cuda_version which rejects nvcc 13.0
+# against torch cu128. Fix: add a CUDA 12.8 toolchain side-by-side and point
+# CUDA_HOME at it only during UCCL build. Runtime still uses CUDA 13.0 driver
+# surface (forward-compatible with cu128 torch wheel) — we only need a matching
+# nvcc for offline compilation.
 ARG TORCH_CUDA_ARCH_LIST="9.0"
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -44,9 +49,23 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # clang-format-14 for UCCL's lint hooks (install_deps.sh would fetch it; we
 # skip install_deps.sh because it overwrites torch).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      clang-format-14 \
+      clang-format-14 gnupg2 ca-certificates wget \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3 /usr/local/bin/python
+
+# ---- CUDA 12.8 toolchain (for UCCL build only) ----
+# Install matching nvcc + cuda runtime dev headers to satisfy torch's version
+# check. Minimal subset: compiler + crt + cudart-dev + driver stubs. Adds ~1.2 GB.
+# Ubuntu 22.04 is the base (verified via base:v5 probe).
+RUN wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb && \
+    dpkg -i cuda-keyring_1.1-1_all.deb && rm cuda-keyring_1.1-1_all.deb && \
+    apt-get update && apt-get install -y --no-install-recommends \
+      cuda-nvcc-12-8 \
+      cuda-cudart-dev-12-8 \
+      cuda-driver-dev-12-8 \
+      libcurand-dev-12-8 \
+      libcublas-dev-12-8 \
+    && rm -rf /var/lib/apt/lists/*
 
 # UCCL build-time Python deps. nanobind is the nb_extension framework UCCL uses;
 # base image may lack it. pybind11/ninja/packaging already present via Mooncake.
@@ -54,16 +73,17 @@ RUN pip install --no-cache-dir "nanobind>=2.0" "pybind11>=2.11" ninja packaging
 
 # ---- UCCL-EP ----
 # Clone fork + branch, build + install Python binding `uccl.ep`.
-# Do NOT run install_deps.sh — it forcibly pulls torch 2.5/cu124 which breaks
-# the Mooncake+SGLang torch 2.4 ABI. UCCL-EP compiles fine against torch 2.4
-# for H200 sm_90 (CUDA 12.6 forward-compatible).
+# Use CUDA 12.8 toolchain (matches torch 2.9.1+cu128 ABI); CUDA_HOME override
+# is scoped to this RUN layer only — runtime still uses /usr/local/cuda → 13.0.
 RUN git clone --recursive ${UCCL_REPO} /opt/uccl && \
     cd /opt/uccl && git checkout ${UCCL_REF} && \
     git submodule update --init --recursive && \
     cd ep && \
+    export CUDA_HOME=/usr/local/cuda-12.8 && \
+    export PATH=/usr/local/cuda-12.8/bin:${PATH} && \
+    export LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:${LD_LIBRARY_PATH:-} && \
     NCCL_HOME=/usr/local/cuda \
     MPI_HOME=/opt/amazon/openmpi \
-    CUDA_HOME=/usr/local/cuda \
     python setup.py install
 
 # ---- DeepEP drop-in wrapper ----
@@ -74,19 +94,29 @@ RUN git clone --recursive ${UCCL_REPO} /opt/uccl && \
 #   /opt/uccl/ep/deep_ep_wrapper/README.md
 RUN cd /opt/uccl/ep/deep_ep_wrapper && python setup.py install
 
+# ---- Runtime LD_LIBRARY_PATH: torch C++ libs (libc10.so etc.) ----
+# UCCL's torch C-extension links against libc10/libtorch at runtime. Base image
+# doesn't put torch/lib on LD_LIBRARY_PATH (sglang-launcher.sh patches this
+# dynamically), so hard-set it here so any subsequent `import uccl.ep` — in
+# build layers AND at container start — resolves torch symbols. Path derived
+# from the base :v5 probe: torch @ /usr/local/lib/python3.10/dist-packages/torch.
+ENV LD_LIBRARY_PATH="/usr/local/lib/python3.10/dist-packages/torch/lib:${LD_LIBRARY_PATH:-}"
+
 # ---- Sanity: imports + SGLang CLI surface ----
 # Fails image build if:
 #   - uccl.ep not importable (ep subpackage install regressed)
 #   - deep_ep not from uccl wrapper (order-of-install got confused with a stray
 #     DeepEP wheel; see §5.8 risk matrix)
 #   - SGLang no longer exposes --moe-a2a-backend (sglang ABI changed)
-RUN python -c "import torch; assert torch.__version__.startswith('2.4'), torch.__version__; \
-               print('torch', torch.__version__, 'cuda', torch.version.cuda)" && \
+RUN python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda); \
+               assert torch.version.cuda.startswith('12.8') or torch.version.cuda.startswith('13.'), \
+                      f'unexpected torch cuda: {torch.version.cuda}'" && \
     python -c "import uccl.ep; print('uccl.ep ok', uccl.ep.__file__ if hasattr(uccl.ep, '__file__') else '(cext)')" && \
-    python -c "import deep_ep, inspect; \
-               p = inspect.getfile(deep_ep); \
-               assert '/opt/uccl/' in p, f'deep_ep not from uccl wrapper: {p}'; \
-               print('deep_ep ok (uccl-backed):', p)" && \
+    python -c "import deep_ep; \
+               m = deep_ep.Config.__module__; \
+               assert m.startswith('uccl.ep') or m.startswith('uccl_ep'), \
+                      f'deep_ep.Config not uccl-backed, module={m}'; \
+               print('deep_ep ok (uccl-backed), Config from:', m, 'at', deep_ep.__file__)" && \
     python -c "import sglang; print('sglang', sglang.__version__)" && \
     (python -m sglang.launch_server --help 2>&1 | grep -i -E "moe-a2a-backend|deepep-mode|deepep-config" | head -10 || \
       echo "WARN: sglang help did not surface moe-a2a-backend flags — verify manually")
