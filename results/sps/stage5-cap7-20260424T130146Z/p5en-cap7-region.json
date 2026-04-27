@@ -1,0 +1,20 @@
+{
+    "SpotPlacementScores": [
+        {
+            "Region": "us-east-2",
+            "Score": 8
+        },
+        {
+            "Region": "us-west-1",
+            "Score": 1
+        },
+        {
+            "Region": "us-east-1",
+            "Score": 1
+        },
+        {
+            "Region": "us-west-2",
+            "Score": 7
+        }
+    ]
+}

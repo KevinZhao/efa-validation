@@ -1,0 +1,9 @@
+{
+    "SpotPlacementScores": [
+        {
+            "Region": "us-west-2",
+            "AvailabilityZoneId": "usw2-az2",
+            "Score": 3
+        }
+    ]
+}
