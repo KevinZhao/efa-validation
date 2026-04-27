@@ -1,5 +1,7 @@
 # Stage 1–4 on p5en (2026-04-22) — 执行总结
 
+> **2026-04-25 更新**：Stage 5 已切 **v5 基线**（Mooncake `@634b7097` + Henan **5** EFA PRs，追加 **#1944** SRD shared-endpoint refactor，带来冷 submit ~4× / warmup ~15× + 修 VRAM preTouchMemory segfault + 修 teardown fi_av_remove 段错误）。Stage 1-4 数据为 v2 基线（4 PRs）历史结果，保持不变；对比数据在 `results/stage5-p5en/` 下产出。
+
 ## 环境
 
 | 项 | 值 |
@@ -32,7 +34,7 @@
 - MoE decode TPOT 中 EP 占比预计从 50-80% 降到 15-25%
 
 ### 2. Stage 3 Mooncake 多 NIC 聚合生效
-王鹤男 4 个 PR（#1509 / #1523 / #1821 / #1912）全部生效：
+截至 Stage 4 v2 基线，王鹤男 4 个 PR（#1509 / #1523 / #1821 / #1912）全部生效（Stage 5 v5 基线追加 **#1944**，见顶部说明）：
 - `fi_mr_regattr` + `FI_HMEM_CUDA` — GPU 内存注册 API (#1509/#1912)
 - `Started 16 CQ polling worker threads` — 每 NIC 1 CQ (#1821)
 - `Chunk 0/1 registered on 16 NICs, duration=427ms` — 自动 striping (#1821)

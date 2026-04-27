@@ -9,6 +9,8 @@
   - sglang-router: **0.3.2** (pip installed at LB boot)
   - NIXL v1.0.1（备选，未启用）
 
+> **2026-04-25 更新**：Stage 5 已切 **v5 基线**（Mooncake `@634b7097` + Henan **5** PRs，追加 **#1944** SRD shared-endpoint refactor）。本文 1P:2D 结果属于 v2 时代，保持不变；Stage 5 R1b 会在 v5 上复测 1P:2D 并单独产出对照数据，届时可量化 v2→v5 的冷启动 / TTFT 差值。
+
 ## 拓扑
 
 | 角色 | Pod | Node | IP |

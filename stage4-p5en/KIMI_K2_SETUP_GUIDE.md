@@ -5,7 +5,7 @@
 **前置假设**：
 - 已有 EKS 集群带 p5en GPU NodeGroup（GPU Operator v25.10.1 + `toolkit.enabled=true` + `cdi.enabled=true`，containerd 2.2 + driver 580 + CUDA 13）
 - 已能 `kubectl` 访问集群
-- 已有 ECR 镜像 `yanxi/sglang-mooncake:v2`（基于 `yanxi/mooncake-nixl:v2`，含 Mooncake post2 Henan PRs + SGLang 0.5.10）
+- 已有 ECR 镜像 `yanxi/sglang-mooncake:v5`（基于 `yanxi/mooncake-nixl:v5`，含 Mooncake @`634b7097` + Henan 5 EFA PRs #1509/#1523/#1821/#1912/**#1944** + SGLang 0.5.10）。v2 镜像是 Stage 1-4 历史基线（4 PRs，不含 #1944），已不再推荐起新 run 用。
 - AWS 账号有 S3 bucket 用来分发 manifest（或直接走 `kubectl apply -f -`）
 - p5en spot/on-demand quota 足够 3 台
 
@@ -221,17 +221,24 @@ kubectl -n yanxi-validation wait deployment/sglang-prefill \
 kubectl -n yanxi-validation logs -l role=prefill --tail=400 | grep -E "EfaTransport|CQ polling|Auto-split|Chunk.*registered"
 ```
 
-期望输出（Henan 4 个 PR 全激活）：
+期望输出（Henan 5 个 PR 全激活，v5 基线 = `634b7097`）：
 ```
 I topology.cpp:124]       Device rdmap{85..88,110..113,135..138,160..163}s0 port 1 is available  ×16
 I transfer_engine_py.cpp:198] Topology discovery complete for EFA. Found 16 devices.
 I efa_transport.cpp:94]    [EFA] AWS Elastic Fabric Adapter transport initialized
 I efa_transport.cpp:113]   EfaTransport: Started 16 CQ polling worker threads              # PR #1821
 I efa_transport.cpp:278]   Auto-split params: page_size=4096, max_pte_entries=23068672...  # PR #1912
-W efa_transport.cpp:486]   Chunk 0/1 registered on 16 NICs, duration=10ms                   # PR #1821
+W efa_transport.cpp:486]   Chunk 0/1 registered on 16 NICs, duration=10ms                   # register-time; note #1944 removed per-request striping
+I efa_transport.cpp:XXX]   SRD shared endpoint: installed ...                              # PR #1944 new log
+I efa_transport.cpp:XXX]   warmupSegment('<peer>'): N/N endpoints connected ... in 1.1s    # PR #1944 opt-in Python binding
 ```
 
 若看到 `Installing TCP transport` **替代** EFA transport，说明 sed patch 没生效 → 检查 `${MC_PY}` 路径是否对（某些镜像版本 sglang 装在 `site-packages` 而非 `dist-packages`）。
+
+**v2 → v5 基线差异速记**（若对比 Stage 3/4 老日志）：
+- v2 (Henan 4 PR) 关键字：`EfaTransport: Started CQ polling` / `Chunk N/M registered on K NICs`
+- v5 (Henan 5 PR, 含 #1944) 额外关键字：`SRD shared endpoint` / `warmupSegment` / first submit ~26 ms（旧版 ~99 ms）
+- **v5 不会再看到 `MC_EFA_STRIPING_THRESHOLD` 运行时路径**（#1944 已移除）
 
 ---
 

@@ -6,6 +6,8 @@
 **Mooncake**: **`v0.3.10.post2` / commit `e1d6d6f6`** (2026-04-22), 包含王鹤男全部 4 个 EFA PR (#1509 #1523 #1821 #1912)
 **完整日志**: `s3://yanxi-validation-788668107894/logs/stage3-p5en/mooncake-dram-init-*.log`
 
+> **2026-04-25 更新**：本文件为 Stage 3 历史结果，基线保持不变。Stage 5 已切 **v5 基线**（Mooncake `@634b7097` + Henan **5** PRs，新增 **#1944 SRD shared-endpoint refactor**），见 `STAGE5_PLAN.md` + `results/stage5-p5en/lane-k/TECH_DELTA.md`。v5 中 #1944 修复了本文档 §8 "VRAM 路径 target segfault" 问题。
+
 ## 关键结果 — DRAM 路径
 
 | 指标 | p5 (post1, 旧) | p5 最优扫参 (t=24) | **p5en (post2, 新)** | 提升 |

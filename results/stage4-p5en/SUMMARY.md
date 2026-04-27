@@ -3,6 +3,8 @@
 **时间**: 2026-04-22 ~16:30 UTC
 **镜像**: `788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake:v2` (digest `aa7f2f6f5f2f1c15...`)
 
+> **2026-04-25 更新**：本文件为 Stage 4 历史结果，保持不变。Stage 5 已切 **v5 基线**（`yanxi/sglang-mooncake:v5`，Mooncake `@634b7097` + Henan **5** PRs，新增 **#1944** SRD shared-endpoint refactor）。详见 `STAGE5_PLAN.md` + `RUNBOOK.md` 2026-04-25 条目。
+
 ## 完成的部分
 
 | 检查 | 结果 |

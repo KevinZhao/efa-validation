@@ -10,6 +10,23 @@
 
 ## Changelog
 
+### 2026-04-26 — Day 2 R6a B300 ABORT + 镜像栈整理立项
+
+**触发**：2026-04-26 下午 R6a（GLM-4.6-FP8 1P:1D @ 2×p6-b300 usw2-az2）ABORT。Mooncake EFA v5 在 B300 上**初始化 PASS**（shared endpoint max_wr=256、16 CQ、`max_mr_size=412 GB`），但 sglang decode path 走 Triton JIT → `ptxas --gpu-name=sm_103a exit 255` → `Capture cuda graph failed` → `--disable-cuda-graph` 也救不回（Triton piecewise kernel 仍走 JIT）。详见 `results/stage5-p5en/r6-b300/20260425T144609Z/`。
+
+**根因**：当前 `yanxi/sglang-mooncake:v5` 栈是 Hopper-only pipeline：
+- `base-cuda-efa:v1` = CUDA 12.6 / NCCL 2.23.4 编译时 `NVCC_GENCODE=compute_90,code=sm_90`，单架构
+- `mooncake-nixl:v5` 层 pin `torch==2.4.*`（cu124 wheel，sm_90 only）
+- `sglang-mooncake:v5` 层 `pip install sglang[all]==0.5.10` 隐式拉 `flashinfer-python` / `triton==3.1.x` / `vllm-flash-attn`，全是 sm_90 预编译 wheel
+- ECR 上存在的 `base-cuda-efa:v3` tag 内容和 v1 一致（4729 MB → 4743 MB），CLAUDE.md 文档里 "v3 = CUDA 13.0.2 + sm_90/100/103" 是**虚构描述**，从未实际 build
+
+**行动**：新增 **§13 镜像栈整理 + Blackwell 分叉**（本次 changelog 条目后的主章节），定义 Hopper / Blackwell 双栈 build matrix、ECR tag 迁移计划、受影响 run 的依赖关系。**该章节在 Stage 5 剩余窗口内不吃 GPU 节点时间，由 builder EC2 异步执行**，不挤占 Lane K / Lane E。
+
+**受阻 run 清单**（需等 Blackwell 栈 ready）：
+- R6a / R6b / R6c（B300 上 GLM-4.6 / Kimi-K2 e2e）
+- 未来任何 p6-b200 / p6-b300 上的 sglang / uccl-ep / flashinfer attention run
+- **不影响** p5 / p5en 上的 Mooncake / NIXL / UCCL-EP / sglang 全部 Hopper 栈 run（Lane K / Lane E / R1-R5 继续走 v5 hopper 栈）
+
 ### 2026-04-25 晚 — Day 1 执行结果回填 + Day 2+ 重排
 
 **Day 1 产出**：R1a（Kimi-K2 1P:1D @ 2×p5en Ohio）PASS；R3（GLM-4.6-FP8 1P:1D @ 2×p5 Oregon same-AZ）PASS；R1b/R3 1P:2D/R4 三个 abort 带 ABORT.md。详见 `results/stage5-p5en/2026-04-25_DAY1_SUMMARY.md`。
@@ -39,6 +56,18 @@
 7. §5.4 UCCL-EP 正确性闸门在"logits max-abs-diff ≤ 1e-3"之外**加 token match rate ≥ 99%**（greedy, temperature=0, ≥ 64 条短请求）
 
 P2（格式类，本轮**不做**）：Spot 价采样脚注 / P99.9 CI 标注 —— 留到下一轮
+
+### 2026-04-25 晚 — Lane E 附加项（UCCL 上游 PR 自测纳入）
+
+向 UCCL 上游提交了第一个 PR **#904** (`UCCL_EP_CPU_TIMEOUT_SECS` runtime override，解 issue #893/#878)，为让 "AWS benchmark 作为 UCCL 团队的权威验证数据"（见 memory `feedback_uccl_pr_aws_bench.md`）真正闭环，在 §5 Lane E 新增 **§5.7 PR #904 自测项**：
+
+- **Day 5 晚 +1 h**（不挤占其他项）：沿用当日 2 node 镜像，build `sglang-mooncake:v5-uccl-pr904` 跑 3 段 microbench（A baseline f1ecbaf7 / B no-regression a7eb743e / C env=600 生效）+ 非法值 stderr 测试
+- **交付**：`results/stage5-p5en/lane-e/pr904-verify/<stamp>/` → 直接贴 PR #904 comment；若 Day 5 SPS 不够延 Day 6 晚；若 Day 5/6 都不起，PR 只附 CPU build log，AWS 数据做 follow-up
+- **风险**：~1 h 小项，Fallback 明确（见 §5.7.4），不阻塞 Lane E 主线 E-E1/E2/E3 / §10.1 R5 pre-flight / Day 7 R5
+
+产出归属：若 Stage 5 窗口内 PR merge → `SUMMARY.md` 列为 "上游修复已 upstream"；否则进 `RECOMMENDATIONS.md` Open items。
+
+---
 
 ### 2026-04-25 晚 — Lane E 深度收紧（客户定位明确后）
 
@@ -386,6 +415,85 @@ Lane K 原方案只测性能差值，未测正确性 —— 但 KV 传输在 ren
 - `results/stage5-p5en/lane-e/E_DECISION_TREE.md` —— **2026-04-25 晚 新增**：从客户模型（Qwen3-MoE / Kimi-K2 / DeepSeek-V3.1）+ EP 规模 → 推荐 backend（UCCL-EP / NCCL-EP）+ 关键 env + 预期延迟区间；这是给客户决策的直接输入，不是参数清单
 - `scripts/stage5-lane-e-microbench.sh`、`scripts/stage5-lane-e-e2e.sh`、`scripts/stage5-lane-e-correctness.sh`（新增）
 
+### 5.7 Lane E 附加项 —— UCCL 上游贡献验证（**2026-04-25 新增**）
+
+本 Stage 5 窗口期内，团队向 `uccl-project/uccl` 提交了第一个上游 PR（**#904** — `UCCL_EP_CPU_TIMEOUT_SECS` runtime 覆盖）。为把客户决策从"旁观 UCCL-EP 生产可用性"升级为"主动补强并可验证"，把 PR 自测作为 **Lane E 的第 4 个交付维度**，与 §5.3 microbench / §5.4 正确性闸门 / §5.5 E2E 并列。
+
+**动机**（与客户价值对齐）：
+- UCCL-EP 在 EFA 上存在已知的 CPU-side false timeout 问题（issue #893 / #878），客户若上生产会踩同样的坑
+- 我们已经实现了 `UCCL_EP_CPU_TIMEOUT_SECS` 环境变量 runtime 覆盖，需要在 AWS p5en 上**实测验证**才能说服 UCCL 团队 merge
+- 验证成功后，同一手段将继续用于 P0 combine-signal / P1 dispatch early-release 等后续 PR —— 本轮建立的 benchmark 基建是**跨 PR 可复用**的工具链
+
+**PR #904 实际改动**（基于 HEAD `f1ecbaf7` + 两个 commit）：
+| Commit | 内容 | 风险 |
+|---|---|---|
+| `0ce1a22f` | 加 `UCCL_EP_CPU_TIMEOUT_SECS` env var，override `NUM_CPU_TIMEOUT_SECS` | 低（纯 env 扩展，默认行为不变） |
+| `a7eb743e` | Helper 移 `common.hpp`，`atoi` → `strtol` + 验证 | 低（refactor，无语义变化） |
+
+#### 5.7.1 测试目标
+
+**必验证项（3 条，blocking merge）**：
+1. **零回归**：`UCCL_EP_CPU_TIMEOUT_SECS` 未设置时，`test_low_latency.py` 的 dispatch/combine 微基准数字和 HEAD `f1ecbaf7` 一致（误差 < 1%，低于 run-to-run 噪声）
+2. **Env 生效**：设置 `UCCL_EP_CPU_TIMEOUT_SECS=3` 触发短超时路径、设置 `=600` 允许长步骤不触发超时
+3. **Build 通过**：在 p5en.48xlarge 上 `bash build.sh cu12 ep --install` 无编译错误，`python3 -c "import uccl.ep"` 无 import 错误
+
+**可选强化项（PR review 被要求时再做）**：
+4. 非法值 fallback：`UCCL_EP_CPU_TIMEOUT_SECS=abc` / `=-5` / `=0` 均 fallback 到 100，并观察到一次性 stderr warning
+5. Stress：Megatron / SGLang 实际工作负载下 `=600` 稳定运行 2 h 无 false timeout
+
+#### 5.7.2 测试设计
+
+**测试窗口**：Day 5 晚（Lane E microbench 结束后），共 ~1 h，不影响主流程。
+
+**硬件**：沿用当日 Lane E microbench 拉起的 2×p5en.48xlarge（SPS 按 §1.2 当日可用 AZ 选），不另外起集群。
+
+**镜像**：基于 Stage 5 现有 `sglang-mooncake:v5-uccl` 镜像，新 build 一个标签 `sglang-mooncake:v5-uccl-pr904`，内含：
+- UCCL `KevinZhao/uccl:ep-warmup-cpu-timeout-env`（HEAD `a7eb743e`）
+- 其他依赖（Mooncake / Henan PR / rdma→efa 补丁）完全保持和 v5-uccl 一致
+- 构建脚本复用 `scripts/stage5-mirror-ecr.sh`，加 `UCCL_BRANCH=ep-warmup-cpu-timeout-env` 变量
+
+**测试脚本**：`scripts/stage5-lane-e-pr904-verify.sh`（新增，~80 行）：
+1. 启动 2 node pod（image 切到 `v5-uccl-pr904`）
+2. 三段 microbench：
+   - **A 段**（baseline）：`HEAD=f1ecbaf7`，env 不设，`test_low_latency.py --num-tokens=128 --hidden=7168 --num-topk=8 --num-experts=288`，3 次取平均
+   - **B 段**（verify 无回归）：`HEAD=a7eb743e`，env 不设，同参数，3 次取平均；对比 A 段 dispatch/combine 延迟差应 < 1%
+   - **C 段**（verify env 生效）：`HEAD=a7eb743e`，`UCCL_EP_CPU_TIMEOUT_SECS=3` 起 pod，验证 dispatch 30 s 后启动不会被 kill（因为只是 runtime knob，不触发 timeout）；再用 `=600` 启，观察 import 阶段 env 生效（`strace -e getenv` 或直接日志）
+3. 非法值测试：`UCCL_EP_CPU_TIMEOUT_SECS=abc python3 -c "import uccl.ep"` 抓 stderr，grep `[UCCL] Warning: invalid`
+
+**数据采集**：和 §8 统一口径一致，额外加：
+- UCCL commit SHA（每 run 写 `env.txt`）
+- env 变量值 + stderr warning 片段（`env.txt` + `stderr.log`）
+- 三段对比表格进 `results/stage5-p5en/lane-e/pr904-verify/RESULT.md`
+
+#### 5.7.3 交付物（PR comment 可直接贴）
+
+- `results/stage5-p5en/lane-e/pr904-verify/<stamp>/STEPS.md` —— 流水（pod 起、每段启动时间、3 次采样 raw）
+- `results/stage5-p5en/lane-e/pr904-verify/<stamp>/RESULT.md` —— 结构化对比表：
+  | Segment | UCCL SHA | Env | Dispatch µs | Combine µs | Δ vs A |
+  |---|---|---|---|---|---|
+  | A baseline | `f1ecbaf7` | unset | (N) | (N) | — |
+  | B no-regression | `a7eb743e` | unset | (N) | (N) | < 1% |
+  | C env-works | `a7eb743e` | `=600` | (N) | (N) | < 1% |
+- `results/stage5-p5en/lane-e/pr904-verify/<stamp>/env.txt` —— full env snapshot（实例 id / AZ / 所有 UCCL_* env）
+- `results/stage5-p5en/lane-e/pr904-verify/<stamp>/stderr_abc.log` —— 非法值测试的 warning 原文
+- 以上所有内容汇总成 PR #904 的 comment（代码块 + 表格），符合 `feedback_uccl_pr_aws_bench.md` 要求
+
+#### 5.7.4 风险与 Fallback
+
+| 风险 | 概率 | 影响 | Fallback |
+|---|---|---|---|
+| Day 5 晚 Ohio SPS 不足，没法起 2 node | 中 | 本项延到 Day 6 晚 | 如 Day 6 也不起，PR 先提交 "build log only"（CPU 侧确认过 format/build pass），AWS 数据做 follow-up comment |
+| `v5-uccl-pr904` 镜像 build 失败 | 低 | 本项阻塞 | 镜像 build 是 Day 4 尾完成，Day 5 早发现可回退到 `v5-uccl` 打 patch 直接 pod 内 `pip install -e /opt/uccl/ep` |
+| B 段和 A 段差值 > 1%（即我们的 refactor 意外引入回归）| 低 | PR 要撤或修 | 立刻 `git bisect` 定位是 `0ce1a22f` 还是 `a7eb743e` 引入，若是 helper 移 `common.hpp` 引入，回退到文件作用域方案（PR 重提） |
+| C 段 env 不生效（证明我们的实现有 bug）| 极低 | PR 阻塞 | 同上，回本机 debug；这是 pre-merge 必须 clear 的 |
+| UCCL 团队在 Day 5-7 窗口期 review comment 要求改 API | 中 | 要追加 commit | 不阻塞 Stage 5 收尾；新 commit push fork 后 PR 自动更新，benchmark 数据不变（语义等价的话） |
+
+#### 5.7.5 与主线关系
+
+**不占 Day 6 R5 pre-flight / Day 7 R5 / 报告窗口**。如果 Day 5 晚跑不完，宁可把 5.7 项**整个砍掉**（PR #904 提供 CPU-side build log 即可），也不挤压 §5.5 Lane E E2E 和 §10.1 R5 pre-flight。
+
+**产出归属**：PR #904 如果在 Stage 5 窗口内 merge，把"AWS benchmark 已上游验证"作为 `SUMMARY.md` 的附加亮点；如果窗口内没 merge，单独列在 `RECOMMENDATIONS.md` 的 "Open items" 小节里给客户看，体现 "UCCL 上游修复路径已打通"。
+
 ---
 
 ## 6. 主路径基线（SGLang + Mooncake，PD 扫描）
@@ -554,6 +662,7 @@ Lane K 原方案只测性能差值，未测正确性 —— 但 KV 传输在 ren
 | 00:00 | **Lane E microbench**（2 node → 4 node）：`uccl-ep bench` + `deepep-tests` 改 EFA + NCCL-tests alltoall |
 | 04:00 | **Lane E 正确性闸门**：UCCL-EP vs NCCL-EP logits 对齐 |
 | 08:00 | **Lane E 端到端**：E-E1 Kimi-K2 EP=16（2 node）|
+| **20:00** | **Lane E 5.7 附加项 — PR #904 验证**：沿用当日 2 node 镜像切 `v5-uccl-pr904` 跑 3 段 microbench（A baseline / B no-regression / C env-works）+ 非法值 stderr 测试，~1 h；产出贴到 PR #904 comment。若 Day 5 晚 SPS 不足，延到 Day 6 晚 |
 
 ### Day 6（2026-04-30）— Lane E E2E + R5 pre-flight
 | Time | Action |
@@ -586,6 +695,8 @@ Lane K 原方案只测性能差值，未测正确性 —— 但 KV 传输在 ren
 | 7 天跑不完 | 中 | 报告降级 | 优先保 Lane K/E + R1 PD 曲线 + R5 GLM-5.1 FP16；R3/R4 可砍 |
 | GLM-5.1 FP16 @ 4 node HBM 不够（显存 ≥ 710 GB，4 × H200 × 141GB = 564GB） | **高** | R5 OOM | 扩到 5 node TP=20（若 pp 切分支持）或等价 6 node TP=24；若仍不够，降级为 AWQ/FP8 量化的 GLM-5.1 备选；最差回退到 GLM-4.6 FP16（ctx 减半）。**Go/No-Go 见下 §10.1（2026-04-25 新增）** |
 | GLM-5.1 上游 HF 未发布 / SGLang 未接入 | 中 | R5 无模型 | 等模型到位再跑；临时用 GLM-4.6 BF16 作"形状等价"替代，标注 |
+| **PR #904 自测不过（B 段 > 1% 回归）**（§5.7 新增） | 低 | PR 要撤或修 | `git bisect` 定位，回退 helper 位置；不影响 Lane E 主线 |
+| **PR #904 Day 5-6 SPS 不足无法 AWS 验证**（§5.7 新增） | 中 | PR 只能附 build log | 不阻塞 Stage 5；AWS 数据做 follow-up comment，不影响 Lane E 主交付 |
 
 ### 10.1 R5 Go/No-Go Pre-flight（**2026-04-25 新增**）
 
@@ -622,6 +733,7 @@ Lane K 原方案只测性能差值，未测正确性 —— 但 KV 传输在 ren
 - `results/stage5-p5en/lane-e/E_VS_NCCL.md` —— **性能差值表**（Δ% 全列 + 扩展性曲线）
 - `results/stage5-p5en/lane-e/CORRECTNESS.md` —— 正确性闸门
 - `results/stage5-p5en/lane-e/IB_REFERENCE.md` —— DeepEP IB 参考数字（标注不对齐）
+- `results/stage5-p5en/lane-e/pr904-verify/<stamp>/` —— **2026-04-25 新增**：PR #904 AWS p5en benchmark 验证产出（STEPS.md / RESULT.md / env.txt / stderr_abc.log），直接贴到 upstream PR comment
 - `results/stage5-p5en/PD_RATIO_CURVE.md` —— Kimi-K2 1P:ND 曲线
 - `results/stage5-p5en/R5_GLM51_FP16.md` —— **GLM-5.1 FP16 收尾画像**（4 node TP=16 1P:1D，最终工作点 TTFT/TPOT/OTPS + HBM/EFA 压力曲线）
 - `results/stage5-p5en/RECOMMENDATIONS.md` —— 给客户的一页调优总表（SGLang flag / NIXL / UCCL-EP 的最佳参数 + EFA env + PD 比例），**只给技术建议，不做引 / 不引判断**
@@ -641,3 +753,131 @@ Lane K 原方案只测性能差值，未测正确性 —— 但 KV 传输在 ren
 3. **DeepEP IB 趋势线数据**：能否提供客户国内生产同模型的 dispatch/combine 延迟 & 带宽数字，作为 Lane E 的比对参考？
 4. **投机解码（MTP/EAGLE）默认开关** —— 影响 OTPS 基线可比性
 5. **reasoning 路径**：V3.1 `reasoning=on` 统一还是独立 SKU
+
+---
+
+## 13. 镜像栈整理 + Blackwell 分叉（2026-04-26 立项）
+
+**背景**：见 Changelog 2026-04-26 条目。当前镜像栈的三个根本问题：
+1. **Hopper 锁死**：base / mooncake / sglang 三层编译期 / pip install 期全绑 sm_90，B300 (sm_103) 无法 JIT 出可执行 kernel
+2. **版本号撒谎**：ECR 上 `base-cuda-efa:v1/v2/v3` 三个 tag 内容基本一致，CLAUDE.md 描述与实际不符
+3. **隐式依赖**：`sglang[all]` pip extras 每次 build 拉当时最新 flashinfer / triton wheel，不可重现且不适配新硬件
+
+### 13.1 目标
+
+1. 维持 Hopper 栈（`v5`）不变，**所有 p5 / p5en 上的 Stage 5 run 继续能跑**
+2. 新增 Blackwell 栈（`blackwell-v1`），支撑 p6-b200 / p6-b300 上的 sglang / uccl-ep / mooncake 全套 e2e
+3. 把 Dockerfile、ECR tag、mirror 脚本、CLAUDE.md 描述对齐到**单一真源**（`common/BUILD_MATRIX.md`）
+
+### 13.2 范围 + 非目标
+
+**范围内**：
+- 重写 `common/Dockerfile.{base-cuda-efa,mooncake-nixl,sglang-mooncake,uccl-ep,nccl-tests}` 的 ARG 语义，引入 `CUDA_VARIANT={hopper|blackwell}` 或拆 `.hopper` / `.blackwell` 后缀（见 §13.4 决策）
+- 新增 `common/BUILD_MATRIX.md` 作为单一真源
+- 新增 `scripts/build-image-matrix.sh`（批量 build Hopper/Blackwell 两条线）
+- `stage5-mirror-ecr.sh` 对齐现实（当前仍引用 `:v2` 老 tag）
+- CLAUDE.md / README.md 修正虚构描述
+- 所有新 manifest 统一用 `:{hopper-v5,blackwell-v1}` 命名（旧 `:v1/v2/v5` 保留给历史 manifest，不删）
+
+**非目标**：
+- 不删除 ECR 上任何已有 tag（避免 break 正在引用的 pod / manifest）
+- 不动 Stage 1-4 历史产物的镜像依赖（停在 v5 hopper）
+- 不在 Stage 5 剩余窗口内占用 GPU 节点时间（build 全部 builder EC2 异步）
+
+### 13.3 Hopper 栈现状盘点（作为 **frozen baseline**）
+
+| 层 | Dockerfile | ECR tag 当前 | 内容 |
+|---|---|---|---|
+| base | `Dockerfile.base-cuda-efa` | `base-cuda-efa:v1/v2/v3` | CUDA 12.6 / NCCL 2.23.4 / aws-ofi-nccl 1.19 / sm_90 only |
+| transport | `Dockerfile.mooncake-nixl` | `mooncake-nixl:v5` | Mooncake @634b7097 + Henan 5 PRs + NIXL v1.0.1 / torch 2.4.* |
+| serving | `Dockerfile.sglang-mooncake` | `sglang-mooncake:v5` | sglang 0.5.10 `[all]` + flashinfer sm_90 wheel + triton 3.1.x |
+| ep | `Dockerfile.uccl-ep` | `uccl-ep:v2`（04-21 起冻结）| UCCL main @04-21 + DeepEP v1.2.1 / torch 2.5.1+cu124 |
+| test | `Dockerfile.nccl-tests-v2`（`nccl-tests` 是旧版，重复）| `nccl-tests:v2` | NCCL-tests v2.14 / sm_90 only |
+
+**决策**：Hopper 栈当前 tag 全部**冻结**，以 `hopper-v5`（以及 nccl-tests 的 `hopper-v2`、uccl-ep 的 `hopper-v2`）做**别名重打**。原 `v1/v2/v3/v5` tag 保留不删。
+
+### 13.4 Dockerfile 组织方式（待决策）
+
+两种选择，各自权衡：
+
+**选项 A — 文件后缀拆分**（推荐）
+```
+common/
+├── Dockerfile.base-cuda-efa.hopper        (CUDA 12.6 / sm_90，= 现有)
+├── Dockerfile.base-cuda-efa.blackwell     (CUDA 13.0 / sm_90;100;103)
+├── Dockerfile.mooncake-nixl.hopper        (torch 2.4 / sm_90)
+├── Dockerfile.mooncake-nixl.blackwell     (torch 2.9 cu128 / sm_90;100;103)
+├── Dockerfile.sglang-mooncake.hopper      (sglang[all] 预编 wheel)
+├── Dockerfile.sglang-mooncake.blackwell   (sglang + 手动 source-build flashinfer/triton sm_103)
+├── Dockerfile.uccl-ep.hopper              (= 现有，torch 2.5.1+cu124)
+├── Dockerfile.uccl-ep.blackwell           (TBD，UCCL 本身是否 sm_103 兼容待查)
+├── Dockerfile.nccl-tests.hopper           (= 现 nccl-tests-v2，rename)
+└── Dockerfile.nccl-tests.blackwell        (NCCL 2.27 / sm_90;100;103)
+```
+优点：语义最清楚；每个文件独立可读；build 脚本简单
+缺点：重复代码 ~60%，任何通用修改要改两处
+
+**选项 B — 同一文件 + ARG**
+```
+Dockerfile.base-cuda-efa      (ARG CUDA_VARIANT={hopper|blackwell})
+Dockerfile.mooncake-nixl      (同)
+Dockerfile.sglang-mooncake    (同)
+```
+优点：DRY；通用改动一处搞定
+缺点：Dockerfile 里大量 `if [ "$CUDA_VARIANT" = "blackwell" ]; then ... fi`，可读性差，调试时难以复现
+
+**建议 A**，理由：Blackwell 的每一层都有独立的版本 pin（CUDA 13 vs 12.6、torch 2.9 vs 2.4、flashinfer 0.2.8 source-build vs 0.2.0 预编 wheel），条件分支太多会把 Dockerfile 变成脚本。**等你确认**。
+
+### 13.5 Milestones（WBS）
+
+按 **不吃 GPU 节点** + **builder EC2 串行 build** 的节奏，这是一个跨 2-3 天的工作项，不阻塞 Stage 5 主线 Lane K / Lane E。
+
+| # | Milestone | 工时 | 依赖 | 产出 |
+|---|---|---|---|---|
+| M1 | 冻结 Hopper 栈 + 别名重打 ECR tag | 30 min | 无 | `hopper-v5` / `hopper-v2` 别名就绪；现有 manifest 不动 |
+| M2 | 清理 repo 内冗余：`Dockerfile.nccl-tests`（旧）删除、`nccl-tests-v2` 重命名 | 10 min | 无 | PR 1 个 |
+| M3 | 新增 `common/BUILD_MATRIX.md` 单一真源 | 30 min | §13.4 决策 | 文档 |
+| M4 | 改 Dockerfile `ARG BASE_IMAGE` 去除默认值（强制外部传入，避免隐藏版本漂移）| 30 min | M3 | PR 1 个（改动 3 个 Dockerfile）|
+| M5 | Blackwell base build + push：`base-cuda-efa.blackwell` | 30 min build + 15 min push | M4，选项 A | `base-cuda-efa:blackwell-v1` @ Ohio ECR |
+| M6 | Blackwell mooncake build + push：`mooncake-nixl.blackwell`（含 Mooncake CMake `-DCMAKE_CUDA_ARCHITECTURES="90;100;103"`）| 45 min build | M5 | `mooncake-nixl:blackwell-v1` |
+| M7 | Blackwell sglang build + push：`sglang-mooncake.blackwell`（含 flashinfer 0.2.8 source-build、triton 3.3 pin）| 60-90 min build | M6 | `sglang-mooncake:blackwell-v1`（预计 ~18 GB）|
+| M8 | 单节点 B300 preflight：`torch.cuda.get_arch_list()` 应含 `sm_103`，`triton` 生成 MoE-like kernel 跑通 JIT，`fi_info -p efa` 16 NIC | 1h（1 × B300 Spot）| M7，B300 SPS ≥ 6 | `results/stage6.5/b300-preflight/<stamp>/STEPS.md`（**独立 run 目录，不污染 Stage 5**）|
+| M9 | Oregon ECR mirror Blackwell 栈（`stage5-mirror-ecr.sh` 改 IMAGES 列表）| 20 min | M7 | Oregon ECR 有 `*:blackwell-v1` |
+| M10 | 重跑 R6a @ Blackwell 栈（2 × B300 usw2-az2）| 1.5h | M8 M9，B300 SPS ≥ 6 | `results/stage5-p5en/r6-b300/<stamp-2>/RESULT.md` PASS |
+| M11 | CLAUDE.md / README.md 修正 `base-cuda-efa:v3 = CUDA 13` 的虚构描述 | 15 min | M3 | PR 1 个 |
+
+**路径总时长**：纯 build 3h；GPU 节点 2.5h（Spot 窗口允许的话，M8+M10 同一批 B300）；repo 工作 2.5h。**总预算 8h**，可分散到 2-3 天。
+
+### 13.6 风险 + Fallback
+
+| 风险 | 概率 | Fallback |
+|---|---|---|
+| CUDA 13.0 + EFA installer 1.47 runtime 不兼容（`libnvidia-ml.so` ABI） | 中 | 降到 CUDA 12.8（ptxas 也认 sm_103a，是 torch 2.9 cu128 wheel 的官配）|
+| flashinfer 0.2.8 source-build 60+ min 失败（CMake 找不到 CUDA 13 header）| 中 | 用 flashinfer 0.2.6 或 triton-only attention backend|
+| triton 3.3 和 sglang 0.5.10 API 不兼容 | 低 | 升 sglang 到 0.5.12（明确 merge 了 B300 fix）或 0.5.13|
+| UCCL 本身不兼容 sm_103 | 中 | uccl-ep Blackwell 栈 park，Lane E B300 暂不做|
+| Mooncake CMake 多架构 build 时间从 10 min → 30 min | 高 | 接受（只是 build，不影响运行时）|
+
+### 13.7 完成判据
+
+**M1-M4 完成**（repo + ECR 现状固化）：
+- `git log` 上有 "freeze hopper stack + rename nccl-tests-v2" commit
+- `common/BUILD_MATRIX.md` 存在且被 CLAUDE.md link
+- `aws ecr describe-images --repository-name yanxi/base-cuda-efa` 能看到 `hopper-v5` alias
+
+**M5-M9 完成**（Blackwell 栈 build 就绪）：
+- Ohio + Oregon ECR 都有 `base-cuda-efa:blackwell-v1` / `mooncake-nixl:blackwell-v1` / `sglang-mooncake:blackwell-v1`
+- 1 × B300 单节点 preflight STEPS.md 记录 `arch_list` 含 sm_103 + triton kernel JIT PASS
+
+**M10 完成**（真正 unblock R6）：
+- `results/stage5-p5en/r6-b300/<stamp>/RESULT.md` 记录 PASS
+- GLM-4.6 2 × B300 1P:1D same-AZ bench 数字（tok/s + TPOT + TTFT）
+- 作为 R3 Oregon p5 same-AZ（2315 tok/s）的 **single-variable diff** 对照
+
+### 13.8 归属
+
+**不属于 Stage 5 主报告**。结果存到 `results/stage6.5/image-stack-cleanup/<stamp>/` 下（新目录），分两份文档：
+- `BUILD_MATRIX_IMPL.md` —— 各 Dockerfile 的实际 diff + 版本 pin rationale
+- `B300_FIRST_RUN.md` —— M8/M10 的 STEPS/RESULT，作为 Blackwell 栈的"首次生产 run"证据
+
+Stage 5 主 SUMMARY 只一句话引用："B300 run 见 `results/stage6.5/image-stack-cleanup/`，镜像栈整理专项"。

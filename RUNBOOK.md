@@ -58,6 +58,19 @@
 |---|---|
 | `yanxi-validation-788668107894` | Dockerfile / manifest 分发、日志归档 |
 
+### FSx for Lustre（模型权重缓存，2026-04-24 起）
+
+| Region | FileSystemId | Lustre | MountName | Subnet / AZ | SG | 类型 | 容量 | Name |
+|---|---|---|---|---|---|---|---|---|
+| us-east-2 | `fs-0e7e1313a9c964d34` | 2.15 | `5w7shb4v` | `subnet-0c86f1c69e4067890` / us-east-2b | `sg-062ae2f53a5e61e49` | SCRATCH_2 | 2400 GiB | `yanxi-model-cache` |
+| us-west-2 | `fs-079832d056597a33b` | 2.15 | `tjvijb4v` | `subnet-0343696171ce4cdc9` / us-west-2b | `sg-0c2f826221429c8f3` | SCRATCH_2 | 2400 GiB | `yanxi-model-cache` |
+
+> 首版（08:01 起的 `fs-0adb0b44ce313faea` / `fs-0a0a98a5f21d6f9fc`）为 Lustre 2.10，与 AL2023 自带 2.15.6 client 不兼容；于 09:50-10:00 UTC 删库重建到 2.15。`fsx-create.sh` 现已 pin `FSX_LUSTRE_VERSION=2.15`。
+
+生命周期脚本（全部幂等）：`scripts/fsx-{lib,sg-setup,create,status,destroy,apply-pvpvc}.sh`。
+CSI / PV / PVC 资料：`manifests/fsx/README.md`、`manifests/fsx/pv-pvc.yaml.tpl`。
+基于 FSx 的模型预取：EC2 Spot 一次性 prefetcher（`scripts/prefetch-models-{launch.sh,userdata.sh.tpl}`）或 K8s Job（`stage4-p5en/model-prefetch-fsx.yaml`）。
+
 ### Kubernetes
 
 | 资源 | 名字 |
@@ -214,3 +227,261 @@
 | 2026-04-21 | 主 region 用 Ohio 而非原计划 Oregon | Ohio 已有 GPU NG + 模板；Spot 价 $10.6 vs Oregon $13–22 且稳定；节省搭建时间 |
 | 2026-04-21 | 不为 GPU NG 加 Cluster Placement Group | 同 subnet 已够用；若阶段 1 all-reduce 达不到判据再回头加 |
 | 2026-04-21 | 改用分层 Dockerfile（base + per-stage） | 避免重复构建 CUDA/EFA/NCCL；客户明确要求记录入仓、价格不是主要因素 |
+
+---
+
+## 2026-04-23 · US Spot Placement Score 扫描（4 台）
+
+**脚本**：`scripts/spot-placement-score.sh`
+**结果目录**：`results/sps/latest/`（`SUMMARY.md` 为汇总报告）
+**任务**：在 4 个美国 region 针对 `p5.48xlarge / p5e.48xlarge / p5en.48xlarge / p6-b200.48xlarge / p6-b300.48xlarge`，目标 capacity=4，做 region + 单 AZ 两个维度的 SPS 查询。账号未启用 GovCloud，仅 us-east-1/2 + us-west-1/2。
+
+### 扫描 1（11:32 UTC）
+
+- 最高分：`p5.48xlarge` @ us-east-1e = 3，其余全 1。
+
+### 扫描 2（13:46 UTC，再次全美扫描）
+
+- **`p5.48xlarge` @ us-west-2b (usw2-az2) = 9 / 10** ⭐
+- **`p5en.48xlarge` @ us-west-2c (usw2-az3) = 9 / 10** ⭐
+- `p6-b300.48xlarge` @ us-west-2b = 3（依旧全美唯一可选）
+- `p5e.48xlarge` / `p6-b200.48xlarge`：全 1。
+
+**结论**：2 小时内 Oregon Hopper/Blackwell 容量明显松动。如果要真起 4 台，**立刻在 us-west-2b/2c 上打 EC2 Fleet `capacity-optimized`**；SPS 实时变化，真 launch 前要再跑一次。
+
+### 扫描 3（14:22 UTC，APAC 区域）
+
+**脚本**：`scripts/spot-placement-score-apac.sh`
+**结果目录**：`results/sps-apac/latest/`
+
+账号 APAC 已启用：ap-south-1 (Mumbai) / ap-east-1 (HK) / ap-northeast-1/2/3 (Tokyo/Seoul/Osaka) / ap-southeast-1/2 (Singapore/Sydney)。未启用：ap-south-2、ap-east-2、ap-southeast-3/4/5/6/7。
+
+**供给矩阵（5 款 GPU × APAC）**：
+
+- `p5.48xlarge`：ap-south-1 / ap-northeast-1 / ap-northeast-2 / ap-southeast-2
+- `p5e.48xlarge`：只 ap-southeast-2
+- `p5en.48xlarge`：ap-south-1 / ap-northeast-1 / ap-northeast-2
+- `p6-b200.48xlarge` / `p6-b300.48xlarge`：**APAC 全部不卖**
+
+**关键结论**：
+
+- **`p5en.48xlarge` @ Tokyo / ap-northeast-1a (apne1-az4) = 5/10** ⭐，是 APAC 唯一非 1 分。
+- 其它 APAC 组合全部 1 分。
+- APAC 不是 B200/B300 的选项；要 Blackwell 必须走 US。
+
+---
+
+## 2026-04-23 · Stage 5 计划落地
+
+**方案文档**：[`STAGE5_PLAN.md`](./STAGE5_PLAN.md)
+**约束**：7 × p5en.48xlarge（H200 × 56 卡），主走 FP8，旗舰不做 FP16。
+**执行窗口**：**2026-04-24 ~ 2026-04-30（7 天）**。
+**选址首选**：us-west-2c（SPS = 9）。
+**候选模型**：Kimi-K2 / DeepSeek-V3.1 / GLM-4.6 / Qwen3-235B-A22B / Qwen3-Next-80B-A3B 全 FP8 MoE；**Day 7 最后追加 GLM-5.1 FP16 收尾 run（R5，4 node TP=16 1P:1D）**。
+**重点课题（v2 更新）**：不做 vLLM / Dynamo，客户 Mooncake fork 不可得——本轮只在 **SGLang 0.5.10 + Mooncake upstream**（基线）之上做两条**可插拔组件**的深度调优：
+1. **Lane K — NIXL vs Mooncake 技术差异量化**：产出架构差异（`TECH_DELTA.md`）、性能差值（`K_VS_MOONCAKE.md` 含 Δ%）、参数调优（`NIXL_TUNING.md`）、切换可观测项（`SWITCH_OBSERVABLES.md`，事实无评价）。
+2. **Lane E — UCCL-EP vs NCCL-EP 技术差异量化**：产出架构差异（`TECH_DELTA.md`）、性能差值（`E_VS_NCCL.md` 含 Δ% + 2→4 节点扩展性）、参数调优（`UCCL_EP_TUNING.md`）、正确性（`CORRECTNESS.md`）、IB 参考标注（`IB_REFERENCE.md`）。
+3. 主路径基线：SGLang + Mooncake EfaTransport 做 1P:1D → 3P:4D PD 比例扫描；出 `PD_RATIO_CURVE.md`。
+
+**口径**：客户信息不足，不做"引 / 不引"或"必须 / 非必须"的业务判断；把**两条路径的技术差异和测试差值全部数字化、具象化**，用数据影响客户。`RECOMMENDATIONS.md` 只给技术建议（最优参数、env 白名单、PD 比例），不做决策。
+
+**与客户对齐点（Stage 5 启动前）**：
+
+1. Mooncake 客户 fork 的 delta（chunk / thread / retry）是否能拿到
+2. FP16 是否为真生产 SLA（是否仍要跑旗舰 FP16）
+3. PD 比例的目标区间（1P:1D / 1P:2D / 1P:3D 哪个最贴近欧洲 MaaS）
+4. 投机解码（MTP/EAGLE）是否默认开
+5. reasoning 路径权重（V3.1 单 SKU 还是 V3.1 + R1 双 SKU）
+
+---
+
+## 2026-04-24 · FSx for Lustre 模型缓存（两 region 同步上线）
+
+**背景**：每轮 benchmark 都要从 HF 把 Kimi K2 (959 GB) / DeepSeek / Qwen 拉到每个 p5/p5en 节点的本地 NVMe，耗时 15 min+ 且重复，费出站带宽。改成 **FSx for Lustre 共享挂载**：一次下载，整个 region 所有 GPU pod 复用。
+
+**决策理由**（vs S3 Express One Zone）：
+- POSIX 原生，`huggingface-cli download --local-dir /fsx/xxx` 零改动；Mountpoint-S3 的 symlink / xattr 限制会污染 HF snapshot 目录结构。
+- SCRATCH_2 2400 GiB 基线 480 MB/s、burst ~3 GB/s，足够 3 节点并发 read Kimi K2。
+- 单 AZ 与 GPU NG 同 subnet，避免跨 AZ 流量。
+- 不跑时 `fsx-destroy.sh --yes` 一条命令销毁，成本可控。
+
+**时间线（UTC）**：
+
+| 时间 | 动作 | 脚本 / 资源 | 结果 |
+|---|---|---|---|
+| 08:00 | 第一次 create 尝试，SG description 非 ASCII 被拒 | `scripts/fsx-sg-setup.sh` | 修掉 `—` 为 `-` |
+| 08:01 | Ohio SG 建立 | `sg-062ae2f53a5e61e49` | 988 + 1018-1023 允许 `sg-067fb33ae2c309f5f`（GPU node） + self |
+| 08:01 | Oregon SG 建立 | `sg-0c2f826221429c8f3` | 允许 `sg-0b5a28e11052ef250`（GPU node） + self |
+| 08:01 | Ohio FSx 创建（SCRATCH_2 2400 GiB, us-east-2b） | `fs-0adb0b44ce313faea` | CREATING |
+| 08:01 | Oregon FSx 创建（SCRATCH_2 2400 GiB, us-west-2b） | `fs-0a0a98a5f21d6f9fc` | CREATING |
+| 08:08 | Ohio FSx v1 AVAILABLE | dns=`fs-0adb0b44ce313faea.fsx.us-east-2.amazonaws.com` mount=`xc4chb4v` (Lustre 2.10) | ⚠️ client 不兼容 |
+| 08:09 | Oregon FSx v1 AVAILABLE | dns=`fs-0a0a98a5f21d6f9fc.fsx.us-west-2.amazonaws.com` mount=`uqkyjb4v` (Lustre 2.10) | ⚠️ client 不兼容 |
+| 09:03 | 两 cluster 装 aws-fsx-csi-driver（helm `kube-system`） | controller ×2 + node DaemonSet | ✅ |
+| 09:04 | 渲染并 apply 静态 PV/PVC `yanxi-model-cache` | `scripts/fsx-apply-pvpvc.sh` | ✅ |
+| ~09:30 | 发现 AL2023 自带 Lustre client 2.15.6 挂不上 2.10 FSx（`mount.lustre: Invalid argument`） | — | 返工 |
+| 09:50 | `fsx-create.sh` pin `FSX_LUSTRE_VERSION=2.15`，删旧库重建 | v1 destroy + v2 create | CREATING |
+| 10:00 | Ohio FSx v2 AVAILABLE | dns=`fs-0e7e1313a9c964d34.fsx.us-east-2.amazonaws.com` mount=`5w7shb4v` (Lustre 2.15) | ✅ |
+| 10:00 | Oregon FSx v2 AVAILABLE | dns=`fs-079832d056597a33b.fsx.us-west-2.amazonaws.com` mount=`tjvijb4v` (Lustre 2.15) | ✅ |
+| 10:00 | PV/PVC 重新 bind 到新 FSx ID | — | ✅ 两 region Bound |
+| 10:06 | EC2 Fleet `capacity-optimized` 拉起 m7i prefetcher Spot（两 region 同步，m6in.32xlarge 无 Spot 容量，降级到 m7i.16x/24x） | `scripts/prefetch-models-launch.sh` + `prefetch-models-userdata.sh.tpl` | Ohio `i-0e559f242487cc5f7` / Oregon `i-02606615a4464114a`，在跑 |
+| 12:44 | 两 region PVC 状态复查（via bastion SSM） | `yanxi-model-cache` | ✅ Bound / RWX / 2400Gi（Ohio `Used By: fsx-ls` smoke pod） |
+| 12:45 | 提 P Spot quota 1152 → 1344 vCPU | `L-7212CCBC` | Ohio req `40f36b30…xgSLbMSo` PENDING / Oregon req `8a7b5351…o7ymZ4Tz` PENDING |
+
+**踩坑笔记**（写入脚本，避免下次再犯）：
+1. Lustre 2.10 vs AL2023 client 2.15.6 不兼容 → `fsx-create.sh` pin `FSX_LUSTRE_VERSION=2.15`。
+2. `huggingface_hub` 1.x 取消 `[cli]` extra，入口 `huggingface-cli` → `hf`；UserData 装 `huggingface_hub>=1.0 hf_transfer hf_xet`，直接 `hf download`。
+3. m6in.32xlarge 在两个 FSx AZ 当前都无 Spot 容量；`prefetch-models-launch.sh` 用 EC2 Fleet + 9 档 instance type 候选（m6in → m7i → c7i）+ `capacityOptimized` 兜底。FSx SCRATCH_2 burst ~3 GB/s，m7i 25/37.5 Gbps ENA 不是瓶颈。
+4. SG description 不能含非 ASCII 字符（`—` 被拒）。
+
+**Prefetcher 下载顺序**（小→大，单实例一次拉完，完成后 self-terminate）：
+Qwen3-Next-80B (~85 GB) → Qwen3-235B-A22B-FP8 (~240 GB) → GLM-4.6 (~340 GB) → DeepSeek-V3.1 (~640 GB) → Kimi-K2-Instruct-0905 (~959 GB)。总 ~2.26 TB / region，刚好塞进 2400 GiB SCRATCH_2。
+
+**下一步**：
+1. 等 prefetcher 完成（SSM `tail -F /var/log/yanxi-prefetch.log` 观察 `.prefetch-complete` sentinel）
+2. 替换原有 `stage4-*/model-prefetch*.yaml` 的 hostPath 为 `persistentVolumeClaim: yanxi-model-cache`
+3. 启 4 node p5en → Stage 5 Day 1 正式起跑（日程滑到 04-25）
+
+---
+
+## 2026-04-24 13:00 UTC · Stage 5 规模下调到 4 节点
+
+**背景**：
+- SPS cap=7 扫描（13:01 UTC）：us-east-2a=8、us-west-2c=6，其它 AZ=1。最高 8/10 说明 7 节点一起起**大概率拿不齐**。
+- 原计划 7 节点要把 Spot quota 从 1152 提到 1344 vCPU，ticket `L-7212CCBC` 两 region 12:45 UTC 提交，仍 `CASE_OPENED`。
+- 4 节点只要 768 vCPU，现有 quota 够用，不再阻塞。
+
+**决策**：
+- 规模由 **7 → 4 节点**。
+- 首选 **us-east-2a**（Ohio，SPS=8），沿用已有 nodegroup `gpu-p5en-spot-useast2a`。
+- 砍 **R1d（7 node 2P:5D）** 和 **R1e（7 node 3P:4D）**。PD 曲线只保留 1P:1D / 1P:2D / 1P:3D 三点（decode 扩展）。
+- **prefill 侧扩展（2P/3P）放弃**：4 节点预算下，保留 decode 扩展曲线更有信息量。写进最终 `SUMMARY.md` 局限说明，让客户知道这部分不在本轮数据范围内。
+- Lane E E-E3（EP=32 跨 4 node）**保留**——4 节点正好够打。
+- R5 GLM-5.1 FP16 TP=16 跨 4 node **保留**——4 节点正好够打。
+
+**动作**：
+1. `STAGE5_PLAN.md §1.2 / §6 / §9 Day 4 / §10 风险` 同步更新。
+2. `manifests/stage5-p5en/r1d-*.yaml`、`r1e-*.yaml` **删除**。
+3. Ohio `gpu-p5en-spot-useast2a` nodegroup：`max=7`（保留 headroom），`desired=0`（quota 批下来 / 容量够时可直接拉 4）。
+4. Oregon `gpu-p5en-48xlarge-spot`：`max=7`、`desired=0`（备份，不主跑）。
+5. **Quota ticket `L-7212CCBC` 可撤回**（两 region）—— 4 节点不需要，撤回免得占 AWS Support 队列；要不要撤待用户确认。
+
+---
+
+## 2026-04-24 14:10 UTC · R6 取消
+
+**结论**：放弃本轮 DeepSeek-V4-Pro 测试，等软件生态进一步完善。
+
+**软件生态现状**（GitHub 查询 14:05 UTC）：
+- SGLang main（0.5.10.post1 及之前所有 release）**不含** `deepseek_v4.py`，不支持 `DeepseekV4ForCausalLM`
+- 主 tracking PR **#23600 "DeepSeek V4" open，未 merge**（head=`deepseek_v4` @ f5d03db8，base=main）
+- 相关修复全 open：#23635（GB200 off-by-one）/ #23626（PP+PD disagg）/ #23639（HiCache）
+- Roadmap #23602 明示还未完成：Hopper W4A16、PP、MegaMoE 优化、HiCache、SM120
+- 要跑 V4 必须走未 merge 特性分支 + tilelang 0.1.8 + apache-tvm-ffi 0.1.9 + DeepSeek 官方 FlashMLA + 重新 build 一个 dsv4 变体镜像；而 Mooncake EFA 4 PR 与此分支的兼容性**未经验证**
+- 决策：不赌未稳定软件栈；等 SGLang V4 支持 merge 回 main 后再做代际对比
+
+**清理动作**：
+1. 删 `manifests/stage5-b300/` 目录（含 `r6-ds-v4-pro-1p3d.yaml` + `r6-prefetch-v4-pro.yaml`）
+2. `STAGE5_PLAN.md §3` / §6 / §9 Day 7 / §10 R6 相关条目全部 strike-through 并标记取消
+3. `manifests/stage5-p5en/` 保留不变（9 个 p5en 的 run）
+4. **Oregon FSx 上的 Kimi-K2 `.prefetch-complete` + `.SKIPPED` sentinel 保留不动**——即使 R6 不做，Oregon FSx 容量也本来就放不下 Kimi-K2 + V3.1 + 其它；Ohio 继续主跑 Kimi-K2，Oregon 仅作 Spot 备份
+5. `scripts/stage5-render.sh` 新增的 `--instance-type` 参数保留（通用能力，将来需要 b300 再用）
+
+**未来恢复条件**（给下一阶段用）：
+- SGLang V4 PR #23600 merge 回 main 且在稳定 release 里
+- SGLang + DSv4 + Mooncake EFA 组合有公开验证过
+- 重新做 SPS cap=4 @ p6-b300 扫描（usw2-az2 单 AZ）
+- 届时 `scripts/stage5-render.sh --instance-type p6-b300.48xlarge --region us-west-2` 一键重渲染即可
+
+---
+
+## ~~2026-04-24 13:45 UTC · R6 追加：DeepSeek-V4-Pro on p6-b300 × 4~~（已取消，见上）
+
+**背景**：客户追加请求 —— 加一个 DeepSeek-V4 Pro（FP8）的测试，用 4 台 p6-b300。
+
+**模型确认**（HF API 查询 2026-04-24 13:45）：
+- 官方 `deepseek-ai/DeepSeek-V4-Pro`（latest update 2026-04-24T10:00）
+- 已是 FP8 e4m3 + block 128×128；activation_scheme=dynamic；65k rope base + yarn factor 16 = 1M 有效 ctx
+- 架构：61 层，hidden 7168，128 attn heads，MLA（q_lora_rank 1536, o_lora_rank 1024），384 routed experts top-6 + 1 shared
+- 体积：**865 GB** (64 safetensors 分片)
+- SGL 社区也有 `sgl-project/DeepSeek-V4-Pro-FP8`（同 base，同 FP8，2026-04-24T07:43）—— 官方版就是 FP8，**用官方**，少一步 weight conv
+
+**硬件**：
+- p6-b300.48xlarge × 4（Oregon usw2-az2，nodegroup `gpu-p6-b300-48xlarge-spot` 已存在，`max=4, desired=0`）
+- 规格：8 × B300 / 2.2 TB HBM per node = **8.6 TB HBM total**；192 vCPU；16 EFA NIC
+- 865 GB FP8 weight 在 32 × B300 上 **只占 10%**，TP/EP 拓扑非常自由
+- SPS cap=4 @ usw2-az2 = **5/10**（可起，有 Spot 回收风险）
+- 4 台 = 768 vCPU，现有 P Spot quota 1152 够用
+
+**拓扑决策**：1P:3D TP=8（先摸 decode 扩展；prefill 1 台、decode 3 台，共 4 台）。Day 7 和 R5 **并行**（不同 region / 硬件）。
+
+**FSx 容量问题**：
+- Oregon FSx 2400 GiB；当前 1.4 TB used / 800 G free，且 prefetcher 正在下 DSv3.1（338/640 G）；Kimi-K2 959 G 未开始
+- 加上 V4 Pro 865 G，**放不下 Kimi-K2**
+- 决策：Oregon **砍 Kimi-K2**（Ohio 主跑 Kimi-K2 覆盖 R1/Lane 系列）；Oregon 只拉 R6 必须的 V4 Pro
+- 13:50 UTC SSM 在 Oregon prefetcher 上写 `/fsx/Kimi-K2-Instruct-0905/.prefetch-complete` + `.SKIPPED` sentinel，prefetcher 下一轮循环会跳过
+
+**产出**：
+1. `manifests/stage5-b300/r6-ds-v4-pro-1p3d.yaml` —— R6 SGLang 1P:3D 部署（复用 `_launcher.yaml` ConfigMap）
+2. `manifests/stage5-b300/r6-prefetch-v4-pro.yaml` —— K8s Job 下 V4 Pro 到 Oregon FSx（pre-flight 检查 900 G 可用空间）
+3. `scripts/stage5-render.sh` 加 `--instance-type` 参数（默认 p5en.48xlarge，R6 传 p6-b300.48xlarge）
+4. `STAGE5_PLAN.md §3 / §6 / §9 Day 7 / §10` 同步
+
+**风险**（已入 §10）：
+- p6-b300 × 4 拿不齐（SPS 5）→ 降级 2 节点 1P:1D 或砍
+- SGLang 0.5.10 未支持 `model_type=deepseek_v4` → Day -1 验证 import；失败则用 repo 自带 `inference/generate.py`，不出 SGLang 数据
+- Oregon FSx 容量 → 已通过 Kimi-K2 skip sentinel 缓解
+
+**下一步**：
+1. 等 Oregon prefetcher 把 DSv3.1 下完（可 SSM tail 观察），脚本自动跳过 Kimi-K2 → instance self-terminate
+2. kubectl apply `r6-prefetch-v4-pro.yaml` 起 V4 Pro 下载 Job（需 Oregon 有一台 nodegroup 节点或 eks-utils 可调度）
+3. Day 7 00:00 UTC 同步 `desired=4` 拉起 p6-b300 NG，apply `r6-ds-v4-pro-1p3d.yaml`
+
+---
+
+## 2026-04-24 Stage 5 Day 0 结（FSx 基建日）
+
+详见 `results/stage5-p5en/2026-04-24_DAY0_SUMMARY.md`。关键动作：
+- 两 region FSx SCRATCH_2 2400 GiB Lustre 2.15 全部 AVAILABLE（08:00→10:06 UTC，中间踩 Lustre 2.10 vs AL2023 client 不兼容坑返工一次）
+- 模型预取启动：Qwen3-Next-80B ✅ / Qwen3-235B-FP8 / GLM-4.6 / DeepSeek-V3.1 / Kimi-K2 顺序下载，Ohio m6in.16x + Oregon c6in.16x Spot
+- 代码：`scripts/fsx-{lib,sg-setup,create,status,destroy,apply-pvpvc}.sh` + `scripts/prefetch-models-{launch,watch}.sh` + `manifests/fsx/pv-pvc.yaml.tpl` 全部入仓
+
+## 2026-04-24 15:13–16:25 UTC · Stage 5 R0 smoke PASS（Oregon）
+
+详见 `results/stage5-p5en/r0-smoke/20260424T151359Z/{STEPS,RESULT,preflight-output}`。关键数字：
+- **选址**：us-west-2c (usw2-az3, SPS=9 @ cap=1) —— Ohio SPS 短期跌到 3/2，切 Oregon
+- **节点**：`i-016848633dec5b3e8` p5en.48xlarge Spot；scale → Ready 3 min 15 s
+- **镜像**：`yanxi/sglang-mooncake:v2` digest `aa7f2f6f…`（Ohio→Oregon 15:06 UTC mirror）
+- **preflight 5/5 PASS**：Mooncake 0.3.10.post2 / Henan EFA SO 103 hits / `MC_LEGACY_RPC_PORT_BINDING` / SGLang rdma hardcode 在 line 195 / SGLang 0.5.10
+- **冷启动**：pod create → ready **22 min 55 s**，主导是 Qwen3-Next E=512 N=64 MoE Triton kernel JIT（0.5.10 无预编 config，fallback triton_3_4_0 + 重编）
+- **generate probe**：`"The capital of France is"` → `"Paris. …Berlin. …Rome. …Madrid. …London."`，e2e 296 ms，5 in / 32 out
+
+## 2026-04-25 03:19–03:56 UTC · Stage 5 切 v5 基线 + R1a 起跑
+
+详见 `results/stage5-p5en/r1a-kimi-k2-1p1d/20260425T033552Z/{STEPS,BUILD_V3}.md`。
+
+| 时间 UTC | 动作 | 结果 |
+|---|---|---|
+| 02:50 (16:25Z 扫) | SPS cap=2 rescan：us-east-2a=**9** / us-west-2c=4 / us-east-2b=3 | Ohio 重新领先 → R1a 选 Ohio |
+| 03:19 | Ohio `gpu-p5en-spot-useast2a` NG desired=0→2 | `i-025388ac45366a78d` + `i-0a599cca49c3a8875` 两节点 Running us-east-2a |
+| 03:35 | R1a v2 镜像 apply 触发（第一次起） | — |
+| 03:52 | 切 v5 计划 kick-off：`common/Dockerfile.mooncake-nixl` `MOONCAKE_REF=634b7097`（#1944 SRD shared endpoint 合入点）| — |
+| 03:56 | builder inspect 发现 Ohio ECR 已有 18h 前预 build 的 `yanxi/{mooncake-nixl,sglang-mooncake}:v5`（`/opt/mooncake` HEAD = `634b709` #1944） | 跳过本地 rebuild，直接用 v5 镜像 |
+| 03:56 | v3 自 build 尝试失败于 Dockerfile 尾部 `efa_latency_bench.py` 路径检查（upstream #1944 后文件搬了位置），Dockerfile 已补 tolerate | 本地 rebuild 取消，v3 Dockerfile 改动保留 |
+| 03:56+ | Oregon ECR mirror `sglang-mooncake:v5`（pid 3920191 后台）+ 新 manifest `_preflight-image-ohio-v5.yaml` + `r1a-kimi-k2-1p1d-v5.yaml` | 进行中 |
+
+**Stage 5 正式基线**：`yanxi/sglang-mooncake:v5`，Mooncake @`634b7097` + Henan 5 EFA PRs（#1509/#1523/#1821/#1912/#1944）。R0/Stage 1-4 历史数据基于 v2（4 PR，不含 #1944），保留不回改。
+
+**#1944 带来的 Stage 5 关键增量**：
+- Cold submit #0：99 ms → **26 ms**（~4×，vLLM/SGLang 自动吃到）
+- `warmupSegment()`：17 s（抖动 9/17/17 s）→ **1.1 s**（稳定 1.13/1.13/1.14，~15×）
+- **修 VRAM `preTouchMemory` segfault**（Stage 3 挂账的 exit 139 问题 → 关闭）
+- **修 teardown `fi_av_remove` after EP close 段错误**
+- **移除 `MC_EFA_STRIPING_THRESHOLD`**：p5en sweep 实测 >2 MB 时 20× 负优化，默认不走那条路径
+- 新 Python 绑定：`warmup_efa_segment(segment_name) -> int`（Lane K 可扫 on/off）
+
+**上游在 #1944 之后还有一条 #1964 "[TE] reduce reg overhead"**（2026-04-24 01:42Z merge，stmatengss 非 Henan）—— 纯把 `vector<MemoryRegion>` 换成 `map<uintptr_t, MemoryRegion>`（O(N)→O(log N)），**不触 EFA transport 代码**，p5en KV disagg 场景收益近似为零；v5 基线**不追**该 commit，停在 `634b7097`。
+
+**下一步**：
+1. 等 Oregon v5 镜像 mirror 完成
+2. 起 v5 preflight（新增 SRD shared-endpoint 符号检查作为第 6 项）
+3. Apply `r1a-kimi-k2-1p1d-v5.yaml` 跑 R1a Kimi-K2 1P:1D
