@@ -1,6 +1,13 @@
 # Lane K microbench — 2026-04-26 首次尝试日志（未出数据，但路径清）
 
-**状态**：**BLOCKED** at GPU device injection into bench pods.
+> **⚠️ SUPERSEDED (2026-04-26 14:45 UTC)**：本文档记录 v5 镜像尝试，当时 blocked 于 nixlbench binary 缺失 + GPU device 注入。后续 v6/v6.1 镜像解决全部问题，**完整 12+12 点 Δ% 数据**见：
+> - `20260426T111002Z-p5-nixl-vs-mooncake/RESULT.md`（p5 EFA v2）
+> - `20260426T134313Z-p5en-nixl-vs-mooncake-nccl/RESULT.md`（p5en EFA v3 + NCCL 参考）
+> - `K_VS_MOONCAKE.md`（最终差值表汇总，本目录顶层）
+>
+> 本文件保留作为**踩坑历史档案**，不代表当前结论。`LESSONS_LEARNED.md` 中 #1-16 的大部分根因发现都来自这次 blocked attempt。
+
+**状态**：**BLOCKED** (历史) at GPU device injection into bench pods.
 **GPU 成本**：2 × p5en ≈ 1 h on Spot（10:20–11:20 UTC）= 2 node-hours
 
 ## 本次尝试的目的

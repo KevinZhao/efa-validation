@@ -1,6 +1,11 @@
 # Lane K · NIXL vs Mooncake DRAM→DRAM over EFA — Partial
 
-**Status**: **PARTIAL** — 1 NIXL data point captured before Spot reclaim.
+> **⚠️ SUPERSEDED (2026-04-26 14:45 UTC)**: 本文件只有 1 NIXL 数据点（58.5 GB/s @ 1M×4×1）。同日后续完成**两组完整 12 点对照**：
+> - p5 EFA v2 → `../20260426T111002Z-p5-nixl-vs-mooncake/RESULT.md`
+> - p5en EFA v3 → `../20260426T134313Z-p5en-nixl-vs-mooncake-nccl/RESULT.md`
+> - 汇总 → `../K_VS_MOONCAKE.md`（最终差值表）
+
+**Status**: **PARTIAL (SUPERSEDED)** — 1 NIXL data point captured before Spot reclaim.
 **Run ID**: `lane-k/20260426T091500Z-nixl-vs-mooncake-partial`
 **Hardware**: 2 × p5en.48xlarge, Ohio use2-az2, EFA v3 (16 × 200 Gbps)
 **Image**: `mooncake-nixl:v6` (`sha256:6271698d...`) — same as prior Mooncake sweep

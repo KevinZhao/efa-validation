@@ -1,6 +1,21 @@
 # Lane K v6 bench attempt — 2026-04-26 second try with `mooncake-nixl:v6`
 
-**Status**: **BLOCKED** at Mooncake EFA transport NIC selection for CPU DRAM addrs.
+> **⚠️ SUPERSEDED (2026-04-26 14:45 UTC)**: v6 "BLOCKED" at NIC selection was due to `block × threads × batch > buffer_size` (1 GB default)——不是 v6 镜像问题，是 sweep 参数设计问题。后续同日：
+> - **v6.1** build 加 libcuda stub symlink → nixlbench 完全跑通
+> - **Mooncake sweep** 12 点完成 on p5en at 13:58 UTC（peak 205.04 GB/s @ 4M×4×8，51% EFA v3 线速）
+> - **NIXL sweep** 12 点完成 on p5en at 14:25 UTC（peak 134.23 GB/s @ 1M×4×8）
+> - **p5 EFA v2 12+12 点对照**早于 p5en 完成（Oregon run at 11:40 UTC）
+> - **NCCL NVLink baseline** 单节点 8 GPU 347 GB/s busbw 收尾记录
+>
+> 完整数据见：
+> - `K_VS_MOONCAKE.md`（本目录顶层 - 最终差值表汇总）
+> - `20260426T134313Z-p5en-nixl-vs-mooncake-nccl/RESULT.md`（p5en 主对照）
+> - `20260426T111002Z-p5-nixl-vs-mooncake/RESULT.md`（p5 辅对照）
+> - `LESSONS_LEARNED.md` #15 (buffer sizing invariant), #17 (batch semantic), #27-29 (NIXL sweep sentinels)
+>
+> 本文件保留为 v6 pipeline unblock 过程档案。
+
+**Status**: **BLOCKED** (历史) at Mooncake EFA transport NIC selection for CPU DRAM addrs.
 **GPU cost**: 2 × p5en × ~1 h = 2 node-hours.
 
 ## What v6 fixed (vs v5 attempt)

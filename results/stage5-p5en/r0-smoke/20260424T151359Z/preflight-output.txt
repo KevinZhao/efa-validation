@@ -1,0 +1,20 @@
+=== Stage 5 image pre-flight (Oregon) ===
+[1/5] Mooncake version (via pip metadata)
+  mooncake pkg version = 0.3.10.post2
+  PASS
+[2/5] Henan EfaTransport in Mooncake binary
+  mooncake dir: /usr/local/lib/python3.10/dist-packages/mooncake
+  EfaTransport/libfabric-efa/Chunk-registered count: 103
+  PASS
+[3/5] MC_LEGACY_RPC_PORT_BINDING support
+  reference count: 1
+  PASS
+[4/5] SGLang rdma hardcode point
+  hardcode at: 195:                "rdma",
+  PASS (launcher will sed rdma→efa)
+[5/5] SGLang version
+  sglang.__version__ = 0.5.10
+  PASS
+
+=== PREFLIGHT PASS ===
+

@@ -1,0 +1,23 @@
+# NCCL all_reduce_perf — single-node 8 H200 GPUs on p5en (NVLink intra-node)
+# nccl 2.23.4 + cuda 12.6 + libnccl-ofi 1.18.0
+# Env: LD_LIBRARY_PATH=/usr/lib64 FI_PROVIDER=efa NCCL_ALGO=Ring
+# Command: ./build/all_reduce_perf -b 1M -e 256M -f 2 -g 8
+# NOTE: single-node => NVLink-only, EFA not exercised. Cross-node 2-node run
+#       requires sshd + mpirun (not in v6.1 image entry, would need pod rebuild).
+#       Use as reference for NVLink peak; NOT comparable to Mooncake/NIXL EFA CPU-DRAM path.
+#
+# Rank 0-7: NVIDIA H200 on pci 59/5a/72/73/8b/8c/a4/a5
+
+# size         count         type   redop  time(us)  algbw(GB/s)  busbw(GB/s)
+1048576        262144       float   sum       47.03     22.30       39.02
+2097152        524288       float   sum       46.39     45.20       79.11
+4194304       1048576       float   sum       53.37     78.59      137.53
+8388608       2097152       float   sum       80.29    104.48      182.83
+16777216      4194304       float   sum      119.33    140.60      246.04
+33554432      8388608       float   sum      209.67    160.03      280.06
+67108864     16777216       float   sum      361.82    185.47      324.58
+134217728    33554432       float   sum      697.37    192.46      336.81
+268435456    67108864       float   sum     1353.93    198.26      346.96
+
+# Avg bus bandwidth: 219.568 GB/s
+# Peak: 346.96 GB/s at 256 MB (NVLink 4th-gen saturation)

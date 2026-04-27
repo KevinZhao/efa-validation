@@ -67,6 +67,23 @@
 | 22 | 新起 p5en 上 `/dev/nvidia*` 不注入 bench pod | `gpu-operator` 的 `nvidia-container-toolkit-daemonset` 在节点上还没部署完成（需 ~3-5 min），bench pod 早于 toolkit ready 时启动 | 先 scale NG + wait 3 min → 看 `kubectl get pods -n gpu-operator -o wide \| grep <新 node IP>` 都 Running → 再 apply bench pods。或者 bench pod 加 `initContainers` wait for toolkit |
 | 23 | p5en EFA NIC 命名不是连续的 `rdmap0s0..rdmap15s0` | p5en PCI 布局：NIC 名是 `rdmap85, 86, 87, 88, 110-113, 135-138, 160-163`（非连续） | 不要 hardcode NIC 名。用 `fi_info -p efa` 动态枚举，或让 Mooncake/NIXL auto-discovery (`--auto_discovery=true` / `--device_list=all`) |
 | 24 | Ohio p5en SPS 从 9 跌到 1（5 min 内） | Spot 容量分钟级波动 | 每次 launch 前重扫 SPS；不够就 Oregon fallback（`us-west-2 az4` 近期 score=6）或 us-east-1 az2=9（需要新起 cluster） |
+| 25 | EKS NG 跨多 AZ subnet 时 ASG 默认 **AZ-balanced launch** → 2 spot 落不同 AZ（违反同 AZ 硬规则） | Oregon p5 NG `VPCZoneIdentifier` 带 4 个 subnet（private-a/b/c/d），ASG 自动 spread | 先 scale 到 0 → `aws autoscaling update-auto-scaling-group --vpc-zone-identifier <单一 subnet> --availability-zones <单一 AZ>` → 再扩。或一开始就给 NG 创建 **per-AZ 一个**（像 Ohio gpu-p5en-spot-useast2a/2b）|
+| 26 | EKS NG update-nodegroup-config 报 `Nodegroup health has issues other than [...]` | 之前 cross-AZ 扩容留下 orphan node object，导致 EKS health check 拒绝进一步 scale | 绕过 EKS API，直接 `aws autoscaling set-desired-capacity` 改 ASG desired，EKS NG 最终会 reconcile |
+
+## 七、NIXL 专项
+
+| # | 症状 | 根因 | 修正 |
+|---|---|---|---|
+| 27 | NIXL sweep 脚本循环里每点 sleep 28s → 所有 row 为 0 (解析失败)，`nxt.log` 仅停在 "All processes are ready to proceed" | nixlbench 启动到出第一行数据需要：ETCD register + 1-GB MR register (1.5s) + warmup 128 iter + measured 128 iter + finalization。1M block 4 threads 场景 > 30s；大块加深度要 80s | 每点 dwell 至少 55-80s（按 block × batch 递增），或者 poll "Block Size" 头行出现再 sleep 额外 20s |
+| 28 | pod 命名 `target`/`initiator` 与 NIXL ETCD rank 语义相反 → CSV 从错误的 pod 读 | NIXL scheme=pairwise 下，**先注册** ETCD 的 rank=0 = NIXL initiator（发送+打印数据）；**后注册** rank=1 = NIXL target。我们启 target pod 先 → rank 0 → 数据在 `/out/nxt.log`（target pod 里） | 从 rank 0 pod（第一启的那个）读 awk；或者改 pod 启动顺序让 `lane-k-initiator` 先启（更直观） |
+| 29 | sweep 每轮覆盖 `/out/nxt.log` → 只保留最后一轮原始数据 | shell 里 `>` 不是 `>>` | 每点独立文件名：`/out/nx-${NAME}.r0.log` + `/out/nx-${NAME}.r1.log`；这样事后能全部追溯 |
+
+## 八、v6.1 镜像专项
+
+| # | 症状 | 根因 | 修正 |
+|---|---|---|---|
+| 30 | 在 v6.1 pod 里跑 NCCL 报 `Test CUDA failure util.cu:557 'CUDA driver is a stub library'` | v6.1 里 `/usr/lib/x86_64-linux-gnu/libcuda.so.1` 是符号链接指向 CUDA SDK 的 stub `libcuda.so`（no-op 占位），只让 nixlbench 这种仅 check symbol 的 binary 通过 loader，不能真正调用 CUDA driver API。实际 host driver bind-mount 的真 `libcuda.so.1` 落在 `/usr/lib64/libcuda.so.1 -> libcuda.so.580.126.09` | 任何要**实际运行 CUDA 代码**的场景（NCCL / PyTorch CUDA op / cuBLAS）前，export `LD_LIBRARY_PATH=/usr/lib64:/usr/local/cuda/lib64:$LD_LIBRARY_PATH` 把真 libcuda 放在 stub 前。或者 bench pod 启动 command 里加 `ln -sf /usr/lib64/libcuda.so.1 /usr/lib/x86_64-linux-gnu/libcuda.so.1` 覆盖 stub（注意：这样会让 nixlbench 也走真 libcuda；如果 pod 没 GPU 就挂 nixlbench）|
+| 31 | v6.1 image 没有 `all_reduce_perf`、没有 `sshd` running、没有 `/root/.ssh`，想跑 2-node NCCL 要费周折 | v6.1 设计就是 Mooncake + NIXL 微基准专用镜像，不带 NCCL 测试套件 | 2-node NCCL 方案：(a) 用独立的 `yanxi/nccl-tests:v1` 镜像 + mpi-operator MPIJob；(b) 重 build v6.2 加 sshd 启动 + 预置 root 密钥 + `all_reduce_perf`。单节点 8 GPU 可以现场 `git clone nccl-tests && make MPI=1 CUDA_HOME=/usr/local/cuda NCCL_HOME=/usr` ~2 min |
 
 ---
 
