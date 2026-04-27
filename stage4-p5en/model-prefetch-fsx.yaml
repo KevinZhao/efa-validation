@@ -1,0 +1,99 @@
+# FSx-backed model prefetch — one Job, one pod, downloads into the shared
+# FSx PVC so every GPU pod afterwards can mount it ReadWriteMany (or
+# ReadOnlyMany if we later re-declare) without re-downloading.
+#
+# Prereqs:
+#   - aws-fsx-csi-driver installed (see manifests/fsx/README.md)
+#   - PVC yanxi-model-cache bound (scripts/fsx-apply-pvpvc.sh)
+#   - ECR image yanxi/sglang-mooncake:v2 reachable
+#
+# Usage:
+#   # Pick a model via the env edit below, then:
+#   kubectl apply -f stage4-p5en/model-prefetch-fsx.yaml
+#   kubectl -n yanxi-validation logs -f job/model-prefetch-fsx
+#
+# To preload multiple models, delete the Job and re-apply with a different
+# MODEL_ID + DEST (each model in its own subdir under /models).
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: model-prefetch-fsx-script
+  namespace: yanxi-validation
+data:
+  prefetch.sh: |
+    #!/usr/bin/env bash
+    set -eux
+    MODEL_ID="${MODEL_ID:-moonshotai/Kimi-K2-Instruct-0905}"
+    # DEST is a subdir under /models so multiple models can coexist on the
+    # same FSx volume. Example: /models/kimi-k2, /models/deepseek-v3, ...
+    DEST="${DEST:-/models/${MODEL_ID##*/}}"
+    mkdir -p "$DEST"
+    # Short-circuit if already present (idempotent).
+    if [ -f "$DEST/.prefetch-complete" ]; then
+      echo "already prefetched: $DEST"
+      ls -la "$DEST" | head -20
+      exit 0
+    fi
+    export HF_HUB_ENABLE_HF_TRANSFER=1
+    export HF_HOME=/models/.hf-cache
+    mkdir -p "$HF_HOME"
+    huggingface-cli download "$MODEL_ID" \
+      --local-dir "$DEST" \
+      --local-dir-use-symlinks False \
+      --max-workers 16
+    touch "$DEST/.prefetch-complete"
+    du -sh "$DEST"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: model-prefetch-fsx
+  namespace: yanxi-validation
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app: yanxi-model-prefetch-fsx
+    spec:
+      restartPolicy: Never
+      # Run on any node that can mount the FSx (all GPU nodes in the subnet
+      # that matches the FSx AZ). Single pod is enough — FSx throughput is
+      # the bottleneck, not pod parallelism.
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: prefetch
+          image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake:v1
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MODEL_ID
+              value: "moonshotai/Kimi-K2-Instruct-0905"
+            # Leave DEST unset to let the script derive /models/<name>.
+            # - name: DEST
+            #   value: "/models/kimi-k2"
+          command: ["/bin/bash", "/scripts/prefetch.sh"]
+          volumeMounts:
+            - name: models
+              mountPath: /models
+            - name: scripts
+              mountPath: /scripts
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+            limits:
+              cpu: "8"
+              memory: "32Gi"
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: yanxi-model-cache
+        - name: scripts
+          configMap:
+            name: model-prefetch-fsx-script
+            defaultMode: 0755

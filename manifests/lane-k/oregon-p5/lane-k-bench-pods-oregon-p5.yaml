@@ -1,0 +1,165 @@
+#
+# Lane K microbench on Oregon **p5.48xlarge** (H100, 32 × 100 Gbps EFA v2)
+# =======================================================================
+# Why this manifest exists:
+#   - p5en tc=2 SPS = 1 (Ohio + Oregon + N. Virginia, 2026-04-26 11 UTC)
+#   - p5.48xlarge tc=2 SPS = 9 in usw2-az1/az2/az3
+#   - p5 has EFA v2 (32 × 100 Gbps) — same 3200 Gbps theoretical line rate as
+#     p5en (16 × 200 Gbps v3), but different NIC topology.
+#   - Data collected here is labelled "p5 / EFA v2"; p5en/EFA v3 data stays as
+#     the prior sweep baseline. Apples-to-apples within the same tool (NIXL
+#     or Mooncake) is still valid; cross-tool comparison (NIXL vs Mooncake)
+#     is what we care about for Lane K, and that's per-architecture invariant.
+#
+# Image: mooncake-nixl:v6.1 (Oregon ECR, mirrored from Ohio 2026-04-26 10:16 UTC).
+# Digest: sha256:0970bdb3d70729bc0d34a8f8060c3cf12d7d16bf168428d1ce23946387d227f2
+#
+# Notes vs Ohio manifest (manifests/lane-k/lane-k-bench-pods.yaml):
+#   - instance-type: p5.48xlarge (was p5en.48xlarge)
+#   - EFA resource: vpc.amazonaws.com/efa: 32 (was 16 on p5en)
+#   - zone: omitted — let scheduler pick any AZ with capacity; we'll verify
+#     afterwards that both pods landed in the same AZ (Oregon NG spans 4 AZs).
+#   - ECR host: us-west-2
+#
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: lane-k-target
+  namespace: yanxi-validation
+  labels:
+    app: lane-k-bench
+    role: target
+    run: p5-nixl-vs-mooncake
+spec:
+  hostNetwork: true
+  hostIPC: true
+  dnsPolicy: ClusterFirstWithHostNet
+  nodeSelector:
+    node.kubernetes.io/instance-type: p5.48xlarge
+    # zone is filled in by pre-flight script after observing which AZ the
+    # 2 p5 Spot nodes land in (Oregon NG spans 4 subnets; we pin once we see
+    # them). Placeholder us-west-2c is replaced via `sed` before kubectl apply.
+    topology.kubernetes.io/zone: us-west-2c
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app: lane-k-bench
+          topologyKey: kubernetes.io/hostname
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  containers:
+    - name: bench
+      image: 788668107894.dkr.ecr.us-west-2.amazonaws.com/yanxi/mooncake-nixl:v6.1
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/bash", "-lc", "sleep infinity"]
+      env:
+        - { name: ROLE, value: target }
+        - { name: FI_PROVIDER, value: efa }
+        - { name: FI_EFA_USE_DEVICE_RDMA, value: "1" }
+        - { name: FI_EFA_FORK_SAFE, value: "1" }
+        - { name: FI_MR_HMEM, value: "1" }
+        - { name: MC_WORKERS_PER_CTX, value: "2" }
+        - { name: MC_NUM_CQ_PER_CTX, value: "2" }
+        - { name: MC_LEGACY_RPC_PORT_BINDING, value: "1" }
+        - { name: NVIDIA_DISABLE_REQUIRE, value: "1" }
+        - { name: NVIDIA_VISIBLE_DEVICES, value: "all" }
+        - { name: NVIDIA_DRIVER_CAPABILITIES, value: "compute,utility" }
+      securityContext:
+        capabilities:
+          add: [IPC_LOCK]
+      resources:
+        limits:
+          nvidia.com/gpu: 8
+          vpc.amazonaws.com/efa: 32
+          hugepages-2Mi: 5120Mi
+          memory: 500Gi
+        requests:
+          nvidia.com/gpu: 8
+          vpc.amazonaws.com/efa: 32
+          hugepages-2Mi: 5120Mi
+          memory: 500Gi
+      volumeMounts:
+        - { name: shm, mountPath: /dev/shm }
+        - { name: out, mountPath: /out }
+  volumes:
+    - name: shm
+      emptyDir: { medium: Memory, sizeLimit: 64Gi }
+    - name: out
+      emptyDir: { sizeLimit: 10Gi }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: lane-k-initiator
+  namespace: yanxi-validation
+  labels:
+    app: lane-k-bench
+    role: initiator
+    run: p5-nixl-vs-mooncake
+spec:
+  hostNetwork: true
+  hostIPC: true
+  dnsPolicy: ClusterFirstWithHostNet
+  nodeSelector:
+    node.kubernetes.io/instance-type: p5.48xlarge
+    # zone is filled in by pre-flight script after observing which AZ the
+    # 2 p5 Spot nodes land in (Oregon NG spans 4 subnets; we pin once we see
+    # them). Placeholder us-west-2c is replaced via `sed` before kubectl apply.
+    topology.kubernetes.io/zone: us-west-2c
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app: lane-k-bench
+          topologyKey: kubernetes.io/hostname
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  containers:
+    - name: bench
+      image: 788668107894.dkr.ecr.us-west-2.amazonaws.com/yanxi/mooncake-nixl:v6.1
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/bash", "-lc", "sleep infinity"]
+      env:
+        - { name: ROLE, value: initiator }
+        - { name: FI_PROVIDER, value: efa }
+        - { name: FI_EFA_USE_DEVICE_RDMA, value: "1" }
+        - { name: FI_EFA_FORK_SAFE, value: "1" }
+        - { name: FI_MR_HMEM, value: "1" }
+        - { name: MC_WORKERS_PER_CTX, value: "2" }
+        - { name: MC_NUM_CQ_PER_CTX, value: "2" }
+        - { name: MC_LEGACY_RPC_PORT_BINDING, value: "1" }
+        - { name: NVIDIA_DISABLE_REQUIRE, value: "1" }
+        - { name: NVIDIA_VISIBLE_DEVICES, value: "all" }
+        - { name: NVIDIA_DRIVER_CAPABILITIES, value: "compute,utility" }
+      securityContext:
+        capabilities:
+          add: [IPC_LOCK]
+      resources:
+        limits:
+          nvidia.com/gpu: 8
+          vpc.amazonaws.com/efa: 32
+          hugepages-2Mi: 5120Mi
+          memory: 500Gi
+        requests:
+          nvidia.com/gpu: 8
+          vpc.amazonaws.com/efa: 32
+          hugepages-2Mi: 5120Mi
+          memory: 500Gi
+      volumeMounts:
+        - { name: shm, mountPath: /dev/shm }
+        - { name: out, mountPath: /out }
+  volumes:
+    - name: shm
+      emptyDir: { medium: Memory, sizeLimit: 64Gi }
+    - name: out
+      emptyDir: { sizeLimit: 10Gi }

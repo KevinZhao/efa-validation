@@ -1,0 +1,72 @@
+# Mooncake HTTP metadata server Deployment for Lane K microbench.
+# transfer_engine_bench accepts schemes: etcd:// / redis:// / http:// / https://
+# Our mooncake-nixl:v6.1 image has USE_ETCD=OFF, USE_REDIS=OFF, USE_HTTP=ON
+# (WITH_STORE=OFF trims etcd/redis metadata plugins).
+# So we stand up mooncake's own http_metadata_server and point the bench at it.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mooncake-meta
+  namespace: yanxi-validation
+spec:
+  selector:
+    app: mooncake-meta
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mooncake-meta
+  namespace: yanxi-validation
+  labels:
+    app: mooncake-meta
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mooncake-meta
+  template:
+    metadata:
+      labels:
+        app: mooncake-meta
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      # Run metadata server on any p5en in the NG (use zone nodeSelector so it
+      # lands in use2-az2 alongside bench pods). HostNetwork port 8080 doesn't
+      # clash with bench pods which use dynamic RPC ports.
+      nodeSelector:
+        node.kubernetes.io/instance-type: p5en.48xlarge
+        topology.kubernetes.io/zone: us-east-2b
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: server
+          image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/mooncake-nixl:v6.1
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              exec python3 -m mooncake.http_metadata_server --port 8080 --host 0.0.0.0 --log-level INFO
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"

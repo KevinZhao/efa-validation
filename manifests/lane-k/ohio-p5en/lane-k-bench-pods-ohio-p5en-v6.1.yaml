@@ -1,0 +1,173 @@
+# Lane K microbench: 2 long-lived pods (target + initiator) with EFA + hostNetwork.
+# Why hostNetwork:
+#   - microbench measures wire-level Gbps / RTT; pod-network overlay would add noise.
+#   - EFA device is exposed through vpc.amazonaws.com/efa resource; requires
+#     IPC_LOCK and hugepages identical to sglang pods.
+# Both pods sleep indefinitely; the driver script runs bench invocations via `kubectl exec`.
+# podAntiAffinity ensures target and initiator land on 2 distinct p5en hosts.
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: lane-k-target
+  namespace: yanxi-validation
+  labels:
+    app: lane-k-bench
+    role: target
+spec:
+  hostNetwork: true
+  hostIPC: true
+  dnsPolicy: ClusterFirstWithHostNet
+  nodeSelector:
+    node.kubernetes.io/instance-type: p5en.48xlarge
+    topology.kubernetes.io/zone: us-east-2b
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app: lane-k-bench
+          topologyKey: kubernetes.io/hostname
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  containers:
+    - name: bench
+      image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/mooncake-nixl:v6.1
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/bash", "-lc", "sleep infinity"]
+      env:
+        - name: ROLE
+          value: target
+        - name: ETCD_ENDPOINTS
+          value: http://etcd.yanxi-validation.svc:2379
+        - name: FI_PROVIDER
+          value: efa
+        - name: FI_EFA_USE_DEVICE_RDMA
+          value: "1"
+        - name: FI_EFA_FORK_SAFE
+          value: "1"
+        - name: FI_MR_HMEM
+          value: "1"
+        - name: MC_WORKERS_PER_CTX
+          value: "2"
+        - name: MC_NUM_CQ_PER_CTX
+          value: "2"
+        - name: NVIDIA_DISABLE_REQUIRE
+          value: "1"
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: "all"
+        - name: NVIDIA_DRIVER_CAPABILITIES
+          value: "compute,utility"
+      securityContext:
+        capabilities:
+          add: [IPC_LOCK]
+      resources:
+        limits:
+          nvidia.com/gpu: 8
+          vpc.amazonaws.com/efa: 16
+          hugepages-2Mi: 5120Mi
+          memory: 500Gi
+        requests:
+          nvidia.com/gpu: 8
+          vpc.amazonaws.com/efa: 16
+          hugepages-2Mi: 5120Mi
+          memory: 500Gi
+      volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+        - name: out
+          mountPath: /out
+  volumes:
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 64Gi
+    - name: out
+      emptyDir:
+        sizeLimit: 10Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: lane-k-initiator
+  namespace: yanxi-validation
+  labels:
+    app: lane-k-bench
+    role: initiator
+spec:
+  hostNetwork: true
+  hostIPC: true
+  dnsPolicy: ClusterFirstWithHostNet
+  nodeSelector:
+    node.kubernetes.io/instance-type: p5en.48xlarge
+    topology.kubernetes.io/zone: us-east-2b
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app: lane-k-bench
+          topologyKey: kubernetes.io/hostname
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  containers:
+    - name: bench
+      image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/mooncake-nixl:v6.1
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/bash", "-lc", "sleep infinity"]
+      env:
+        - name: ROLE
+          value: initiator
+        - name: ETCD_ENDPOINTS
+          value: http://etcd.yanxi-validation.svc:2379
+        - name: FI_PROVIDER
+          value: efa
+        - name: FI_EFA_USE_DEVICE_RDMA
+          value: "1"
+        - name: FI_EFA_FORK_SAFE
+          value: "1"
+        - name: FI_MR_HMEM
+          value: "1"
+        - name: MC_WORKERS_PER_CTX
+          value: "2"
+        - name: MC_NUM_CQ_PER_CTX
+          value: "2"
+        - name: NVIDIA_DISABLE_REQUIRE
+          value: "1"
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: "all"
+        - name: NVIDIA_DRIVER_CAPABILITIES
+          value: "compute,utility"
+      securityContext:
+        capabilities:
+          add: [IPC_LOCK]
+      resources:
+        limits:
+          nvidia.com/gpu: 8
+          vpc.amazonaws.com/efa: 16
+          hugepages-2Mi: 5120Mi
+          memory: 500Gi
+        requests:
+          nvidia.com/gpu: 8
+          vpc.amazonaws.com/efa: 16
+          hugepages-2Mi: 5120Mi
+          memory: 500Gi
+      volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+        - name: out
+          mountPath: /out
+  volumes:
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 64Gi
+    - name: out
+      emptyDir:
+        sizeLimit: 10Gi

@@ -1,0 +1,115 @@
+# UCCL-EP PR-1 L-03 bench workspace v3
+# 用我们 Ohio ECR 现成的 yanxi/uccl-ep:v2 镜像（已含 EFA userland + CUDA + UCCL 依赖）
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: uccl-ep-bench
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: uccl-ep-master
+  namespace: uccl-ep-bench
+  labels:
+    app: uccl-ep-bench
+    role: master
+spec:
+  hostNetwork: true
+  hostIPC: true
+  dnsPolicy: ClusterFirstWithHostNet
+  nodeSelector:
+    node.kubernetes.io/instance-type: p5en.48xlarge
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+    - key: CriticalAddonsOnly
+      operator: Exists
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app: uccl-ep-bench
+          topologyKey: kubernetes.io/hostname
+  containers:
+    - name: workspace
+      image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/uccl-ep:v2
+      command: ["/bin/bash", "-c", "sleep infinity"]
+      securityContext:
+        privileged: true
+        capabilities:
+          add: ["IPC_LOCK", "SYS_PTRACE"]
+      resources:
+        requests:
+          nvidia.com/gpu: 8
+          vpc.amazonaws.com/efa: 16
+          memory: 512Gi
+          cpu: 96
+        limits:
+          nvidia.com/gpu: 8
+          vpc.amazonaws.com/efa: 16
+          memory: 1024Gi
+      volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+  volumes:
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 64Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: uccl-ep-worker
+  namespace: uccl-ep-bench
+  labels:
+    app: uccl-ep-bench
+    role: worker
+spec:
+  hostNetwork: true
+  hostIPC: true
+  dnsPolicy: ClusterFirstWithHostNet
+  nodeSelector:
+    node.kubernetes.io/instance-type: p5en.48xlarge
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+    - key: CriticalAddonsOnly
+      operator: Exists
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app: uccl-ep-bench
+          topologyKey: kubernetes.io/hostname
+  containers:
+    - name: workspace
+      image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/uccl-ep:v2
+      command: ["/bin/bash", "-c", "sleep infinity"]
+      securityContext:
+        privileged: true
+        capabilities:
+          add: ["IPC_LOCK", "SYS_PTRACE"]
+      resources:
+        requests:
+          nvidia.com/gpu: 8
+          vpc.amazonaws.com/efa: 16
+          memory: 512Gi
+          cpu: 96
+        limits:
+          nvidia.com/gpu: 8
+          vpc.amazonaws.com/efa: 16
+          memory: 1024Gi
+      volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+  volumes:
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 64Gi

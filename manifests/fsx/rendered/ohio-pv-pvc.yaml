@@ -1,0 +1,43 @@
+# Static PV + PVC for the yanxi FSx model cache.
+# Placeholders (replaced by scripts/fsx-apply-pvpvc.sh):
+#   fs-0e7e1313a9c964d34     e.g. fs-0abc...
+#   fs-0e7e1313a9c964d34.fsx.us-east-2.amazonaws.com       e.g. fs-0abc....fsx.us-east-2.amazonaws.com
+#   5w7shb4v     Lustre MountName, e.g. "abcdef" (NOT the DNS)
+#   2400  storage capacity GiB (typically 2400)
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: yanxi-model-cache-pv
+  labels:
+    app.kubernetes.io/part-of: yanxi-validation
+    storage: fsx-lustre
+spec:
+  capacity:
+    storage: 2400Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: fsx-lustre-static
+  mountOptions:
+    - flock
+  csi:
+    driver: fsx.csi.aws.com
+    volumeHandle: fs-0e7e1313a9c964d34
+    volumeAttributes:
+      dnsname: fs-0e7e1313a9c964d34.fsx.us-east-2.amazonaws.com
+      mountname: 5w7shb4v
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: yanxi-model-cache
+  namespace: yanxi-validation
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: fsx-lustre-static
+  resources:
+    requests:
+      storage: 2400Gi
+  volumeName: yanxi-model-cache-pv
