@@ -27,10 +27,13 @@ DST_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${DST_REGION}.amazonaws.com"
 # If we change the image pin, update this list (and the manifests).
 declare -a IMAGES=(
   "yanxi/sglang-mooncake:v2"
+  "yanxi/sglang-mooncake:v5"
+  "yanxi/sglang-mooncake:v5-uccl"
   "yanxi/mooncake-nixl:v5"
+  "yanxi/uccl-ep:v2"
   "yanxi/uccl-ep:latest"
   "yanxi/base-cuda-efa:v2"
-  "yanxi/nccl-tests:v1"
+  "yanxi/nccl-tests:v2"
 )
 
 if [ -n "${SINGLE_IMAGE}" ]; then

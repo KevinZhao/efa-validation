@@ -10,6 +10,22 @@
 
 ## Changelog
 
+### 2026-04-27 — Lane E §5.8 单节点 UCCL-EP vs NCCL 对比新增
+
+**触发**：客户问到"单节点 MoE 不跨机，UCCL-EP 相比 NCCL 能快多少"。当前 Lane E 主线（§5.3 / §5.5）全部瞄准 2-4 node 跨机场景，**单节点数据完全缺失**，无法直接答。补 §5.8 作为 Lane E 的第 5 个小项，填上这段曲线。
+
+**核心问题**：单节点 TP=EP=8 时，alltoall 走 NVLink / NVSwitch（900 GB/s），**带宽差距被稀释**——但稀疏 permute/unpermute 融合、SM 占用低（DeepEP 20-24 SM vs NCCL ~132 SM）、chunked overlap 三个 lever 仍在。先写出预估，再用实测数字覆盖。
+
+**预估（待 §5.8 实测验证）**：
+- alltoall 微观延迟：**1.5–2×**（DeepEP paper H800 NVLink 基础推算）
+- MoE decode ITL，不开 overlap：**-10 ~ -15%**
+- MoE decode ITL，叠 SBO overlap：**-20 ~ -30%**
+- MoE prefill throughput：**-5 ~ -10%**
+- 预估来源：DeepEP paper + MoE 58 层 × 220-320 µs alltoall 累计，**没有本项目 p5en 单节点实测数据**
+
+**时机**：Day 4 08:00-12:00（原 buffer 时段），~4 h，不挤 R4 / 故障恢复 / Day 5 Lane E 主线。
+**依赖**：§9 Day 2 晚的"UCCL-EP SGLang 接入 pre-task"必须先闭合（同 §5.3）。
+
 ### 2026-04-26 — Day 2 R6a B300 ABORT + 镜像栈整理立项
 
 **触发**：2026-04-26 下午 R6a（GLM-4.6-FP8 1P:1D @ 2×p6-b300 usw2-az2）ABORT。Mooncake EFA v5 在 B300 上**初始化 PASS**（shared endpoint max_wr=256、16 CQ、`max_mr_size=412 GB`），但 sglang decode path 走 Triton JIT → `ptxas --gpu-name=sm_103a exit 255` → `Capture cuda graph failed` → `--disable-cuda-graph` 也救不回（Triton piecewise kernel 仍走 JIT）。详见 `results/stage5-p5en/r6-b300/20260425T144609Z/`。
@@ -494,6 +510,109 @@ Lane K 原方案只测性能差值，未测正确性 —— 但 KV 传输在 ren
 
 **产出归属**：PR #904 如果在 Stage 5 窗口内 merge，把"AWS benchmark 已上游验证"作为 `SUMMARY.md` 的附加亮点；如果窗口内没 merge，单独列在 `RECOMMENDATIONS.md` 的 "Open items" 小节里给客户看，体现 "UCCL 上游修复路径已打通"。
 
+### 5.8 Lane E 附加项 —— 单节点 UCCL-EP vs NCCL 对比（**2026-04-27 新增**）
+
+#### 5.8.1 课题
+
+Lane E 主线（§5.3 / §5.5）全部瞄准 2-4 node 跨机 EFA 场景；**单节点 TP=EP=8 走 NVLink 内的 MoE alltoall 数据缺失**。客户若只部署单节点（Qwen3-235B-A22B-FP8 / Qwen3-Next-80B-A3B 单机即可），我们目前无法回答"UCCL-EP 相比 NCCL alltoall 能快多少"。本项补该曲线。
+
+**关键点**：单节点 NVLink 900 GB/s 足够宽，**带宽差距被稀释**；UCCL-EP / DeepEP 的优势不来自"数据量少"，来自：
+1. permute / unpermute 融合进 dispatch / combine kernel（NCCL 必须单独 kernel）
+2. SM 占用低（DeepEP 20-24 SM vs NCCL ~132 SM）→ 让出 SM 给 expert GEMM
+3. Chunked dispatch 可与 GroupedGEMM overlap（NCCL alltoall 整块同步）
+
+因此单节点实测需同时测 "不开 overlap" 和 "开 SBO overlap" 两档。
+
+#### 5.8.2 预估（待实测覆盖）
+
+| 指标 | 不开 overlap | 开 SBO overlap | 来源 |
+|---|---|---|---|
+| alltoall 纯延迟（dispatch+combine）| UCCL-EP **-40 ~ -50%**（即 1.5-2× 提速）| 同左 | DeepEP paper H800 NVLink + p5en H200 形状外推 |
+| MoE decode ITL | **-10 ~ -15%** | **-20 ~ -30%** | 58 层 × 110-170 µs 节省 / (30-40 ms ITL) |
+| MoE prefill throughput | **-5 ~ -10%** | 同左（prefill 不叠 overlap）| prefill FLOPs-bound，alltoall 占比 10-15% |
+
+**预估来源**：DeepEP paper (Feb 2025) 数据 + MoE 分层结构推算；**没有本项目 p5en H200 单节点实测**。判据：实测 ITL 改善落在预估区间内 → 结论"单节点 UCCL-EP 收益在预期"；落在区间外 → 文档注明"NVLink 900 vs 400 GB/s 带宽差异 / 单节点 SM 争用行为与 DeepEP 原始假设不一致"。
+
+#### 5.8.3 测试设计
+
+**硬件**：1 × p5en.48xlarge Ohio（use2-az2，SPS 当日最高），沿用现有 `yanxi-validation` ns + Lane E 镜像（`sglang-mooncake:v5-uccl`），**不另起集群**，不需要 hostNetwork（单节点无跨机）。
+
+**时机**：Day 4 08:00-12:00（原 buffer 时段，R4 重试在 00:00-04:00，故障恢复 16:00-20:00，中间窗口空闲）。
+
+**测试矩阵**（分两层，沿用 Lane E §5.3 / §5.4 方法论）：
+
+##### L1 — Microbench（2 h）
+
+单节点 TP=EP=8，`test_intranode.py`（DeepEP 自带，UCCL-EP 已兼容）+ NCCL-tests alltoall 对照：
+
+| 维度 | 取值 | 说明 |
+|---|---|---|
+| Hidden dim | 4096 / 7168 | 覆盖 Qwen3-MoE 和 Kimi-K2 / DeepSeek 两档 |
+| Tokens per batch | 512 / 2048 / 8192 | 单节点有必要加 512（decode 小 batch 代表性）|
+| Top-k | 固定 8 | 同 Lane E 主线 |
+| Experts total | 128（Qwen3）/ 256（DeepSeek）/ 384（Kimi-K2）| 3 档 |
+| Backend | UCCL-EP / NCCL alltoall | 对照 |
+
+组合：2 × 3 × 3 × 2 = **36 run**，每 run 90 s → **~1 h 纯跑时间 + 30 min 切 backend 重建**。
+
+产出：每组参数的 dispatch µs / combine µs / 有效 NVLink 带宽 GB/s / SM 占用。
+
+##### L2 — E2E SGLang（1.5 h）
+
+单节点 Qwen3-235B-A22B-FP8 TP=8 + EP=8（FP8 显存 240 GB 能单机放下，但注意 Day 1 发现的 `moe_intermediate_size=1536` TP=8 不兼容——见 memory `feedback_qwen3_235b_fp8_tp8_unsupported.md`；**本项改用 Qwen3-Next-80B-A3B** 作为实验模型，避免阻塞；Qwen3-Next top-k=8 / 128 E / hidden=4096，结构代表性一致）：
+
+| Run | Backend | Overlap | 产出 |
+|---|---|---|---|
+| S1-NCCL-noovlp | NCCL alltoall | off | baseline TTFT/TPOT/OTPS |
+| S1-UCCL-noovlp | UCCL-EP | off | **验证 "-10 ~ -15% ITL"** |
+| S1-UCCL-ovlp | UCCL-EP | on (SBO chunked overlap) | **验证 "-20 ~ -30% ITL"** |
+| S1-NCCL-prefill | NCCL alltoall | off（仅 prefill） | prefill throughput baseline |
+| S1-UCCL-prefill | UCCL-EP | off（仅 prefill）| **验证 "-5 ~ -10% prefill"** |
+
+每 run：sharegpt 256 请求，ISL 2048 / OSL 1024，concurrency 16。每 run ~8 min，共 5 × ~10 min = 50 min + 10 min 切 backend。
+
+##### L3 — 敏感性（30 min，时间够再做）
+
+把 L2 主工作点扫两个 knob，看 UCCL-EP 收益是否稳定：
+- concurrency：16 / 64 / 128（小 batch 时 kernel launch overhead 占比大，DeepEP 融合优势应更明显）
+- hidden：4096 → 7168（只在 Qwen3-Next 系没法切，此项用 Kimi-K2 active 32B 做——但 Kimi-K2 单机放不下 FP8 959 GB）；**L3 降级为只扫 concurrency**
+
+#### 5.8.4 正确性闸门（**轻量版**）
+
+单节点 alltoall 环境单一（不涉跨机 RDMA），错的概率低于 Lane E 主线；但"UCCL-EP 是否有 SM=8 开关下的 kernel 边界 bug" 值得一查：
+- 单模型 Qwen3-Next-80B-A3B，greedy decoding（temperature=0）
+- 200 条 sharegpt 样本（单节点轻量，不用 1000 条）
+- UCCL-EP vs NCCL alltoall token match rate ≥ 99.5%（单节点单一路径，阈值可略松于 Lane E 主线 99.9%）
+- 不过 → L2 的 UCCL-EP 数字标 ⚠️，只出 NCCL baseline
+
+#### 5.8.5 交付物
+
+- `results/stage5-p5en/lane-e/intranode/<stamp>/STEPS.md` —— 流水
+- `results/stage5-p5en/lane-e/intranode/<stamp>/RESULT.md` —— 两层结果表：
+  - L1 微观：`(hidden, tokens, experts, backend) → (dispatch µs, combine µs, NVLink GB/s, SM 占用)` × 36 行
+  - L2 E2E：S1-NCCL-noovlp / S1-UCCL-noovlp / S1-UCCL-ovlp / S1-NCCL-prefill / S1-UCCL-prefill × (TTFT p50/p99, TPOT p50/p99, OTPS)
+- `results/stage5-p5en/lane-e/intranode/<stamp>/PREDICTION_VS_ACTUAL.md` —— 3 条预估 vs 实测对照，落区间内 / 外各自写明归因
+- `results/stage5-p5en/lane-e/intranode/<stamp>/correctness.log` —— 200 条 token match rate
+- `scripts/stage5-lane-e-intranode.sh`（新增）—— 一键跑 L1 + L2 + 正确性
+- **汇入** `E_VS_NCCL.md`：新增 "单节点" 小节，与跨机数据并列；明确标注"单节点数据 Day 4 补测，样本 1 node，扩展趋势不外推"
+- **汇入** `E_DECISION_TREE.md`：决策树加"单节点部署 → 推荐 UCCL-EP" 或 "单节点部署 → NCCL 足够"的分支（由实测数据决定）
+
+#### 5.8.6 风险 + Fallback
+
+| 风险 | 概率 | 影响 | Fallback |
+|---|---|---|---|
+| Day 4 Ohio p5en SPS 不足（Day 4 故障恢复也要节点）| 中 | 本项延到 Day 6 白天 buffer | Day 6 R5 preflight 前的 8h 空窗可吸收 |
+| Qwen3-Next-80B-A3B SGLang 0.5.10 `--moe-a2a-backend uccl` 不支持（同 §12 客户对齐第 2 条的接入路径问题）| 低-中 | 只出 L1 microbench 数字 | `E_VS_NCCL.md` 单节点小节标"E2E pending integration"，只给 microbench Δ% |
+| L1 实测 UCCL-EP vs NCCL 延迟差 < 10%（即预估 1.5-2× 不成立）| 中 | 需重新推预估 | 在 `PREDICTION_VS_ACTUAL.md` 归因（NVLink 带宽太宽 / SM 争用模式不同），不撤结论 |
+| SBO overlap 在 SGLang 0.5.10 上未默认启用，需要 patch | 中 | L2 S1-UCCL-ovlp 这一 run 缺 | 标注 "overlap 需自定 patch，客户需 sgl-project/sglang PR #XXXX"，只给 noovlp 数字 |
+| UCCL-EP token match rate < 99.5% | 低 | 正确性闸门挂 | 同 §5.4 处理：上 issue；L2 不出 UCCL-EP 数字 |
+
+#### 5.8.7 与 Lane E 主线关系
+
+- 单节点数据 **独立于** 跨机数据（§5.3 / §5.5），不合并分析；`E_VS_NCCL.md` 分"单节点 (5.8)"和"跨机 (5.3/5.5)"两节
+- 若 Day 4 buffer 被 R4 / 故障恢复吃掉，**§5.8 可整体砍掉**（不进 SUMMARY.md 主报告，只留一句"单节点对比未做，留 follow-up"）
+- 预算：4 h GPU 时间（1 × p5en.48xlarge Spot，约 $6）+ 0 新镜像（沿用 v5-uccl）
+
 ---
 
 ## 6. 主路径基线（SGLang + Mooncake，PD 扫描）
@@ -649,11 +768,12 @@ Lane K 原方案只测性能差值，未测正确性 —— 但 KV 传输在 ren
 | 04:00 | **Lane K E2E**：K-E2（最差参数）+ K-E3 DeepSeek-V3.1 | Ohio p5en same-AZ |
 | 08:00 | **R2** DeepSeek-V3.1 reasoning on/off（Mooncake 基线） | Ohio p5en 或 **Oregon p6-b300** (192G HBM, SPS=9) 备选，B300 更宽裕 |
 
-### Day 4（2026-04-28）— R4 重试 + 故障恢复专项（**R4 从 Day 1 移到此处**）
+### Day 4（2026-04-28）— R4 重试 + §5.8 单节点 Lane E + 故障恢复专项（**R4 从 Day 1 移到此处**）
 | Time | Action |
 |---|---|
 | 00:00 | **R4 Qwen3-235B-A22B-FP8 重试**：先看 sglang 有没有 upstream fix（`fused_moe_triton` block-FP8 padding）；否则 park，跑 **R4' Qwen3-30B-A3B-FP8** 作替代（`moe_intermediate_size=768`，TP=8 → 96 也不整除，但 TP=2 可跑；或者直接跑 Qwen3-235B TP=4）|
 | 04:00 | Buffer / R1a-c 高并发补跑 |
+| **08:00** | **§5.8 单节点 UCCL-EP vs NCCL（新增）**：1 × p5en Ohio，L1 microbench 2h（36 组）+ L2 E2E SGLang Qwen3-Next-80B 1.5h（5 run）+ 正确性 30min，共 4h；产出 `results/stage5-p5en/lane-e/intranode/<stamp>/` |
 | **16:00** | **故障恢复专项 4 h**（kill pod / 断 EFA / OOM 各 ≥3 次复测）：NIXL 栈 2h + Mooncake 栈 2h，写 `LANE_K_FAILURE.md` |
 
 ### Day 5（2026-04-29）— Lane E microbench + 正确性
@@ -697,6 +817,8 @@ Lane K 原方案只测性能差值，未测正确性 —— 但 KV 传输在 ren
 | GLM-5.1 上游 HF 未发布 / SGLang 未接入 | 中 | R5 无模型 | 等模型到位再跑；临时用 GLM-4.6 BF16 作"形状等价"替代，标注 |
 | **PR #904 自测不过（B 段 > 1% 回归）**（§5.7 新增） | 低 | PR 要撤或修 | `git bisect` 定位，回退 helper 位置；不影响 Lane E 主线 |
 | **PR #904 Day 5-6 SPS 不足无法 AWS 验证**（§5.7 新增） | 中 | PR 只能附 build log | 不阻塞 Stage 5；AWS 数据做 follow-up comment，不影响 Lane E 主交付 |
+| **§5.8 单节点 Day 4 08-12 时段被 R4 / 故障恢复挤占** | 中 | 本项延 Day 6 或砍掉 | Day 6 08:00-20:00 有 8h 空窗（R5 preflight 前）吸收；或整项砍，只在 SUMMARY 标 follow-up |
+| **§5.8 L1 实测与预估偏差 > 2×（即 UCCL-EP 单节点无明显收益）** | 中 | 预估模型失效 | `PREDICTION_VS_ACTUAL.md` 归因（NVLink 比 H800 宽 / SM 争用不同），不改结论；客户看到真实曲线，对决策反而更有价值 |
 
 ### 10.1 R5 Go/No-Go Pre-flight（**2026-04-25 新增**）
 
@@ -734,6 +856,7 @@ Lane K 原方案只测性能差值，未测正确性 —— 但 KV 传输在 ren
 - `results/stage5-p5en/lane-e/CORRECTNESS.md` —— 正确性闸门
 - `results/stage5-p5en/lane-e/IB_REFERENCE.md` —— DeepEP IB 参考数字（标注不对齐）
 - `results/stage5-p5en/lane-e/pr904-verify/<stamp>/` —— **2026-04-25 新增**：PR #904 AWS p5en benchmark 验证产出（STEPS.md / RESULT.md / env.txt / stderr_abc.log），直接贴到 upstream PR comment
+- `results/stage5-p5en/lane-e/intranode/<stamp>/` —— **2026-04-27 新增 §5.8**：单节点 UCCL-EP vs NCCL 对比（STEPS.md / RESULT.md / PREDICTION_VS_ACTUAL.md / correctness.log），L1 microbench 36 组 + L2 E2E 5 run，汇入 `E_VS_NCCL.md` 单节点小节
 - `results/stage5-p5en/PD_RATIO_CURVE.md` —— Kimi-K2 1P:ND 曲线
 - `results/stage5-p5en/R5_GLM51_FP16.md` —— **GLM-5.1 FP16 收尾画像**（4 node TP=16 1P:1D，最终工作点 TTFT/TPOT/OTPS + HBM/EFA 压力曲线）
 - `results/stage5-p5en/RECOMMENDATIONS.md` —— 给客户的一页调优总表（SGLang flag / NIXL / UCCL-EP 的最佳参数 + EFA env + PD 比例），**只给技术建议，不做引 / 不引判断**
