@@ -1,0 +1,375 @@
+# =============================================================================
+# Customer 1P:1D perf comparison — Qwen3-Next-80B-A3B-Instruct BF16
+# Two variants (uccl vs nccl) share this same manifest; flip via VARIANT env.
+#
+# Topology:
+#   Prefill pod  — 1x p5.48xlarge  (H100 x 8, TP=8), same AZ as decode
+#   Decode pod   — 1x p5.48xlarge  (H100 x 8, TP=8), same AZ as prefill
+#   Router pod   — CPU-only, bridges bench traffic to prefill+decode
+#   KV transport — Mooncake over EFA (identical path across variants)
+#   MoE alltoall — single-node NVLink (doesn't cross nodes in 1P:1D)
+#     * uccl variant: --moe-a2a-backend deepep (routes via deep_ep → UCCL-EP)
+#     * nccl variant: --moe-a2a-backend none   (SGLang default, NCCL fake-a2a)
+#
+# Weight loading — S3 → node-local NVMe via initContainer (s5cmd, ~152 GB):
+#   initContainer runs on same node as the server container; it's idempotent
+#   (checks sentinel .s3-prefetch-done on /mnt/nvme before downloading).
+#   Server container reads from /models/<model> which maps to /mnt/nvme/models/<model>.
+#
+# Apply sequence:
+#   1. export VARIANT=uccl    (or nccl)
+#   2. envsubst < manifest | kubectl apply -f -
+#   3. Wait for /health on router
+#   4. Run bench_serving.py against router
+#   5. kubectl delete, flip VARIANT, repeat
+#
+# Node prereqs (both nodes):
+#   - p5.48xlarge with /mnt/nvme mounted (EKS managed NG does this via userdata)
+#   - EFA 32 NICs visible
+#   - IAM role lets s5cmd read s3://yanxi-validation-788668107894-ohio/models/
+# =============================================================================
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: customer-1p1d-launcher
+  namespace: yanxi-validation
+data:
+  prefetch.sh: |
+    #!/usr/bin/env bash
+    set -eux
+    MODEL_ID="${MODEL_ID:?need MODEL_ID}"         # e.g. Qwen/Qwen3-Next-80B-A3B-Instruct
+    S3_BUCKET="${S3_BUCKET:?need S3_BUCKET}"      # yanxi-validation-788668107894-ohio
+    DST=/host-nvme/models/${MODEL_ID}
+    SENTINEL="$DST/.s3-prefetch-done"
+
+    if [ -f "$SENTINEL" ]; then
+      echo "[prefetch] sentinel exists, skip: $DST"
+      du -sh "$DST" 2>/dev/null || true
+      exit 0
+    fi
+
+    # Install s5cmd (amazonlinux 2023 has amazon-ssm-agent; s5cmd is separate)
+    command -v s5cmd >/dev/null 2>&1 || {
+      echo "[prefetch] installing s5cmd"
+      curl -sL https://github.com/peak/s5cmd/releases/download/v2.2.2/s5cmd_2.2.2_Linux-64bit.tar.gz \
+        | tar -xz -C /usr/local/bin s5cmd
+    }
+
+    mkdir -p "$DST"
+    echo "[prefetch] s5cmd cp s3://${S3_BUCKET}/models/${MODEL_ID}/ -> ${DST}"
+    time s5cmd cp --concurrency 64 \
+      "s3://${S3_BUCKET}/models/${MODEL_ID}/*" "${DST}/"
+    touch "$SENTINEL"
+    echo "[prefetch] done"
+    du -sh "$DST"
+
+  sglang-launcher.sh: |
+    #!/usr/bin/env bash
+    set -eu
+    ROLE="${ROLE:?need ROLE=prefill|decode|lb}"
+    MODEL_PATH="${MODEL_PATH:?need MODEL_PATH}"
+    TP="${TP:-8}"
+    PORT="${PORT:-30000}"
+    BOOTSTRAP_PORT="${BOOTSTRAP_PORT:-8998}"
+    CTX_LEN="${CONTEXT_LEN:-131072}"
+    MEM_FRAC="${MEM_FRAC_STATIC:-0.85}"
+    CHUNKED="${CHUNKED_PREFILL:-4096}"
+    KV_BACKEND="${KV_TRANSPORT_BACKEND:-mooncake}"
+    MOE_A2A="${MOE_A2A_BACKEND:-none}"
+
+    # torch/lib on LD_LIBRARY_PATH for libc10.so resolution
+    TORCH_LIB=$(python3 -c 'import torch, os; print(os.path.join(os.path.dirname(torch.__file__), "lib"))')
+    export LD_LIBRARY_PATH="${TORCH_LIB}:${LD_LIBRARY_PATH:-}"
+    export FI_PROVIDER="${FI_PROVIDER:-efa}"
+    export FI_EFA_USE_DEVICE_RDMA=1
+    export FI_EFA_FORK_SAFE=1
+
+    IB_DEVICE="${IB_DEVICE:-}"
+    if [ -z "${IB_DEVICE}" ] && command -v fi_info >/dev/null 2>&1; then
+      IB_DEVICE=$(fi_info -p efa 2>/dev/null | awk '/domain:/ {print $2}' | sed 's/-rdm$//;s/-dgrm$//' | sort -u | paste -sd, -)
+    fi
+    [ -n "${IB_DEVICE}" ] && echo "[launcher] IB_DEVICE=${IB_DEVICE}"
+
+    # SGLang 0.5.10 hardcodes mooncake protocol="rdma"; flip to "efa" for EFA path.
+    # Image .3+ has "efa" baked in; image .2- still has "rdma" and needs runtime sed.
+    MC_PY=/usr/local/lib/python3.10/dist-packages/sglang/srt/distributed/device_communicators/mooncake_transfer_engine.py
+    if grep -q '"efa",' "${MC_PY}" 2>/dev/null; then
+      echo "[launcher] mooncake_transfer_engine.py: efa protocol already baked in (image .3+)"
+    elif grep -q '"rdma",' "${MC_PY}" 2>/dev/null; then
+      echo "[launcher] legacy image — patching mooncake_transfer_engine.py: rdma -> efa"
+      sed -i 's/"rdma",$/"efa",/' "${MC_PY}"
+      rm -f /usr/local/lib/python3.10/dist-packages/sglang/srt/distributed/device_communicators/__pycache__/mooncake_transfer_engine.cpython-310.pyc 2>/dev/null || true
+    else
+      echo "[launcher] WARN: mooncake_transfer_engine.py missing expected protocol token — image audit needed"
+    fi
+
+    COMMON_ARGS=(
+      --model-path "${MODEL_PATH}"
+      --tp "${TP}"
+      --host 0.0.0.0 --port "${PORT}"
+      --trust-remote-code
+      --context-length "${CTX_LEN}"
+      --mem-fraction-static "${MEM_FRAC}"
+      --chunked-prefill-size "${CHUNKED}"
+      --attention-backend fa3
+      --moe-a2a-backend "${MOE_A2A}"
+      --skip-server-warmup
+    )
+
+    case "${ROLE}" in
+      prefill|decode)
+        DISAGG_EXTRA=()
+        [ -n "${IB_DEVICE}" ] && DISAGG_EXTRA+=(--disaggregation-ib-device "${IB_DEVICE}")
+        exec python3 -m sglang.launch_server \
+          "${COMMON_ARGS[@]}" \
+          --disaggregation-mode "${ROLE}" \
+          --disaggregation-transfer-backend "${KV_BACKEND}" \
+          --disaggregation-bootstrap-port "${BOOTSTRAP_PORT}" \
+          "${DISAGG_EXTRA[@]}"
+        ;;
+      lb)
+        : "${PREFILL_URL:?need PREFILL_URL}"
+        : "${DECODE_URL:?need DECODE_URL}"
+        LB_PORT="${LB_PORT:-8000}"
+        if ! python3 -c "import sglang_router" 2>/dev/null; then
+          pip install --no-cache-dir "sglang-router==0.3.2" || exit 3
+        fi
+        PREFILL_ARGS=()
+        for u in ${PREFILL_URL//,/ }; do PREFILL_ARGS+=(--prefill "${u}"); done
+        DECODE_ARGS=()
+        for u in ${DECODE_URL//,/ }; do DECODE_ARGS+=(--decode "${u}"); done
+        exec python3 -m sglang_router.launch_router \
+          --pd-disaggregation \
+          "${PREFILL_ARGS[@]}" "${DECODE_ARGS[@]}" \
+          --host 0.0.0.0 --port "${LB_PORT}"
+        ;;
+      *) echo "unknown ROLE=${ROLE}"; exit 2 ;;
+    esac
+
+---
+# ==== Services ====
+apiVersion: v1
+kind: Service
+metadata: { name: c1p1d-prefill, namespace: yanxi-validation }
+spec:
+  selector: { app: c1p1d, role: prefill }
+  ports:
+    - { name: http, port: 30000, targetPort: 30000 }
+    - { name: bootstrap, port: 8998, targetPort: 8998 }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: c1p1d-decode, namespace: yanxi-validation }
+spec:
+  selector: { app: c1p1d, role: decode }
+  ports:
+    - { name: http, port: 30000, targetPort: 30000 }
+    - { name: bootstrap, port: 8998, targetPort: 8998 }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: c1p1d-lb, namespace: yanxi-validation }
+spec:
+  selector: { app: c1p1d-lb }
+  ports:
+    - { name: http, port: 8000, targetPort: 8000 }
+
+---
+# ==== Prefill pod ====
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: c1p1d-prefill
+  namespace: yanxi-validation
+  labels: { app: c1p1d, role: prefill }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: c1p1d, role: prefill } }
+  template:
+    metadata:
+      labels: { app: c1p1d, role: prefill }
+    spec:
+      tolerations:
+        - { key: nvidia.com/gpu, operator: Equal, value: "true", effect: NoSchedule }
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - { key: node.kubernetes.io/instance-type, operator: In, values: [p5.48xlarge, p5en.48xlarge] }
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector: { matchLabels: { app: c1p1d } }
+              topologyKey: kubernetes.io/hostname
+      initContainers:
+        - name: s3-prefetch
+          image: public.ecr.aws/amazonlinux/amazonlinux:2023
+          command: ["/bin/bash","-lc","dnf install -y -q curl tar gzip; exec /scripts/prefetch.sh"]
+          env:
+            - { name: MODEL_ID, value: "Qwen/Qwen3-Next-80B-A3B-Instruct" }
+            - { name: S3_BUCKET, value: "yanxi-validation-788668107894-ohio" }
+          volumeMounts:
+            - { name: local-nvme, mountPath: /host-nvme }
+            - { name: scripts, mountPath: /scripts }
+          resources:
+            requests: { cpu: "4", memory: "8Gi" }
+            limits:   { cpu: "16", memory: "32Gi" }
+      containers:
+        - name: server
+          image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake-uccl:2026.04.28-h200
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: ROLE, value: "prefill" }
+            - { name: MODEL_PATH, value: "/models/Qwen/Qwen3-Next-80B-A3B-Instruct" }
+            - { name: TP, value: "8" }
+            - { name: CONTEXT_LEN, value: "32768" }
+            - { name: MEM_FRAC_STATIC, value: "0.85" }
+            - { name: CHUNKED_PREFILL, value: "4096" }
+            - { name: KV_TRANSPORT_BACKEND, value: "mooncake" }
+            - { name: MOE_A2A_BACKEND, value: "$(MOE_A2A_BACKEND)" }   # filled via envsubst
+          command: ["/bin/bash", "-lc"]
+          args: ["exec /scripts/sglang-launcher.sh"]
+          readinessProbe:
+            httpGet: { path: /get_model_info, port: 30000 }
+            initialDelaySeconds: 180
+            periodSeconds: 10
+            failureThreshold: 120
+          ports:
+            - { containerPort: 30000, name: http }
+            - { containerPort: 8998, name: bootstrap }
+          securityContext: { capabilities: { add: [IPC_LOCK] } }
+          resources:
+            limits:   { nvidia.com/gpu: 8, vpc.amazonaws.com/efa: 16, hugepages-2Mi: 5120Mi, memory: 500Gi }
+            requests: { nvidia.com/gpu: 8, vpc.amazonaws.com/efa: 16, hugepages-2Mi: 5120Mi, memory: 500Gi }
+          volumeMounts:
+            - { name: local-nvme, mountPath: /models, subPath: models }
+            - { name: shm, mountPath: /dev/shm }
+            - { name: scripts, mountPath: /scripts }
+      volumes:
+        - name: local-nvme
+          hostPath: { path: /mnt/nvme, type: Directory }
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 64Gi }
+        - name: scripts
+          configMap: { name: customer-1p1d-launcher, defaultMode: 0755 }
+
+---
+# ==== Decode pod ====
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: c1p1d-decode
+  namespace: yanxi-validation
+  labels: { app: c1p1d, role: decode }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: c1p1d, role: decode } }
+  template:
+    metadata:
+      labels: { app: c1p1d, role: decode }
+    spec:
+      tolerations:
+        - { key: nvidia.com/gpu, operator: Equal, value: "true", effect: NoSchedule }
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - { key: node.kubernetes.io/instance-type, operator: In, values: [p5.48xlarge, p5en.48xlarge] }
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector: { matchLabels: { app: c1p1d } }
+              topologyKey: kubernetes.io/hostname
+      initContainers:
+        - name: s3-prefetch
+          image: public.ecr.aws/amazonlinux/amazonlinux:2023
+          command: ["/bin/bash","-lc","dnf install -y -q curl tar gzip; exec /scripts/prefetch.sh"]
+          env:
+            - { name: MODEL_ID, value: "Qwen/Qwen3-Next-80B-A3B-Instruct" }
+            - { name: S3_BUCKET, value: "yanxi-validation-788668107894-ohio" }
+          volumeMounts:
+            - { name: local-nvme, mountPath: /host-nvme }
+            - { name: scripts, mountPath: /scripts }
+          resources:
+            requests: { cpu: "4", memory: "8Gi" }
+            limits:   { cpu: "16", memory: "32Gi" }
+      containers:
+        - name: server
+          image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake-uccl:2026.04.28-h200
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: ROLE, value: "decode" }
+            - { name: MODEL_PATH, value: "/models/Qwen/Qwen3-Next-80B-A3B-Instruct" }
+            - { name: TP, value: "8" }
+            - { name: CONTEXT_LEN, value: "32768" }
+            - { name: MEM_FRAC_STATIC, value: "0.85" }
+            - { name: CHUNKED_PREFILL, value: "4096" }
+            - { name: KV_TRANSPORT_BACKEND, value: "mooncake" }
+            - { name: MOE_A2A_BACKEND, value: "$(MOE_A2A_BACKEND)" }
+          command: ["/bin/bash", "-lc"]
+          args: ["exec /scripts/sglang-launcher.sh"]
+          readinessProbe:
+            httpGet: { path: /get_model_info, port: 30000 }
+            initialDelaySeconds: 180
+            periodSeconds: 10
+            failureThreshold: 120
+          ports:
+            - { containerPort: 30000, name: http }
+            - { containerPort: 8998, name: bootstrap }
+          securityContext: { capabilities: { add: [IPC_LOCK] } }
+          resources:
+            limits:   { nvidia.com/gpu: 8, vpc.amazonaws.com/efa: 16, hugepages-2Mi: 5120Mi, memory: 500Gi }
+            requests: { nvidia.com/gpu: 8, vpc.amazonaws.com/efa: 16, hugepages-2Mi: 5120Mi, memory: 500Gi }
+          volumeMounts:
+            - { name: local-nvme, mountPath: /models, subPath: models }
+            - { name: shm, mountPath: /dev/shm }
+            - { name: scripts, mountPath: /scripts }
+      volumes:
+        - name: local-nvme
+          hostPath: { path: /mnt/nvme, type: Directory }
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 64Gi }
+        - name: scripts
+          configMap: { name: customer-1p1d-launcher, defaultMode: 0755 }
+
+---
+# ==== Router (load balancer) ====
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: c1p1d-lb
+  namespace: yanxi-validation
+  labels: { app: c1p1d-lb }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: c1p1d-lb } }
+  template:
+    metadata:
+      labels: { app: c1p1d-lb }
+    spec:
+      tolerations:
+        - { key: nvidia.com/gpu, operator: Equal, value: "true", effect: NoSchedule }
+      containers:
+        - name: lb
+          image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake-uccl:2026.04.28-h200
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: ROLE, value: "lb" }
+            - { name: PREFILL_URL, value: "http://c1p1d-prefill.yanxi-validation.svc:30000" }
+            - { name: DECODE_URL,  value: "http://c1p1d-decode.yanxi-validation.svc:30000" }
+          command: ["/bin/bash", "-lc"]
+          args: ["exec /scripts/sglang-launcher.sh"]
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 30
+          ports:
+            - { containerPort: 8000, name: http }
+          volumeMounts:
+            - { name: scripts, mountPath: /scripts }
+      volumes:
+        - name: scripts
+          configMap: { name: customer-1p1d-launcher, defaultMode: 0755 }

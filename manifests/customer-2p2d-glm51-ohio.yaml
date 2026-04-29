@@ -1,0 +1,582 @@
+# =============================================================================
+# Customer GLM-5.1-FP8 2P:2D reproduction — Ohio p5en.48xlarge × 4 nodes
+#
+# Purpose: reproduce customer-reported "minute-level response" latency on a
+# simple chat prompt against customer_glm_5.1/*.yml compose config, then
+# bisect which of the following is the actual dominant cost:
+#   (A) debug HTTP logging + log-requests-level=3 (stdout lock under concurrency)
+#   (B) --ep-dispatch-algorithm dynamic (host-side expert remap per step)
+#   (C) --deepep-mode normal (prefill per-batch CPU handshake across nodes)
+#   (D) cuda-graph × UCCL-EP low_latency proxy offset update risk (graph may
+#       silent-disable or miscompute)
+#   (E) EAGLE/MTP accept_length < 1.5 (EAGLE drafts wasted)
+#
+# Topology (matches customer compose files):
+#   Prefill StatefulSet — 2 pods × p5en, PP=2 TP=8 EP=8 (DeepEP normal)
+#   Decode  StatefulSet — 2 pods × p5en, TP=16 EP=16 DP=16 DP-Attn (DeepEP low_latency)
+#   Router pod          — CPU-only, sglang-router mini-lb
+#   KV transport        — Mooncake over EFA
+#   Model               — zai-org/GLM-5.1-FP8 (704 GiB, 142 safetensors + MTP)
+#   Image               — public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.04.28-h200.2
+#
+# All 4 nodes must be same AZ (see feedback_same_az_all_tests memory).
+# EFA device names resolved dynamically via fi_info (p5en has 16 rdmap*s0).
+#
+# Known GLM-5 compat notes:
+#   - GlmMoeDsaForCausalLM inherits DeepseekV2ForCausalLM (glm4_moe.py:1472)
+#   - attention-backend NSA is auto-selected for DSA architecture
+#   - num_nextn_predict_layers=1 → MTP head is built into weights (layer 78)
+#   - EAGLE algo + no draft-path auto-enables MTP (server_args.py:3418-3420)
+#   - EAGLE (num_steps=3, topk=1, draft_tokens=4) are GLM defaults (server_args.py:7308)
+#   - customer spec PP=2 + CP breaks sglang 0.5.10 assert (server_args.py:2839);
+#     we only use PP=2 on prefill (no CP), matching customer compose prefill-*.yml
+# =============================================================================
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: glm51-launcher
+  namespace: yanxi-validation
+data:
+  prefetch.sh: |
+    #!/usr/bin/env bash
+    set -eux
+    MODEL_ID="${MODEL_ID:?need MODEL_ID}"
+    S3_BUCKET="${S3_BUCKET:?need S3_BUCKET}"
+    DST=/host-nvme/models/${MODEL_ID}
+    SENTINEL="$DST/.s3-prefetch-done"
+
+    if [ -f "$SENTINEL" ]; then
+      echo "[prefetch] sentinel exists, skip: $DST"
+      du -sh "$DST" 2>/dev/null || true
+      exit 0
+    fi
+
+    command -v s5cmd >/dev/null 2>&1 || {
+      echo "[prefetch] installing s5cmd"
+      curl -sL https://github.com/peak/s5cmd/releases/download/v2.2.2/s5cmd_2.2.2_Linux-64bit.tar.gz \
+        | tar -xz -C /usr/local/bin s5cmd
+    }
+
+    mkdir -p "$DST"
+    echo "[prefetch] s5cmd cp s3://${S3_BUCKET}/models/${MODEL_ID}/ -> ${DST}"
+    time s5cmd cp --concurrency 64 \
+      "s3://${S3_BUCKET}/models/${MODEL_ID}/*" "${DST}/"
+    touch "$SENTINEL"
+    echo "[prefetch] done"
+    du -sh "$DST"
+
+  sglang-launcher.sh: |
+    #!/usr/bin/env bash
+    set -eu
+    ROLE="${ROLE:?need ROLE=prefill|decode|lb}"
+
+    TORCH_LIB=$(python3 -c 'import torch, os; print(os.path.join(os.path.dirname(torch.__file__), "lib"))' 2>/dev/null || echo "")
+    [ -n "${TORCH_LIB}" ] && export LD_LIBRARY_PATH="${TORCH_LIB}:${LD_LIBRARY_PATH:-}"
+    export FI_PROVIDER="${FI_PROVIDER:-efa}"
+    export FI_EFA_USE_DEVICE_RDMA=1
+    export FI_EFA_FORK_SAFE=1
+
+    case "${ROLE}" in
+      prefill|decode)
+        # Runtime hotfix: ninja-build (h200.2 added apt ninja-build but preserve
+        # safety net for subsequent image versions missing it).
+        if ! command -v ninja >/dev/null 2>&1 || ! [ -x /usr/bin/ninja ]; then
+          DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>&1 | tail -2 || true
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ninja-build 2>&1 | tail -2 || true
+        fi
+
+        MODEL_PATH="${MODEL_PATH:?need MODEL_PATH}"
+        TP="${TP:-16}"                        # sglang total tp across nnodes
+        PP_SIZE="${PP_SIZE:-1}"
+        DP_SIZE="${DP_SIZE:-1}"
+        NNODES="${NNODES:-1}"
+        DIST_INIT_SVC="${DIST_INIT_SVC:-}"
+        DIST_INIT_PORT="${DIST_INIT_PORT:-10010}"
+        PORT="${PORT:-30000}"
+        BOOTSTRAP_PORT="${BOOTSTRAP_PORT:-8998}"
+        CTX_LEN="${CONTEXT_LEN:-202752}"
+        MEM_FRAC="${MEM_FRAC_STATIC:-0.74}"
+        CHUNKED="${CHUNKED_PREFILL:-16384}"
+        KV_BACKEND="${KV_TRANSPORT_BACKEND:-mooncake}"
+        MOE_A2A="${MOE_A2A_BACKEND:-deepep}"
+        DEEPEP_MODE="${DEEPEP_MODE:-low_latency}"
+        WATCHDOG_TIMEOUT="${WATCHDOG_TIMEOUT:-1800}"
+        MAX_RUNNING="${MAX_RUNNING_REQUESTS:-256}"
+        CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS:-16}"
+
+        # Knobs toggleable per-variant for bisection:
+        ENABLE_DP_ATTENTION="${ENABLE_DP_ATTENTION:-0}"
+        ENABLE_SPECULATIVE="${ENABLE_SPECULATIVE:-0}"     # EAGLE/MTP
+        ENABLE_DEBUG_LOG="${ENABLE_DEBUG_LOG:-0}"         # --log-level-http debug + --log-requests-level 3
+        ENABLE_EPLB_DYNAMIC="${ENABLE_EPLB_DYNAMIC:-0}"   # --ep-dispatch-algorithm dynamic
+        ENABLE_DP_LM_HEAD="${ENABLE_DP_LM_HEAD:-0}"
+        ENABLE_NSA_CP="${ENABLE_NSA_CP:-0}"               # prefill context parallel
+        DISABLE_SHARED_EXPERTS_FUSION="${DISABLE_SHARED_EXPERTS_FUSION:-0}"
+
+        # Multi-node dist-init (POD_NAME-0 is leader)
+        DIST_INIT_ADDR="${DIST_INIT_ADDR:-}"
+        if [ "${NNODES}" -gt 1 ] && [ -z "${DIST_INIT_ADDR}" ] && [ -n "${DIST_INIT_SVC}" ] && [ -n "${POD_NAME:-}" ]; then
+          SS_PREFIX="${POD_NAME%-*}"
+          DIST_INIT_ADDR="${SS_PREFIX}-0.${DIST_INIT_SVC}.${POD_NAMESPACE:-yanxi-validation}.svc:${DIST_INIT_PORT}"
+          echo "[launcher] DIST_INIT_ADDR=${DIST_INIT_ADDR}"
+        fi
+        NODE_RANK="${NODE_RANK:-0}"
+        if [ "${NNODES}" -gt 1 ] && [ -n "${POD_NAME:-}" ]; then
+          NODE_RANK="${POD_NAME##*-}"
+          echo "[launcher] NODE_RANK=${NODE_RANK}"
+        fi
+
+        # EFA device enumeration (p5en has 16 rdmap*s0)
+        IB_DEVICE="${IB_DEVICE:-}"
+        if [ -z "${IB_DEVICE}" ] && command -v fi_info >/dev/null 2>&1; then
+          IB_DEVICE=$(fi_info -p efa 2>/dev/null | awk '/domain:/ {print $2}' | sed 's/-rdm$//;s/-dgrm$//' | sort -u | paste -sd, -)
+        fi
+        [ -n "${IB_DEVICE}" ] && echo "[launcher] IB_DEVICE=${IB_DEVICE}"
+
+        # Image .3+ has "efa" baked in; image .2- still has "rdma" and needs runtime sed.
+        MC_PY=/usr/local/lib/python3.10/dist-packages/sglang/srt/distributed/device_communicators/mooncake_transfer_engine.py
+        if grep -q '"efa",' "${MC_PY}" 2>/dev/null; then
+          echo "[launcher] mooncake_transfer_engine.py: efa protocol already baked in (image .3+)"
+        elif grep -q '"rdma",' "${MC_PY}" 2>/dev/null; then
+          echo "[launcher] legacy image — patching mooncake_transfer_engine.py: rdma -> efa"
+          sed -i 's/"rdma",$/"efa",/' "${MC_PY}"
+          rm -f /usr/local/lib/python3.10/dist-packages/sglang/srt/distributed/device_communicators/__pycache__/mooncake_transfer_engine.cpython-310.pyc 2>/dev/null || true
+        else
+          echo "[launcher] WARN: mooncake_transfer_engine.py missing expected protocol token — image audit needed"
+        fi
+
+        # Base args
+        ARGS=(
+          --model-path "${MODEL_PATH}"
+          --served-model-name glm-5-fp8-long-pd
+          --trust-remote-code
+          --host 0.0.0.0 --port "${PORT}"
+          --tp-size "${TP}"
+          --context-length "${CTX_LEN}"
+          --mem-fraction-static "${MEM_FRAC}"
+          --attention-backend nsa
+          --page-size 64
+          --max-running-requests "${MAX_RUNNING}"
+          --moe-a2a-backend "${MOE_A2A}"
+          --deepep-mode "${DEEPEP_MODE}"
+          --watchdog-timeout "${WATCHDOG_TIMEOUT}"
+          --tool-call-parser glm47
+          --reasoning-parser glm45
+          --tokenizer-worker-num 8
+          --enable-dynamic-batch-tokenizer
+          --dynamic-batch-tokenizer-batch-size 8
+          --moe-dense-tp-size 1
+          --crash-dump-folder /sglang/logs
+        )
+        # PP (prefill) / DP (decode)
+        [ "${PP_SIZE}" -gt 1 ] && ARGS+=(--pp-size "${PP_SIZE}")
+        [ "${DP_SIZE}" -gt 1 ] && ARGS+=(--dp-size "${DP_SIZE}")
+        # Role-specific flags
+        if [ "${ROLE}" = "prefill" ]; then
+          ARGS+=(--chunked-prefill-size "${CHUNKED}")
+          [ "${ENABLE_NSA_CP}" = "1" ] && ARGS+=(--enable-nsa-prefill-context-parallel --nsa-prefill-cp-mode round-robin-split)
+        else
+          ARGS+=(--cuda-graph-max-bs "${CUDA_GRAPH_MAX_BS}")
+          ARGS+=(--decode-log-interval 50)
+          ARGS+=(--prefill-round-robin-balance)
+        fi
+        # Toggleable knobs for bisection
+        [ "${ENABLE_DP_ATTENTION}" = "1" ] && ARGS+=(--enable-dp-attention)
+        [ "${ENABLE_DP_LM_HEAD}" = "1" ] && ARGS+=(--enable-dp-lm-head)
+        [ "${DISABLE_SHARED_EXPERTS_FUSION}" = "1" ] && ARGS+=(--disable-shared-experts-fusion)
+        if [ "${ENABLE_EPLB_DYNAMIC}" = "1" ]; then
+          ARGS+=(--ep-dispatch-algorithm dynamic --eplb-algorithm deepseek)
+        fi
+        if [ "${ENABLE_SPECULATIVE}" = "1" ]; then
+          ARGS+=(--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4)
+        fi
+        if [ "${ENABLE_DEBUG_LOG}" = "1" ]; then
+          ARGS+=(--log-level-http debug --log-requests-level 3 --collect-tokens-histogram --show-time-cost)
+        fi
+        # Multi-node
+        if [ "${NNODES}" -gt 1 ]; then
+          : "${DIST_INIT_ADDR:?need DIST_INIT_ADDR when NNODES>1}"
+          ARGS+=(--nnodes "${NNODES}" --node-rank "${NODE_RANK}" --dist-init-addr "${DIST_INIT_ADDR}")
+        fi
+        # Disagg
+        ARGS+=(
+          --disaggregation-mode "${ROLE}"
+          --disaggregation-transfer-backend "${KV_BACKEND}"
+          --disaggregation-bootstrap-port "${BOOTSTRAP_PORT}"
+        )
+        [ -n "${IB_DEVICE}" ] && ARGS+=(--disaggregation-ib-device "${IB_DEVICE}")
+
+        mkdir -p /sglang/logs /sglang/deep_gemm /sglang/torch-compile
+        export SGLANG_ENABLE_JIT_DEEPGEMM=1
+        export SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS=32
+        export SGLANG_DG_CACHE_DIR=/sglang/deep_gemm
+        export SGLANG_SET_CPU_AFFINITY=1
+        export SGLANG_MOE_PADDING=1
+        export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
+        export SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD=16384
+        export SGLANG_HEALTH_CHECK_MEM_FREE=50
+        export SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL=10
+        export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=300
+        export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=300
+        export PYTHONUNBUFFERED=1
+        export OMP_NUM_THREADS=16
+
+        echo "[launcher] exec sglang: ${ARGS[*]}"
+        exec python3 -m sglang.launch_server "${ARGS[@]}"
+        ;;
+      lb)
+        : "${PREFILL_URL:?need PREFILL_URL}"
+        : "${DECODE_URL:?need DECODE_URL}"
+        LB_PORT="${LB_PORT:-8000}"
+        if ! python3 -c "import sglang_router" 2>/dev/null; then
+          pip install --no-cache-dir "sglang-router==0.3.2" || exit 3
+        fi
+        PREFILL_ARGS=()
+        for u in ${PREFILL_URL//,/ }; do PREFILL_ARGS+=(--prefill "${u}"); done
+        DECODE_ARGS=()
+        for u in ${DECODE_URL//,/ }; do DECODE_ARGS+=(--decode "${u}"); done
+        exec python3 -m sglang_router.launch_router \
+          --pd-disaggregation \
+          --mini-lb \
+          --disable-health-check \
+          "${PREFILL_ARGS[@]}" "${DECODE_ARGS[@]}" \
+          --host 0.0.0.0 --port "${LB_PORT}"
+        ;;
+      *) echo "unknown ROLE=${ROLE}"; exit 2 ;;
+    esac
+
+---
+# ==== Services ====
+apiVersion: v1
+kind: Service
+metadata: { name: glm51-prefill, namespace: yanxi-validation }
+spec:
+  # Leader-only: prefill-0 is the one that talks HTTP to the router.
+  selector:
+    app: glm51
+    role: prefill
+    statefulset.kubernetes.io/pod-name: glm51-prefill-0
+  ports:
+    - { name: http, port: 30000, targetPort: 30000 }
+    - { name: bootstrap, port: 8998, targetPort: 8998 }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: glm51-prefill-headless, namespace: yanxi-validation }
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: { app: glm51, role: prefill }
+  ports:
+    - { name: distinit, port: 10010, targetPort: 10010 }
+    - { name: http, port: 30000, targetPort: 30000 }
+    - { name: bootstrap, port: 8998, targetPort: 8998 }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: glm51-decode, namespace: yanxi-validation }
+spec:
+  selector:
+    app: glm51
+    role: decode
+    statefulset.kubernetes.io/pod-name: glm51-decode-0
+  ports:
+    - { name: http, port: 30000, targetPort: 30000 }
+    - { name: bootstrap, port: 8998, targetPort: 8998 }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: glm51-decode-headless, namespace: yanxi-validation }
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: { app: glm51, role: decode }
+  ports:
+    - { name: distinit, port: 10010, targetPort: 10010 }
+    - { name: http, port: 30000, targetPort: 30000 }
+    - { name: bootstrap, port: 8998, targetPort: 8998 }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: glm51-lb, namespace: yanxi-validation }
+spec:
+  selector: { app: glm51-lb }
+  ports:
+    - { name: http, port: 8000, targetPort: 8000 }
+
+---
+# ==== Prefill StatefulSet — 2 pods (PP=2, TP=8, EP=8, DeepEP normal) ====
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: glm51-prefill
+  namespace: yanxi-validation
+  labels: { app: glm51, role: prefill }
+spec:
+  serviceName: glm51-prefill-headless
+  replicas: 2
+  podManagementPolicy: Parallel
+  selector: { matchLabels: { app: glm51, role: prefill } }
+  template:
+    metadata:
+      labels: { app: glm51, role: prefill }
+    spec:
+      tolerations:
+        - { key: nvidia.com/gpu, operator: Equal, value: "true", effect: NoSchedule }
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - { key: node.kubernetes.io/instance-type, operator: In, values: [p5en.48xlarge] }
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector: { matchLabels: { app: glm51 } }
+              topologyKey: kubernetes.io/hostname
+      initContainers:
+        - name: s3-prefetch
+          image: public.ecr.aws/amazonlinux/amazonlinux:2023
+          command: ["/bin/bash","-lc","dnf install -y -q tar gzip; command -v curl && command -v tar && command -v gzip; exec /scripts/prefetch.sh"]
+          env:
+            - { name: MODEL_ID, value: "zai-org/GLM-5.1-FP8" }
+            - { name: S3_BUCKET, value: "yanxi-validation-788668107894-ohio" }
+          volumeMounts:
+            - { name: local-nvme, mountPath: /host-nvme }
+            - { name: scripts, mountPath: /scripts }
+          resources:
+            requests: { cpu: "4", memory: "8Gi" }
+            limits:   { cpu: "16", memory: "64Gi" }
+      containers:
+        - name: server
+          image: public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.04.28-h200.2
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: ROLE, value: "prefill" }
+            - { name: MODEL_PATH, value: "/models/zai-org/GLM-5.1-FP8" }
+            # Customer prefill compose:
+            #   --tp-size 8 --pp-size 2 --nnodes 2 --node-rank {0,1}
+            #   --chunked-prefill-size 16384 --mem-fraction-static 0.85
+            #   --max-running-requests 8 --context-length 202752
+            #   --attention-backend nsa --page-size 64
+            #   --ep-dispatch-algorithm dynamic --eplb-algorithm deepseek
+            #   --disable-shared-experts-fusion --deepep-mode normal
+            #   --moe-a2a-backend deepep --dp-size 1 --moe-dense-tp-size 1
+            #   --enable-nsa-prefill-context-parallel --nsa-prefill-cp-mode round-robin-split
+            - { name: TP, value: "8" }
+            - { name: PP_SIZE, value: "2" }
+            - { name: DP_SIZE, value: "1" }
+            - { name: NNODES, value: "2" }
+            - { name: DIST_INIT_SVC, value: "glm51-prefill-headless" }
+            - { name: DIST_INIT_PORT, value: "10010" }
+            - { name: POD_NAME, valueFrom: { fieldRef: { fieldPath: metadata.name } } }
+            - { name: POD_NAMESPACE, valueFrom: { fieldRef: { fieldPath: metadata.namespace } } }
+            - { name: CONTEXT_LEN, value: "202752" }
+            - { name: MEM_FRAC_STATIC, value: "0.85" }
+            - { name: CHUNKED_PREFILL, value: "16384" }
+            - { name: MAX_RUNNING_REQUESTS, value: "8" }
+            - { name: KV_TRANSPORT_BACKEND, value: "mooncake" }
+            - { name: MOE_A2A_BACKEND, value: "deepep" }
+            - { name: DEEPEP_MODE, value: "normal" }
+            - { name: WATCHDOG_TIMEOUT, value: "3600" }
+            # Bisection knobs — all ON by default to match customer baseline:
+            - { name: ENABLE_NSA_CP, value: "$(ENABLE_NSA_CP)" }
+            - { name: ENABLE_EPLB_DYNAMIC, value: "$(ENABLE_EPLB_DYNAMIC)" }
+            - { name: DISABLE_SHARED_EXPERTS_FUSION, value: "$(DISABLE_SHARED_EXPERTS_FUSION)" }
+            - { name: ENABLE_DEBUG_LOG, value: "$(ENABLE_DEBUG_LOG)" }
+            - { name: ENABLE_SPECULATIVE, value: "0" }     # prefill-side has no speculative
+          command: ["/bin/bash", "-lc"]
+          args: ["exec /scripts/sglang-launcher.sh"]
+          readinessProbe:
+            tcpSocket: { port: 30000 }
+            initialDelaySeconds: 180
+            periodSeconds: 10
+            failureThreshold: 300   # 50 min, GLM-5.1 DeepGEMM JIT ~15 min first start
+          ports:
+            - { containerPort: 30000, name: http }
+            - { containerPort: 8998, name: bootstrap }
+            - { containerPort: 10010, name: distinit }
+          securityContext: { capabilities: { add: [IPC_LOCK] } }
+          resources:
+            limits:   { nvidia.com/gpu: 8, vpc.amazonaws.com/efa: 16, hugepages-2Mi: 5120Mi, memory: 500Gi }
+            requests: { nvidia.com/gpu: 8, vpc.amazonaws.com/efa: 16, hugepages-2Mi: 5120Mi, memory: 500Gi }
+          volumeMounts:
+            - { name: local-nvme, mountPath: /models, subPath: models }
+            - { name: deep-gemm-cache, mountPath: /sglang/deep_gemm, subPath: glm51-deep-gemm-prefill }
+            - { name: torch-compile-cache, mountPath: /sglang/torch-compile, subPath: glm51-torch-compile-prefill }
+            - { name: sglang-logs, mountPath: /sglang/logs, subPath: glm51-logs }
+            - { name: shm, mountPath: /dev/shm }
+            - { name: scripts, mountPath: /scripts }
+      volumes:
+        - name: local-nvme
+          hostPath: { path: /mnt/nvme, type: Directory }
+        - name: deep-gemm-cache
+          hostPath: { path: /mnt/nvme/sglang, type: DirectoryOrCreate }
+        - name: torch-compile-cache
+          hostPath: { path: /mnt/nvme/sglang, type: DirectoryOrCreate }
+        - name: sglang-logs
+          hostPath: { path: /mnt/nvme/sglang, type: DirectoryOrCreate }
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 64Gi }
+        - name: scripts
+          configMap: { name: glm51-launcher, defaultMode: 0755 }
+
+---
+# ==== Decode StatefulSet — 2 pods (TP=16, EP=16, DP=16, DP-Attn, DeepEP low_latency) ====
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: glm51-decode
+  namespace: yanxi-validation
+  labels: { app: glm51, role: decode }
+spec:
+  serviceName: glm51-decode-headless
+  replicas: 2
+  podManagementPolicy: Parallel
+  selector: { matchLabels: { app: glm51, role: decode } }
+  template:
+    metadata:
+      labels: { app: glm51, role: decode }
+    spec:
+      tolerations:
+        - { key: nvidia.com/gpu, operator: Equal, value: "true", effect: NoSchedule }
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - { key: node.kubernetes.io/instance-type, operator: In, values: [p5en.48xlarge] }
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector: { matchLabels: { app: glm51 } }
+              topologyKey: kubernetes.io/hostname
+      initContainers:
+        - name: s3-prefetch
+          image: public.ecr.aws/amazonlinux/amazonlinux:2023
+          command: ["/bin/bash","-lc","dnf install -y -q tar gzip; command -v curl && command -v tar && command -v gzip; exec /scripts/prefetch.sh"]
+          env:
+            - { name: MODEL_ID, value: "zai-org/GLM-5.1-FP8" }
+            - { name: S3_BUCKET, value: "yanxi-validation-788668107894-ohio" }
+          volumeMounts:
+            - { name: local-nvme, mountPath: /host-nvme }
+            - { name: scripts, mountPath: /scripts }
+          resources:
+            requests: { cpu: "4", memory: "8Gi" }
+            limits:   { cpu: "16", memory: "64Gi" }
+      containers:
+        - name: server
+          image: public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.04.28-h200.2
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: ROLE, value: "decode" }
+            - { name: MODEL_PATH, value: "/models/zai-org/GLM-5.1-FP8" }
+            # Customer decode compose:
+            #   --tp-size 16 --dp-size 16 --nnodes 2 --node-rank {0,1}
+            #   --enable-dp-attention --moe-dense-tp-size 1 --enable-dp-lm-head
+            #   --ep-dispatch-algorithm dynamic --eplb-algorithm deepseek
+            #   --disable-shared-experts-fusion --deepep-mode low_latency
+            #   --mem-fraction-static 0.74 --cuda-graph-max-bs 16
+            #   --max-running-requests 256 --context-length 202752
+            #   --moe-a2a-backend deepep --prefill-round-robin-balance
+            #   --tokenizer-worker-num 8 --enable-dynamic-batch-tokenizer
+            #   --attention-backend nsa --page-size 64
+            #   --speculative-algorithm EAGLE --speculative-num-steps 3
+            #     --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
+            - { name: TP, value: "16" }
+            - { name: DP_SIZE, value: "16" }
+            - { name: NNODES, value: "2" }
+            - { name: DIST_INIT_SVC, value: "glm51-decode-headless" }
+            - { name: DIST_INIT_PORT, value: "10010" }
+            - { name: POD_NAME, valueFrom: { fieldRef: { fieldPath: metadata.name } } }
+            - { name: POD_NAMESPACE, valueFrom: { fieldRef: { fieldPath: metadata.namespace } } }
+            - { name: CONTEXT_LEN, value: "202752" }
+            - { name: MEM_FRAC_STATIC, value: "0.74" }
+            - { name: MAX_RUNNING_REQUESTS, value: "256" }
+            - { name: CUDA_GRAPH_MAX_BS, value: "16" }
+            - { name: KV_TRANSPORT_BACKEND, value: "mooncake" }
+            - { name: MOE_A2A_BACKEND, value: "deepep" }
+            - { name: DEEPEP_MODE, value: "low_latency" }
+            - { name: WATCHDOG_TIMEOUT, value: "1200" }
+            # Bisection knobs — all ON by default to match customer baseline:
+            - { name: ENABLE_DP_ATTENTION, value: "$(ENABLE_DP_ATTENTION)" }
+            - { name: ENABLE_DP_LM_HEAD, value: "$(ENABLE_DP_LM_HEAD)" }
+            - { name: ENABLE_EPLB_DYNAMIC, value: "$(ENABLE_EPLB_DYNAMIC)" }
+            - { name: DISABLE_SHARED_EXPERTS_FUSION, value: "$(DISABLE_SHARED_EXPERTS_FUSION)" }
+            - { name: ENABLE_DEBUG_LOG, value: "$(ENABLE_DEBUG_LOG)" }
+            - { name: ENABLE_SPECULATIVE, value: "$(ENABLE_SPECULATIVE)" }
+          command: ["/bin/bash", "-lc"]
+          args: ["exec /scripts/sglang-launcher.sh"]
+          readinessProbe:
+            tcpSocket: { port: 30000 }
+            initialDelaySeconds: 180
+            periodSeconds: 10
+            failureThreshold: 300   # 50 min, same as prefill
+          ports:
+            - { containerPort: 30000, name: http }
+            - { containerPort: 8998, name: bootstrap }
+            - { containerPort: 10010, name: distinit }
+          securityContext: { capabilities: { add: [IPC_LOCK] } }
+          resources:
+            limits:   { nvidia.com/gpu: 8, vpc.amazonaws.com/efa: 16, hugepages-2Mi: 5120Mi, memory: 500Gi }
+            requests: { nvidia.com/gpu: 8, vpc.amazonaws.com/efa: 16, hugepages-2Mi: 5120Mi, memory: 500Gi }
+          volumeMounts:
+            - { name: local-nvme, mountPath: /models, subPath: models }
+            - { name: deep-gemm-cache, mountPath: /sglang/deep_gemm, subPath: glm51-deep-gemm-decode }
+            - { name: torch-compile-cache, mountPath: /sglang/torch-compile, subPath: glm51-torch-compile-decode }
+            - { name: sglang-logs, mountPath: /sglang/logs, subPath: glm51-logs }
+            - { name: shm, mountPath: /dev/shm }
+            - { name: scripts, mountPath: /scripts }
+      volumes:
+        - name: local-nvme
+          hostPath: { path: /mnt/nvme, type: Directory }
+        - name: deep-gemm-cache
+          hostPath: { path: /mnt/nvme/sglang, type: DirectoryOrCreate }
+        - name: torch-compile-cache
+          hostPath: { path: /mnt/nvme/sglang, type: DirectoryOrCreate }
+        - name: sglang-logs
+          hostPath: { path: /mnt/nvme/sglang, type: DirectoryOrCreate }
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 64Gi }
+        - name: scripts
+          configMap: { name: glm51-launcher, defaultMode: 0755 }
+
+---
+# ==== Router ====
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: glm51-lb
+  namespace: yanxi-validation
+  labels: { app: glm51-lb }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: glm51-lb } }
+  template:
+    metadata:
+      labels: { app: glm51-lb }
+    spec:
+      tolerations:
+        - { key: nvidia.com/gpu, operator: Equal, value: "true", effect: NoSchedule }
+      containers:
+        - name: lb
+          image: public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.04.28-h200.2
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: ROLE, value: "lb" }
+            - { name: PREFILL_URL, value: "http://glm51-prefill.yanxi-validation.svc:30000" }
+            - { name: DECODE_URL,  value: "http://glm51-decode.yanxi-validation.svc:30000" }
+          command: ["/bin/bash", "-lc"]
+          args: ["exec /scripts/sglang-launcher.sh"]
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 30
+          ports:
+            - { containerPort: 8000, name: http }
+          volumeMounts:
+            - { name: scripts, mountPath: /scripts }
+      volumes:
+        - name: scripts
+          configMap: { name: glm51-launcher, defaultMode: 0755 }

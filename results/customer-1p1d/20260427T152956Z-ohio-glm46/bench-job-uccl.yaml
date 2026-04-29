@@ -1,0 +1,38 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bench-uccl
+  namespace: yanxi-validation
+spec:
+  ttlSecondsAfterFinished: 600
+  backoffLimit: 0
+  activeDeadlineSeconds: 1800
+  template:
+    spec:
+      restartPolicy: Never
+      tolerations:
+        - { key: nvidia.com/gpu, operator: Equal, value: "true", effect: NoSchedule }
+      containers:
+        - name: bench
+          image: public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.04.28-h200.2
+          command: ["bash","-lc"]
+          args:
+            - |
+              # sglang 0.5.10 bench_serving 默认拿 model 名当 tokenizer HF repo
+              # id；我们 prefill/decode 启动时 --model-path 是 /models/... 本地
+              # 路径，LB 报回来的 served_model_name 也是 /models/... 。bench
+              # 容器内没挂那个路径，所以必须显式 --tokenizer 走 HF hub 拉
+              # (tokenizer 几 MB，不会被限流)。
+              python3 -m sglang.bench_serving \
+                --backend sglang \
+                --host c1p1d-lb.yanxi-validation.svc --port 8000 \
+                --tokenizer zai-org/GLM-4.6 \
+                --model zai-org/GLM-4.6 \
+                --dataset-name random \
+                --random-input-len 2048 --random-output-len 1024 \
+                --num-prompts 128 --max-concurrency 16 \
+                --warmup-requests 8 \
+                --output-file /tmp/bench.json 2>&1
+              echo "=== bench.json ==="
+              cat /tmp/bench.json 2>/dev/null || echo "(no output file)"
+              echo "=== BENCH_DONE ==="

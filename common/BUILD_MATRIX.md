@@ -33,7 +33,101 @@ Both variants share identical Mooncake TE, SGLang, EFA, NCCL, torch — **only t
 - **Latest tag**: `latest` → current release (per variant)
 - **Stable alias**: `stable` → promoted manually after 1 week of internal soak (per variant)
 
-### 2026.04.28-h200 (inaugural release)
+### 2026.04.28-h200.4 hotfix (2026-04-29 rebuild)
+
+Shipped 2026-04-29 after validating `.3` on a real p5.48xlarge and realizing
+one of the two EFA test binaries from the Mooncake official test protocol
+was missing from our runtime image:
+
+| Missing binary | Source | Why it matters |
+|---|---|---|
+| `efa_first_submit_probe` (`/opt/mooncake/install/bin/`) | Built in `/opt/mooncake/build/mooncake-transfer-engine/example/`, not copied into install prefix by `ninja install` | Mooncake official doc [EFA Transport](https://kvcache-ai.github.io/Mooncake/design/transfer-engine/efa_transport.html) references this for first-submit latency measurement. Customer reproducing our validation would hit "binary not found" without a source checkout |
+
+**Fix**: Dockerfile builder stage now also copies `efa_first_submit_probe`
+next to `transfer_engine_bench` (conditional — skipped with a log message if
+the Mooncake SHA pre-dates this binary, to keep future MOONCAKE_REF bumps
+from breaking the build).
+
+**Tag policy**: patch-bump to `2026.04.28-h200.4`; no other changes (Mooncake /
+UCCL / SGLang / torch / CUDA / EFA / the rdma→efa patch all unchanged from
+`.3`). Both `.3` tags remain valid for customer use; `.4` only adds a
+diagnostic binary.
+
+### 2026.04.28-h200.3 hotfix (2026-04-29 rebuild)
+
+Shipped 2026-04-29 after customer GLM-5.1 2P:2D docker-compose run revealed
+that SGLang's hardcoded Mooncake protocol silently fell back to TCP on our
+EFA Mooncake build, producing minute-level KV-transfer latency:
+
+| Bug in `.2` | Why | How we hit it |
+|---|---|---|
+| `sglang/srt/distributed/device_communicators/mooncake_transfer_engine.py` hardcodes protocol `"rdma"` when calling `TransferEngine.initialize(...)`. Our Mooncake build is `USE_EFA=ON` (`transfer_engine_py.cpp:237`), which installs TCP transport whenever the protocol string is not `"efa"`. Standard-RDMA Mooncake builds (customer's domestic IDC) accept `"rdma"` natively, so this only bites AWS EFA deployments | SGLang upstream has no env/flag to override this string; the `"rdma"` token is inline. `.2` image had a `sed` patch inside our launcher shell script (`manifests/customer-*-glm51-*.yaml`), but customer's docker-compose uses `entrypoint: python3 -m sglang.launch_server` directly — the launcher never runs, the patch never applies | Customer GLM-5.1 logs 2026-04-28 showed 24× `Installing TCP transport (auto_discover disabled in EFA build)` across prefill ranks; KV transfer ran on TCP sockets; compounded with CP `is_dummy_cp_rank` it produced 181s prefill + 300s decode timeouts |
+
+**Fix**: Dockerfile builder stage now `sed -i 's/"rdma",$/"efa",/'` the file
+into the image itself (before Mooncake TE build), so any entrypoint — our
+launcher, bare `python -m sglang.launch_server`, custom wrappers — gets the
+correct `"efa"` protocol. Build fails fast if upstream sglang changes the
+string shape (token guard via `grep -q '"rdma",'` and post-sed assertions).
+
+**Smoke check extended**: runtime stage now asserts at build time that
+`inspect.getsource(sglang.srt.distributed.device_communicators.mooncake_transfer_engine)`
+contains `"efa",` and does not contain `"rdma",`. Catches any future
+regression where the patch didn't actually apply.
+
+**Launcher change** (`manifests/customer-2p2d-glm51-ohio.yaml` et al.):
+launcher now detects whether the image is pre-patched (`.3+`) or legacy
+(`.2-`) and only runs the sed in the legacy case, emitting a log message
+either way. This keeps old manifests compatible with new images and vice
+versa.
+
+**Tag policy**: patch-bump to `2026.04.28-h200.3`; no other changes (Mooncake
+/ UCCL / SGLang / torch / CUDA / EFA SHAs unchanged from `.2`). `.2` tag
+left in place for forensics but deprecated.
+
+**Caveat**: `.3` fixes the **transport layer** (KV traffic now runs on EFA
+SRD, not TCP). It does NOT fix the **PD-disagg + CP contract layer** —
+sglang's `is_dummy_cp_rank` gating (PR #19504) still causes prefill CP
+rank≠0 to skip bootstrap/send KV when prefill CP > 1 and decode CP = 1,
+producing the same 181s+300s timeout pattern. The workaround remains
+"disable `--enable-nsa-prefill-context-parallel`" (or set env
+`SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER=1`, not yet verified on AWS).
+
+### 2026.04.28-h200.2 hotfix (2026-04-27 rebuild)
+
+Shipped 2026-04-27 after customer Docker 1P:1D run revealed the `.1` image
+was still missing a runtime CLI binary:
+
+| Missing binary | Why SGLang needs it | How we hit it |
+|---|---|---|
+| `/usr/bin/ninja` (apt pkg `ninja-build`) | SGLang TP workers JIT-compile attention kernels (QK-Norm, tvm_ffi) via a forked `subprocess.run("ninja", ...)`. The pip-installed ninja wheel's CLI at `/usr/local/bin/ninja` from the builder stage is NOT copied to runtime (we only `COPY /usr/local/bin/python`, not the whole dir) | Decode pod crash loop: `Failed to load JIT QK-Norm kernel: 'ninja'` across TP workers. Prefill occasionally started because its first-touch kernels are different from decode's |
+
+**Fix**: Dockerfile runtime apt install adds `ninja-build` (system PATH
+`/usr/bin/ninja`, fork-safe for TP workers — doesn't rely on `/usr/local/bin`
+being copied or PATH surviving multiprocessing fork).
+**Smoke check extended**: `test -x /usr/bin/ninja && ninja --version`.
+**Tag policy**: patch-bump to `2026.04.28-h200.2`; no other changes (Mooncake /
+UCCL / SGLang / torch / CUDA / EFA SHAs unchanged from `.1`). `.1` tag
+left in place for forensics but deprecated.
+
+### 2026.04.28-h200.1 hotfix (2026-04-27 rebuild, DEPRECATED — missing runtime ninja)
+
+Shipped 2026-04-27 after 1P:1D perf test on Oregon p5 revealed the original
+`2026.04.28-h200` image was missing two runtime libs:
+
+| Missing lib | Why SGLang needs it | How we hit it |
+|---|---|---|
+| `libpython3.10.so.1.0` (apt pkg `libpython3.10`) | Mooncake's cpython-310 binding `dlopen`s it at `from mooncake.engine import TransferEngine` — NOT covered by `import mooncake` which only loads package metadata | `ImportError: libpython3.10.so.1.0: cannot open shared object file` when SGLang init'd Mooncake TE |
+| `Python.h` (apt pkg `python3.10-dev`) | Triton JIT fallback in `sglang/srt/layers/attention/fla/utils.py:223` compiles a tiny CUDA shim when triton can't load — without Python.h it emits noisy CPU fallback | `fatal error: Python.h: No such file or directory` spam in log |
+
+**Fix**: Dockerfile runtime apt install adds `libpython3.10 python3.10-dev`.
+**Smoke check extended** so future rebuilds catch it (uses `from mooncake.engine
+import TransferEngine` + `test -f /usr/lib/x86_64-linux-gnu/libpython3.10.so.1.0`
++ `test -f /usr/include/python3.10/Python.h`).
+**Tag policy**: patch-bump to `2026.04.28-h200.1`; no other changes (Mooncake /
+UCCL / SGLang / torch / CUDA / EFA SHAs unchanged). Previous `2026.04.28-h200`
+tag left in place for forensics but deprecated.
+
+### 2026.04.28-h200 (inaugural release, DEPRECATED — missing libpython runtime deps)
 
 | Component | Version / SHA | Source | Rationale |
 |---|---|---|---|
@@ -123,11 +217,16 @@ Additional moving tags:
 
 Every release image MUST pass:
 1. `python -c "import torch; print(torch.__version__, torch.version.cuda)"` → 2.9.1+cu128
-2. `python -c "import uccl.ep"` → no error
-3. `python -c "import deep_ep; assert deep_ep.Config.__module__.startswith('uccl')"` → deep_ep routed to UCCL
+2. `python -c "import uccl.ep"` → no error (uccl variant only)
+3. `python -c "import deep_ep; assert deep_ep.Config.__module__.startswith('uccl')"` → deep_ep routed to UCCL (uccl variant only)
 4. `python -c "import mooncake"` → no error
-5. `python -c "import sglang; print(sglang.__version__)"` → 0.5.10
-6. `python -m sglang.launch_server --help | grep moe-a2a-backend` → shows `deepep` in choices
-7. `/opt/mooncake/install/bin/transfer_engine_bench --help` → runs
-8. `fi_info -p efa` inside container (on EFA-capable node) → shows 16 devices on p5en
-9. Image SBOM matches this file's version table (see `/opt/BUILD_INFO.json` inside image)
+5. `python -c "from mooncake.engine import TransferEngine"` → no error (catches `libpython3.10.so.1.0` missing; pure metadata `import mooncake` does NOT)
+6. `test -f /usr/lib/x86_64-linux-gnu/libpython3.10.so.1.0` (libpython3.10 apt pkg)
+7. `test -f /usr/include/python3.10/Python.h` (python3.10-dev apt pkg; triton JIT fallback)
+8. `python -c "import sglang; print(sglang.__version__)"` → 0.5.10
+9. `python -m sglang.launch_server --help | grep moe-a2a-backend` → shows `deepep` in choices
+10. `/opt/mooncake/install/bin/transfer_engine_bench --help` → runs
+11. `fi_info -p efa` inside container (on EFA-capable node) → shows 16 devices on p5en
+12. Image SBOM matches this file's version table (see `/opt/BUILD_INFO.json` inside image)
+13. **E2E smoke on GPU node** — `sglang.launch_server --disaggregation-mode prefill --disaggregation-transfer-backend mooncake` must start without TransferEngine ImportError (this is what would have caught h200.0 → h200.1 bug)
+14. **Mooncake EFA patch applied** — `python -c "import inspect, sglang.srt.distributed.device_communicators.mooncake_transfer_engine as m; src=inspect.getsource(m); assert '\"efa\",' in src and '\"rdma\",' not in src; print('ok')"` → ok (catches h200.2 → h200.3 TCP-fallback bug)

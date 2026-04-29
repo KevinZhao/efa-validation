@@ -1,0 +1,34 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bench-nccl
+  namespace: yanxi-validation
+spec:
+  ttlSecondsAfterFinished: 600
+  backoffLimit: 0
+  activeDeadlineSeconds: 1800
+  template:
+    spec:
+      restartPolicy: Never
+      tolerations:
+        - { key: nvidia.com/gpu, operator: Equal, value: "true", effect: NoSchedule }
+      containers:
+        - name: bench
+          image: public.ecr.aws/n3l4x8f3/sglang-mooncake-nccl:2026.04.28-h200.2
+          command: ["bash","-lc"]
+          args:
+            - |
+              python3 -m sglang.bench_serving \
+                --backend sglang \
+                --host c1p1d-lb.yanxi-validation.svc --port 8000 \
+                --tokenizer deepseek-ai/DeepSeek-V3.1 \
+                --model deepseek-ai/DeepSeek-V3.1 \
+                --dataset-name random \
+                --random-input-len 2048 --random-output-len 1024 \
+                --num-prompts 128 --max-concurrency 16 \
+                --warmup-requests 8 \
+                --ready-check-timeout-sec 0 \
+                --output-file /tmp/bench.json 2>&1
+              echo "=== bench.json ==="
+              cat /tmp/bench.json 2>/dev/null || echo "(no output file)"
+              echo "=== BENCH_DONE ==="

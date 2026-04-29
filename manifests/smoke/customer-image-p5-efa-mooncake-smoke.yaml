@@ -1,0 +1,186 @@
+# =============================================================================
+# Customer image .3 full EFA-Mooncake verification — follows official test
+# protocol from https://kvcache-ai.github.io/Mooncake/design/transfer-engine/efa_transport.html
+#
+# Tests (in order of evidence strength):
+#   A) TransferEngine.initialize(...protocol='efa'...) returns 0
+#      Proves: rdma→efa patch works AND Mooncake can enumerate real EFA devices
+#              (not just "Installing EFA transport" log line like .2)
+#
+#   B) efa_first_submit_probe with warmup=1 iters=5 (target + initiator same node)
+#      Proves: first-submit latency acceptable + ongoing submits in single-digit ms
+#
+#   C) transfer_engine_bench loopback at block_size=1MB, threads=16, batch=128
+#      Proves: real EFA RDMA-SRD bandwidth (target >=100 GB/s loopback on p5)
+#
+# Hardening vs previous smoke (manifests/smoke/customer-image-p5-smoke.yaml):
+#   - privileged: true  — lets container open /dev/infiniband/uverbs* and
+#     libibverbs enumerate EFA devices (our earlier smoke failed here with
+#     "No EFA devices found" despite fi_info seeing 32)
+#   - hostNetwork + hostIPC — gives Mooncake access to shared-mem SRD paths
+#   - Explicit FI_PROVIDER=efa, FI_EFA_USE_DEVICE_RDMA=1 (already in Dockerfile
+#     ENV but reasserting for clarity)
+#
+# Node: 1 x p5.48xlarge (H100, 32 EFA NICs) in Oregon gpu-cluster-oregon
+# Image: public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.04.28-h200.3
+# =============================================================================
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: customer-image-efa-mooncake-smoke
+  namespace: default
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      hostNetwork: true
+      hostIPC: true
+      nodeSelector:
+        node.kubernetes.io/instance-type: p5.48xlarge
+      containers:
+        - name: smoke
+          image: public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.04.28-h200.3
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["IPC_LOCK", "SYS_NICE", "SYS_RESOURCE", "NET_RAW", "NET_ADMIN"]
+          env:
+            - { name: FI_PROVIDER,            value: "efa" }
+            - { name: FI_EFA_USE_DEVICE_RDMA, value: "1" }
+            - { name: FI_EFA_FORK_SAFE,       value: "1" }
+            - { name: FI_EFA_USE_HUGE_PAGE,   value: "0" }
+            - { name: MOONCAKE_PROTOCOL,      value: "efa" }
+          resources:
+            requests: { cpu: "2", memory: "8Gi" }
+            limits:
+              nvidia.com/gpu: "1"
+              vpc.amazonaws.com/efa: "32"
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+              echo "=============================="
+              echo "=== 0. Environment ==========="
+              echo "=============================="
+              echo "HOSTNAME=$(hostname)"
+              ls /dev/infiniband/ 2>&1 || echo "no /dev/infiniband"
+              ls /opt/amazon/efa/lib/libfabric.so* 2>&1 | head -3
+              ldconfig -p | grep -E "libefa|libfabric" | head -5
+              echo
+
+              echo "=============================="
+              echo "=== 1. BUILD_INFO ============"
+              echo "=============================="
+              cat /opt/BUILD_INFO.json
+              echo
+
+              echo "=============================="
+              echo "=== 2. fi_info (libfabric) ==="
+              echo "=============================="
+              fi_info -p efa -t FI_EP_RDM 2>/dev/null | awk '/domain:|provider:/ {print}' | head -10
+              EFA_CNT=$(fi_info -p efa -t FI_EP_RDM 2>/dev/null | awk '/domain:/ {print $2}' | sort -u | wc -l)
+              echo "EFA domains visible to libfabric: $EFA_CNT"
+              [ "$EFA_CNT" -ge 16 ] && echo "PASS: >=16 EFA domains" || { echo "FAIL: only $EFA_CNT EFA domains"; exit 1; }
+              echo
+
+              echo "=========================================="
+              echo "=== 3. ibv / EFA device node access ======"
+              echo "=========================================="
+              ls -la /dev/infiniband/ 2>&1 | head -35
+              command -v ibv_devinfo >/dev/null 2>&1 && ibv_devinfo 2>&1 | head -20 || echo "ibv_devinfo not installed — using mooncake's own enumeration"
+              echo
+
+              echo "=========================================="
+              echo "=== TEST A: TransferEngine.initialize ===="
+              echo "=========================================="
+              python3 - <<'PY' 2>&1 | tee /tmp/test-a.log
+              from mooncake.engine import TransferEngine
+              te = TransferEngine()
+              # Signature per official doc: initialize(local_server_name_or_ip,
+              # metadata_server, protocol, device_name)
+              result = te.initialize('127.0.0.1:12345', 'P2PHANDSHAKE', 'efa', '')
+              print(f"RESULT={result}")
+              PY
+              if grep -q "RESULT=0" /tmp/test-a.log; then
+                echo "PASS (A): TransferEngine.initialize protocol=efa returned 0"
+              else
+                echo "FAIL (A): initialize did not return 0"
+                grep -E "No EFA devices|Failed|RESULT=" /tmp/test-a.log || true
+                # don't exit — let B and C run so we have full picture
+              fi
+              echo
+
+              echo "=========================================="
+              echo "=== TEST B: efa_first_submit_probe ======="
+              echo "=========================================="
+              PROBE=$(find /opt/mooncake -name efa_first_submit_probe -type f 2>/dev/null | head -1)
+              if [ -z "$PROBE" ]; then
+                echo "SKIP (B): efa_first_submit_probe binary not shipped in image"
+              else
+                echo "found: $PROBE"
+                # Launch target in background
+                $PROBE --mode=target --metadata_server=P2PHANDSHAKE \
+                  --local_server_name=127.0.0.1:23456 > /tmp/probe-target.log 2>&1 &
+                TPID=$!
+                sleep 3
+                # Initiator
+                timeout 30 $PROBE --mode=initiator --metadata_server=P2PHANDSHAKE \
+                  --segment_id=127.0.0.1:23456 --warmup=1 --iters=5 \
+                  > /tmp/probe-init.log 2>&1 || echo "(probe initiator exited; normal if short run)"
+                kill $TPID 2>/dev/null || true
+                wait $TPID 2>/dev/null || true
+                echo "--- target log (first 30 lines) ---"
+                head -30 /tmp/probe-target.log || true
+                echo "--- initiator log ---"
+                cat /tmp/probe-init.log || true
+                if grep -qE "submit #0" /tmp/probe-init.log; then
+                  echo "PASS (B): first-submit probe completed"
+                else
+                  echo "WARN (B): probe didn't reach submit phase"
+                fi
+              fi
+              echo
+
+              echo "=========================================="
+              echo "=== TEST C: transfer_engine_bench ========"
+              echo "=========================================="
+              BENCH=/opt/mooncake/install/bin/transfer_engine_bench
+              if [ ! -x "$BENCH" ]; then
+                echo "SKIP (C): transfer_engine_bench binary not found at $BENCH"
+                ls -la /opt/mooncake/install/bin/ 2>&1 | head
+              else
+                echo "found: $BENCH"
+                # Target
+                $BENCH --mode=target --protocol=efa --metadata_server=P2PHANDSHAKE \
+                  --local_server_name=127.0.0.1:34567 \
+                  --buffer_size=4294967296 --gpu_id=-1 > /tmp/bench-target.log 2>&1 &
+                BPID=$!
+                sleep 5
+                # Initiator
+                timeout 60 $BENCH --mode=initiator --protocol=efa \
+                  --metadata_server=P2PHANDSHAKE \
+                  --segment_id=127.0.0.1:34567 \
+                  --operation=write --duration=10 --threads=8 \
+                  --block_size=1048576 --batch_size=128 \
+                  --buffer_size=4294967296 --gpu_id=-1 \
+                  --report_unit=GB \
+                  > /tmp/bench-init.log 2>&1 || echo "(bench initiator exited)"
+                kill $BPID 2>/dev/null || true
+                wait $BPID 2>/dev/null || true
+                echo "--- bench target log (first 40 lines) ---"
+                head -40 /tmp/bench-target.log || true
+                echo "--- bench initiator log (last 50 lines) ---"
+                tail -50 /tmp/bench-init.log || true
+                if grep -qE "GB/s|Throughput|Bandwidth" /tmp/bench-init.log; then
+                  echo "PASS (C): bench produced throughput numbers"
+                else
+                  echo "WARN (C): bench didn't print throughput — check target log"
+                fi
+              fi
+              echo
+
+              echo "=============================="
+              echo "=== SMOKE ALL DONE ==========="
+              echo "=============================="

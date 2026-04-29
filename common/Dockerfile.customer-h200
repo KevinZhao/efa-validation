@@ -177,6 +177,28 @@ RUN python -m pip install --upgrade pip setuptools wheel && \
       "grpcio>=1.60" "grpcio-tools>=1.60" \
       "etcd3>=0.12" "protobuf>=4.25"
 
+# ---- Patch sglang mooncake_transfer_engine.py: "rdma" -> "efa" ----
+# sglang 0.5.10 mooncake_transfer_engine.py hardcodes protocol "rdma".
+# Our Mooncake build is USE_EFA=ON (AWS EFA / libfabric SRD). Its
+# transfer_engine_py.cpp:237 falls back to TCP transport whenever protocol
+# != "efa", silently degrading KV transfer from EFA RDMA-SRD to TCP socket.
+# On standard-RDMA Mooncake builds (e.g. customer's domestic IDC) "rdma"
+# works natively, which is why this only bites on AWS.
+# Baking the patch into the Python file so that bare
+# `python3 -m sglang.launch_server` entrypoints (customer's docker-compose
+# pattern) get the fix without depending on any launcher shell script.
+# fail-fast: if upstream sglang changes the string shape, build aborts and
+# a maintainer must re-audit the patch.
+# See feedback_sglang_cp_pd_disagg_mismatch.md §终极根因修正.
+RUN MC_PY=/usr/local/lib/python3.10/dist-packages/sglang/srt/distributed/device_communicators/mooncake_transfer_engine.py && \
+    test -f "${MC_PY}" || { echo "ERROR: ${MC_PY} not found — sglang install layout changed" >&2; exit 1; } && \
+    grep -q '"rdma",' "${MC_PY}" || { echo "ERROR: '\"rdma\",' token missing — sglang upstream changed, re-audit patch" >&2; exit 1; } && \
+    sed -i 's/"rdma",$/"efa",/' "${MC_PY}" && \
+    grep -q '"efa",' "${MC_PY}" || { echo "ERROR: sed did not produce '\"efa\",' token" >&2; exit 1; } && \
+    ! grep -q '"rdma",' "${MC_PY}" || { echo "ERROR: '\"rdma\",' token still present after sed" >&2; exit 1; } && \
+    rm -f /usr/local/lib/python3.10/dist-packages/sglang/srt/distributed/device_communicators/__pycache__/mooncake_transfer_engine.cpython-310.pyc 2>/dev/null || true && \
+    echo "[patch] sglang mooncake_transfer_engine.py: rdma -> efa applied"
+
 # ---- Mooncake Transfer Engine (Henan 5 PRs baked in via @634b7097) ----
 # TE-only build: WITH_EP=OFF (Mooncake-EP is mlx5-IBGDA only, incompatible
 # with EFA), WITH_STORE=OFF (customer uses PD-disagg TE, no store layer).
@@ -205,10 +227,23 @@ RUN mkdir -p /opt/mooncake/build && cd /opt/mooncake/build && \
     ninja -j"$(nproc)" && \
     ninja install && \
     ldconfig && \
-    # ninja install does NOT copy transfer_engine_bench (bench stays in build/)
+    # ninja install does NOT copy example binaries (they stay in build/).
+    # Mooncake official EFA test protocol
+    # (https://kvcache-ai.github.io/Mooncake/design/transfer-engine/efa_transport.html)
+    # references transfer_engine_bench for throughput and efa_first_submit_probe
+    # for first-submit latency. We ship both so customers can reproduce without
+    # a source checkout. efa_first_submit_probe may not exist on older Mooncake
+    # SHAs, so make its copy non-fatal.
     mkdir -p /opt/mooncake/install/bin && \
     cp /opt/mooncake/build/mooncake-transfer-engine/example/transfer_engine_bench \
-       /opt/mooncake/install/bin/
+       /opt/mooncake/install/bin/ && \
+    if [ -x /opt/mooncake/build/mooncake-transfer-engine/example/efa_first_submit_probe ]; then \
+        cp /opt/mooncake/build/mooncake-transfer-engine/example/efa_first_submit_probe \
+           /opt/mooncake/install/bin/ && \
+        echo "[build] efa_first_submit_probe shipped" ; \
+    else \
+        echo "[build] efa_first_submit_probe not built (older Mooncake SHA); skipping" ; \
+    fi
 
 # Python binding (wheel install; headers not kept at runtime)
 RUN cd /opt/mooncake && \
@@ -298,12 +333,26 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
 
 # ---- Minimal runtime system deps ----
-# No -dev packages, no compilers. Just what's needed to exec the stack.
+# Mostly no -dev packages, no compilers. Exceptions:
+#   - python3.10-dev: triton's sglang/srt/layers/attention/fla/utils.py falls
+#     back to a JIT compile path that does `#include <Python.h>` when triton
+#     can't load — without Python.h we get a noisy CPU fallback.
+#   - libpython3.10: provides libpython3.10.so.1.0 that Mooncake's cpython-310
+#     binding dlopens at runtime (NOT in the `python3.10` apt package —
+#     discovered 2026-04-27 P5 bench).
+#   - ninja-build: installs /usr/bin/ninja, needed by SGLang TP workers'
+#     JIT kernel compile (QK-Norm / tvm_ffi subprocess shells out to `ninja`).
+#     pip-installed ninja wheel's CLI in /usr/local/bin/ninja does NOT survive
+#     the stage copy (we only copy /usr/local/bin/python, not /usr/local/bin)
+#     — and even if it did, sglang's forked TP workers need a stable system
+#     PATH binary, not a pip console_script that relocates. Discovered via
+#     customer 1P1D decode crash: `Failed to load JIT QK-Norm kernel: 'ninja'`.
 # libnccl2 is pre-installed on nvidia/cuda:13.0.2-cudnn-devel base — keep it
 # here to survive apt cache purge. Also needed: EFA installer runtime deps
 # (iproute2, ethtool, etc.) so `fi_info -p efa` actually works.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3.10 python3-pip \
+      python3.10 python3-pip libpython3.10 python3.10-dev \
+      ninja-build \
       libyaml-cpp0.7 libgflags2.2 libgoogle-glog0v5 \
       libboost-system1.74.0 libboost-thread1.74.0 libboost-filesystem1.74.0 \
       libjsoncpp25 libssl3 libjemalloc2 \
@@ -389,7 +438,16 @@ RUN UCCL_SHA=$(cat /opt/BUILD_INFO.uccl-sha) && \
 # the A/B comparison purpose).
 RUN python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)" && \
     python -c "import mooncake; print('mooncake OK')" && \
+    python -c "from mooncake.engine import TransferEngine; print('mooncake.engine.TransferEngine OK')" && \
+    test -f /usr/lib/x86_64-linux-gnu/libpython3.10.so.1.0 && echo "libpython3.10.so.1.0 OK" && \
+    test -f /usr/include/python3.10/Python.h && echo "Python.h OK" && \
+    test -x /usr/bin/ninja && ninja --version && echo "ninja OK" && \
     python -c "import sglang; print('sglang', sglang.__version__)" && \
+    python -c "import inspect, sglang.srt.distributed.device_communicators.mooncake_transfer_engine as m; \
+               src = inspect.getsource(m); \
+               assert '\"efa\",' in src, 'mooncake efa patch missing in runtime image'; \
+               assert '\"rdma\",' not in src, 'mooncake rdma token leaked into runtime image'; \
+               print('mooncake efa patch OK in runtime')" && \
     (python -m sglang.launch_server --help 2>&1 | grep -E "moe-a2a-backend|disaggregation-transfer-backend" | head -5) && \
     test -x /opt/mooncake/install/bin/transfer_engine_bench && \
     if [ "${WITH_UCCL}" = "true" ]; then \

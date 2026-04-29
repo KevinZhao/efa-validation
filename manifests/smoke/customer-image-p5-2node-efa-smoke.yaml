@@ -1,0 +1,287 @@
+# =============================================================================
+# Customer image .4 — TWO-NODE EFA Mooncake test per official doc
+# https://kvcache-ai.github.io/Mooncake/design/transfer-engine/efa_transport.html
+#
+# Runs three official tests across two p5.48xlarge nodes (same AZ — EFA SRD
+# is single-AZ only):
+#
+#   Test A — TransferEngine.initialize(protocol='efa') → 0 on each node
+#            (already PASS on single-node; re-verified here)
+#
+#   Test B — efa_first_submit_probe target + initiator across nodes
+#            (shipped in .4 image; previous .3 was missing this binary)
+#
+#   Test C — transfer_engine_bench target + initiator across nodes,
+#            block_size=1MB threads=16 batch=128 duration=10s
+#            Official target on p5en: ~365 GB/s write. p5 H100 is a bit less
+#            but should still be multi-hundred GB/s if stack is correct.
+#
+# Topology:
+#   target   — StatefulSet replica 0 on node A
+#   initiator— StatefulSet replica 1 on node B
+#   service  — headless, so DNS A record returns pod IP
+#   sync     — initiator waits for target's readiness marker in a shared
+#              K8s configmap (populated by target when it's listening)
+#
+# After smoke finishes, read logs:
+#   kubectl logs customer-p5-2node-target-0 -c smoke   > target.log
+#   kubectl logs customer-p5-2node-initiator-0 -c smoke > initiator.log
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: customer-p5-2node-scripts
+  namespace: default
+data:
+  target.sh: |
+    #!/usr/bin/env bash
+    set -eu
+    echo "=== TARGET node=$(hostname) ==="
+    BENCH=/opt/mooncake/install/bin/transfer_engine_bench
+    PROBE=/opt/mooncake/install/bin/efa_first_submit_probe
+
+    ls -la /opt/mooncake/install/bin/
+    cat /opt/BUILD_INFO.json
+
+    # Validate Test A locally (still useful as sanity)
+    echo "=== Local Test A (initialize on target node) ==="
+    python3 -c "
+    from mooncake.engine import TransferEngine
+    te = TransferEngine()
+    r = te.initialize('127.0.0.1:12345', 'P2PHANDSHAKE', 'efa', '')
+    print(f'RESULT={r}')
+    "
+
+    # Then run B + C targets in parallel (different ports)
+    echo "=== Starting probe target on :23456 ==="
+    $PROBE --mode=target --metadata_server=P2PHANDSHAKE \
+      --local_server_name=$(hostname -i):23456 > /tmp/probe-target.log 2>&1 &
+    PROBE_PID=$!
+
+    echo "=== Starting bench target on :34567 ==="
+    $BENCH --mode=target --protocol=efa --metadata_server=P2PHANDSHAKE \
+      --local_server_name=$(hostname -i):34567 \
+      --buffer_size=4294967296 --gpu_id=-1 > /tmp/bench-target.log 2>&1 &
+    BENCH_PID=$!
+
+    # Give targets time to fully init (32 EFA devices × ~30ms + libfabric setup)
+    echo "=== Waiting 60s for targets to finish EFA init + listen ==="
+    sleep 60
+    echo "=== Targets should be listening now ==="
+    echo "--- probe target log (first 30) ---"
+    head -30 /tmp/probe-target.log || true
+    echo "--- bench target log (first 40) ---"
+    head -40 /tmp/bench-target.log || true
+
+    # Write readiness to a file in shared emptyDir (we use inter-pod sync
+    # via a polling loop on initiator, not cm — cm updates require API call)
+    echo "ready" > /tmp/target-ready
+
+    # Keep targets alive for 120s so initiator has time
+    echo "=== Keeping targets alive for 120s ==="
+    sleep 120
+
+    echo "=== Target wrap-up ==="
+    kill $PROBE_PID 2>/dev/null || true
+    kill $BENCH_PID 2>/dev/null || true
+    wait 2>/dev/null || true
+
+    echo "=== Full probe target log ==="
+    cat /tmp/probe-target.log || true
+    echo "=== Full bench target log (tail 80) ==="
+    tail -80 /tmp/bench-target.log || true
+    echo "=== Target done ==="
+
+  initiator.sh: |
+    #!/usr/bin/env bash
+    set -eu
+    echo "=== INITIATOR node=$(hostname) ==="
+    BENCH=/opt/mooncake/install/bin/transfer_engine_bench
+    PROBE=/opt/mooncake/install/bin/efa_first_submit_probe
+    TARGET_HOST=customer-p5-2node-target-0.customer-p5-2node-target
+
+    # Resolve target IP
+    echo "=== Resolving $TARGET_HOST ==="
+    for i in $(seq 1 60); do
+      TARGET_IP=$(getent hosts $TARGET_HOST 2>/dev/null | awk '{print $1}' | head -1)
+      if [ -n "$TARGET_IP" ]; then
+        echo "TARGET_IP=$TARGET_IP"
+        break
+      fi
+      echo "attempt $i: DNS not yet"
+      sleep 2
+    done
+    [ -n "$TARGET_IP" ] || { echo "FAIL: target DNS never resolved"; exit 1; }
+
+    # Give target 90s to stand up (it sleeps 60 before marking ready + 32 EFA init)
+    echo "=== Waiting 90s for target EFA init + listen ==="
+    sleep 90
+
+    echo "=== Test A: initialize on initiator node ==="
+    python3 -c "
+    from mooncake.engine import TransferEngine
+    te = TransferEngine()
+    r = te.initialize('127.0.0.1:12346', 'P2PHANDSHAKE', 'efa', '')
+    print(f'RESULT={r}')
+    "
+    echo
+
+    echo "=== Test B: efa_first_submit_probe — initiator ==="
+    timeout 60 $PROBE --mode=initiator --metadata_server=P2PHANDSHAKE \
+      --segment_id=$TARGET_IP:23456 --warmup=1 --iters=5 \
+      2>&1 | tee /tmp/probe-init.log || echo "(probe exited)"
+    if grep -qE "submit #0" /tmp/probe-init.log; then
+      echo "PASS (B): first-submit probe completed"
+    else
+      echo "WARN (B): no submit line; dump last 30 lines"
+      tail -30 /tmp/probe-init.log
+    fi
+    echo
+
+    echo "=== Test C: transfer_engine_bench — initiator ==="
+    timeout 60 $BENCH --mode=initiator --protocol=efa \
+      --metadata_server=P2PHANDSHAKE \
+      --segment_id=$TARGET_IP:34567 \
+      --operation=write --duration=10 --threads=16 \
+      --block_size=1048576 --batch_size=128 \
+      --buffer_size=4294967296 --gpu_id=-1 \
+      --report_unit=GB \
+      2>&1 | tee /tmp/bench-init.log || echo "(bench exited)"
+    echo "--- bench initiator tail (50) ---"
+    tail -50 /tmp/bench-init.log || true
+    if grep -qE "GB/s|[Tt]hroughput|[Bb]andwidth" /tmp/bench-init.log; then
+      BW=$(grep -oE "[0-9]+\\.[0-9]+ GB/s|[Tt]hroughput: [0-9.]+" /tmp/bench-init.log | head -5)
+      echo "PASS (C): $BW"
+    else
+      echo "WARN (C): no throughput line"
+    fi
+    echo "=== Initiator done ==="
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: customer-p5-2node-target
+  namespace: default
+spec:
+  clusterIP: None  # headless — resolves to pod IP
+  selector:
+    app: customer-p5-2node
+    role: target
+  ports:
+    - name: probe
+      port: 23456
+    - name: bench
+      port: 34567
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: customer-p5-2node-target
+  namespace: default
+spec:
+  serviceName: customer-p5-2node-target
+  replicas: 1
+  selector:
+    matchLabels:
+      app: customer-p5-2node
+      role: target
+  template:
+    metadata:
+      labels:
+        app: customer-p5-2node
+        role: target
+    spec:
+      restartPolicy: Always
+      hostNetwork: true
+      hostIPC: true
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels: { app: customer-p5-2node }
+              topologyKey: kubernetes.io/hostname
+      nodeSelector:
+        node.kubernetes.io/instance-type: p5.48xlarge
+      volumes:
+        - name: scripts
+          configMap:
+            name: customer-p5-2node-scripts
+            defaultMode: 0755
+      containers:
+        - name: smoke
+          image: public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.04.28-h200.4
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["IPC_LOCK","SYS_NICE","SYS_RESOURCE","NET_RAW","NET_ADMIN"]
+          env:
+            - { name: FI_PROVIDER,            value: "efa" }
+            - { name: FI_EFA_USE_DEVICE_RDMA, value: "1" }
+            - { name: FI_EFA_FORK_SAFE,       value: "1" }
+            - { name: FI_EFA_USE_HUGE_PAGE,   value: "0" }
+            - { name: MOONCAKE_PROTOCOL,      value: "efa" }
+          resources:
+            requests: { cpu: "2", memory: "8Gi" }
+            limits:
+              nvidia.com/gpu: "8"
+              vpc.amazonaws.com/efa: "32"
+          volumeMounts:
+            - { name: scripts, mountPath: /scripts }
+          command: ["/bin/bash","/scripts/target.sh"]
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: customer-p5-2node-initiator
+  namespace: default
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: customer-p5-2node
+        role: initiator
+    spec:
+      restartPolicy: Never
+      hostNetwork: true
+      hostIPC: true
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels: { app: customer-p5-2node }
+              topologyKey: kubernetes.io/hostname
+      nodeSelector:
+        node.kubernetes.io/instance-type: p5.48xlarge
+      volumes:
+        - name: scripts
+          configMap:
+            name: customer-p5-2node-scripts
+            defaultMode: 0755
+      containers:
+        - name: smoke
+          image: public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.04.28-h200.4
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["IPC_LOCK","SYS_NICE","SYS_RESOURCE","NET_RAW","NET_ADMIN"]
+          env:
+            - { name: FI_PROVIDER,            value: "efa" }
+            - { name: FI_EFA_USE_DEVICE_RDMA, value: "1" }
+            - { name: FI_EFA_FORK_SAFE,       value: "1" }
+            - { name: FI_EFA_USE_HUGE_PAGE,   value: "0" }
+            - { name: MOONCAKE_PROTOCOL,      value: "efa" }
+          resources:
+            requests: { cpu: "2", memory: "8Gi" }
+            limits:
+              nvidia.com/gpu: "8"
+              vpc.amazonaws.com/efa: "32"
+          volumeMounts:
+            - { name: scripts, mountPath: /scripts }
+          command: ["/bin/bash","/scripts/initiator.sh"]

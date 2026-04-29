@@ -1,0 +1,176 @@
+# =============================================================================
+# GLM-5.1 simple-chat E2E latency bench — reproduce customer "minute-level" report
+#
+# Customer complaint: simple chat prompt takes > 60s end-to-end.
+# To reproduce, send short Chinese/English prompts one-at-a-time (concurrency=1),
+# then a few concurrent, and measure TTFT + full-generation E2E.
+#
+# Applied as a K8s Job. Runs 3 scenarios sequentially:
+#   1) warmup — 2 requests, thrown away
+#   2) single — 10 requests at concurrency=1, short prompt (baseline user chat)
+#   3) burst  — 20 requests at concurrency=4, short prompt
+#
+# Each scenario prints per-request latency + server response headers so we can
+# catch cases where TTFT << E2E (decode is the culprit) vs TTFT ~= E2E (prefill
+# or KV transfer is the culprit). Output goes to stdout + /tmp/bench-*.json.
+#
+# curl-based (not sglang.bench_serving) because:
+#   - bench_serving defaults to random tokens, not real short prompts
+#   - /generate 请求体直接用 sglang 原生格式 (text + sampling_params) 最简洁
+#   - per-request timing with --write-out catches extreme outliers cleanly
+# =============================================================================
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: glm51-bench-latency
+  namespace: yanxi-validation
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: bench
+          image: public.ecr.aws/amazonlinux/amazonlinux:2023
+          env:
+            - { name: LB_URL, value: "http://glm51-lb.yanxi-validation.svc:8000" }
+            - { name: MODEL_NAME, value: "glm-5-fp8-long-pd" }
+          command: ["/bin/bash", "-euxc"]
+          args:
+            - |
+              dnf install -y -q curl jq python3 tar gzip bc
+
+              cat > /tmp/bench.py <<'PY'
+              import json, os, sys, time
+              from concurrent.futures import ThreadPoolExecutor, as_completed
+              import urllib.request, urllib.error
+
+              LB = os.environ["LB_URL"].rstrip("/")
+              MODEL = os.environ["MODEL_NAME"]
+
+              # Short prompts mixing Chinese/English, 10-40 tokens each.
+              # Chosen to mimic "simple user chat" — which is what customer reports slow.
+              PROMPTS = [
+                  "你好，请用一句话介绍你自己。",
+                  "What is 2+2? Answer in one sentence.",
+                  "今天北京的天气怎么样？",
+                  "Give me a one-line summary of the theory of relativity.",
+                  "写一句关于春天的中文诗。",
+                  "List three programming languages.",
+                  "用一句话解释什么是机器学习。",
+                  "What color is the sky at noon?",
+                  "帮我翻译这句话成英文：我爱学习。",
+                  "Name one famous painting by Van Gogh.",
+              ]
+
+              def gen_once(prompt: str, max_new: int = 32, timeout: float = 180.0):
+                  body = {
+                      "text": prompt,
+                      "sampling_params": {
+                          "temperature": 0.0,
+                          "max_new_tokens": max_new,
+                      },
+                  }
+                  data = json.dumps(body).encode("utf-8")
+                  req = urllib.request.Request(
+                      f"{LB}/generate",
+                      data=data,
+                      headers={"Content-Type": "application/json"},
+                      method="POST",
+                  )
+                  t0 = time.perf_counter()
+                  try:
+                      with urllib.request.urlopen(req, timeout=timeout) as resp:
+                          raw = resp.read().decode("utf-8", errors="replace")
+                      t1 = time.perf_counter()
+                      return {
+                          "ok": True,
+                          "e2e_s": t1 - t0,
+                          "resp_bytes": len(raw),
+                          "prompt": prompt[:40],
+                          "resp_head": raw[:200],
+                      }
+                  except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
+                      t1 = time.perf_counter()
+                      return {
+                          "ok": False,
+                          "e2e_s": t1 - t0,
+                          "error": str(e),
+                          "prompt": prompt[:40],
+                      }
+
+              def scenario(name: str, n: int, concurrency: int, max_new: int = 32):
+                  print(f"\n=== scenario={name} n={n} concurrency={concurrency} max_new={max_new} ===", flush=True)
+                  results = []
+                  with ThreadPoolExecutor(max_workers=concurrency) as ex:
+                      futs = [ex.submit(gen_once, PROMPTS[i % len(PROMPTS)], max_new) for i in range(n)]
+                      for i, fut in enumerate(as_completed(futs)):
+                          r = fut.result()
+                          results.append(r)
+                          tag = "OK " if r.get("ok") else "ERR"
+                          print(f"  [{name} {i+1}/{n}] {tag} e2e={r['e2e_s']:.2f}s  prompt={r['prompt']!r}", flush=True)
+                          if not r.get("ok"):
+                              print(f"    error: {r.get('error')}", flush=True)
+                          elif r['e2e_s'] > 10.0:
+                              print(f"    >>> SLOW: {r['e2e_s']:.2f}s  head: {r.get('resp_head','')[:120]!r}", flush=True)
+                  return results
+
+              def summarize(name: str, results: list):
+                  ok = [r for r in results if r.get("ok")]
+                  errs = [r for r in results if not r.get("ok")]
+                  if not ok:
+                      print(f"\n### {name}: 0/{len(results)} succeeded", flush=True)
+                      return
+                  lats = sorted(r["e2e_s"] for r in ok)
+                  n = len(lats)
+                  def pct(p):
+                      i = min(n-1, max(0, int(round(p/100.0*(n-1)))))
+                      return lats[i]
+                  print(f"\n### {name}: {len(ok)}/{len(results)} ok  errs={len(errs)}  (e2e seconds)", flush=True)
+                  print(f"    mean={sum(lats)/n:.2f}  min={lats[0]:.2f}  p50={pct(50):.2f}  p90={pct(90):.2f}  p99={pct(99):.2f}  max={lats[-1]:.2f}", flush=True)
+
+              # 0. server ping
+              print(f"pinging {LB}/v1/models ...", flush=True)
+              for attempt in range(10):
+                  try:
+                      with urllib.request.urlopen(f"{LB}/v1/models", timeout=5) as r:
+                          print(f"  ok: {r.read()[:200]!r}", flush=True)
+                          break
+                  except Exception as e:
+                      print(f"  attempt {attempt+1}: {e}", flush=True)
+                      time.sleep(3)
+              else:
+                  print("server unreachable, aborting", flush=True)
+                  sys.exit(1)
+
+              # 1. warmup
+              scenario("warmup", n=2, concurrency=1, max_new=16)
+
+              # 2. single (customer's "simple question" case)
+              r_single = scenario("single", n=10, concurrency=1, max_new=32)
+              summarize("single", r_single)
+
+              # 3. burst (small concurrent load)
+              r_burst = scenario("burst", n=20, concurrency=4, max_new=32)
+              summarize("burst", r_burst)
+
+              # 4. long-output (to stress decode TPOT)
+              r_long = scenario("long-output", n=4, concurrency=1, max_new=256)
+              summarize("long-output", r_long)
+
+              # Full dump
+              out = {
+                  "single": r_single,
+                  "burst": r_burst,
+                  "long_output": r_long,
+              }
+              with open("/tmp/bench-latency.json", "w") as f:
+                  json.dump(out, f, indent=2, ensure_ascii=False)
+              print("\n=== DONE === /tmp/bench-latency.json written", flush=True)
+              PY
+
+              python3 /tmp/bench.py
+          resources:
+            requests: { cpu: "500m", memory: "512Mi" }
+            limits:   { cpu: "2",    memory: "2Gi" }

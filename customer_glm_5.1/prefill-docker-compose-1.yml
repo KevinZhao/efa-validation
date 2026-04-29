@@ -1,0 +1,94 @@
+version: '3.4'
+
+services:
+
+  ds32-chat-1:
+    image: public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.04.28-h200.2
+
+    privileged: true
+    restart: always
+    pull_policy: always
+    deploy:
+      resources:
+        reservations:
+          devices:
+          - driver: nvidia
+            device_ids: ['0','1','2','3','4','5','6','7']
+            capabilities: [gpu]
+    shm_size: 8192gb
+    ipc: host
+
+
+    environment:
+      - NVIDIA_SPARSE_ENABLE=1
+      - OMP_NUM_THREADS=16
+      - SGLANG_SET_CPU_AFFINITY=1
+      - SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
+      - SGLANG_MOE_PADDING=1
+      - SGLANG_ENABLE_JIT_DEEPGEMM=1
+      - SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS=32
+      - SGLANG_DG_CACHE_DIR=/sglang/deep_gemm
+      - SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD=16384
+      - SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL=10
+      - SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=181
+      - SGLANG_DISAGGREGATION_WAITING_TIMEOUT=179
+      - SGLANG_HEALTH_CHECK_MEM_FREE=50
+
+
+    network_mode: host  # 使用 host 网络模式
+
+    volumes:
+      # 模型挂载
+      - /export/models/zai-org/GLM-5.1-FP8:/models/model
+      - /export/logs:/sglang/logs
+      - /export/sglang/pd_glm5/tp8_pd_prefill/torch-compile:/sglang/torch-compile
+      - /export/sglang/pd_glm5/tp8_pd_prefill/deep_gemm:/sglang/deep_gemm
+
+    entrypoint: python3 -m sglang.launch_server
+
+    command:
+      --model-path /models/model
+      --served-model-name glm-5-fp8-long-pd
+      --watchdog-timeout 3600
+      --enable-metrics
+      --log-level-http debug
+      --log-requests-level 3
+      --collect-tokens-histogram
+      --show-time-cost
+      --disaggregation-mode prefill
+      --disaggregation-ib-device rdmap110s0,rdmap111s0,rdmap112s0,rdmap113s0,rdmap135s0,rdmap136s0,rdmap137s0,rdmap138s0,rdmap160s0,rdmap161s0,rdmap162s0,rdmap163s0,rdmap85s0,rdmap86s0,rdmap87s0,rdmap88s0
+      --host 0.0.0.0
+      --port 30082
+      --trust-remote-code
+      --tp-size 8
+      --pp-size 2
+      --nnodes 2
+      --node-rank 1
+      --dist-init-addr 6.166.120.245:5757
+      --chunked-prefill-size 16384
+      --mem-fraction-static 0.85
+      --max-running-requests 8
+      --context-length 202752
+      --attention-backend nsa
+      --page-size 64
+      --crash-dump-folder /sglang/logs
+      --tool-call-parser glm47
+      --reasoning-parser glm45
+      --tokenizer-worker-num 8
+      --enable-dynamic-batch-tokenizer
+      --dynamic-batch-tokenizer-batch-size 8
+      --enable-nsa-prefill-context-parallel
+      --nsa-prefill-cp-mode round-robin-split
+      --ep-dispatch-algorithm dynamic
+      --eplb-algorithm deepseek
+      --disable-shared-experts-fusion
+      --deepep-mode normal
+      --moe-a2a-backend deepep
+      --dp-size 1
+      --moe-dense-tp-size 1
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "5g"
+        max-file: "3"

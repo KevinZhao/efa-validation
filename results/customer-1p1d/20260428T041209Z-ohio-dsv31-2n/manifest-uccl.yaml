@@ -1,0 +1,525 @@
+# =============================================================================
+# Customer 1P:1D-2N perf comparison — DeepSeek-V3.1 block-FP8 (688 GB)
+# Ohio (us-east-2) on p5en.48xlarge × 3 nodes (H200 x 8 each, 141 GB / GPU).
+#
+# **Why 1P + 1D-spanning-2-nodes**:
+#   The 1P:1D single-node TP=8 bench (results/.../20260428T000232Z-ohio-dsv31/)
+#   showed UCCL-EP's MoE alltoall never gets invoked — both variants took the
+#   DeepEP intranode NVLink path. To exercise UCCL-EP, a role must do
+#   cross-node expert parallelism. This layout:
+#     - Prefill: 1 node, TP=8, EP=8  (intranode NVLink MoE alltoall; UCCL-EP NOT invoked)
+#     - Decode:  2 nodes, TP=8 DP=2 EP=16 --enable-dp-attention (cross-node MoE
+#                alltoall over EFA → internode_ll path → **UCCL-EP IS invoked**)
+#   So A/B delta in TPOT/ITL is attributable to UCCL-EP vs DeepEP-over-IB on EFA.
+#   This matches customer GLM5 production spec D:TP16/EP16/DPattn16 at smaller scale.
+#
+# Why DS-V3.1 (not GLM-4.6):
+#   - GLM-4.6 BF16 + deepep hits sglang 0.5.10 forward_deepgemm_{contiguous,masked}
+#     assert — upstream broken (see feedback_sglang_0_5_10_uccl_ep_bf16_moe_broken).
+#   - DS-V3.1 is block-FP8 → Fp8Config → ep_moe/layer.py deprecate_flag=True
+#     → super().run_moe_core → Fp8MoEMethod.apply → works.
+#   - top_k=8 ≤ UCCL kNumMaxTopK=9.
+#   - 688 GB × 3 nodes prefetch via S3 → NVMe.
+#
+# Two variants (uccl vs nccl) share this manifest; flip via deepep.
+# Image: sglang-mooncake-{uccl,nccl}:2026.04.28-h200.2.
+#
+# Topology detail:
+#   Prefill pod       — 1x p5en, TP=8 EP=8 single-node
+#   Decode StatefulSet — 2x p5en, c1p1d-decode-{0,1}; node-rank 0/1; dist-init
+#                        via c1p1d-decode-headless Service DNS
+#   Router pod        — CPU-only, MiniLB
+#   KV transport      — Mooncake over EFA
+#   MoE alltoall P    — intranode NVLink (UCCL-EP NOT invoked for prefill)
+#   MoE alltoall D    — internode over EFA (UCCL-EP INVOKED via deep_ep → internode_ll)
+#     * uccl variant: --moe-a2a-backend deepep → UCCL-EP on decode cross-node
+#     * nccl variant: --moe-a2a-backend none   → NCCL fake-a2a on decode cross-node
+#
+# Weight loading — S3 → node-local NVMe via initContainer (s5cmd, ~688 GB):
+#   initContainer runs on same node as the server container; it's idempotent
+#   (checks sentinel .s3-prefetch-done on /mnt/nvme before downloading).
+#   Server container reads from /models/<model> which maps to /mnt/nvme/models/<model>.
+#   688 GB at ~3 GB/s s5cmd → ~4 min first fetch per node; sentinel skip after.
+#
+# Node prereqs (both nodes):
+#   - p5en.48xlarge with /mnt/nvme LVM-striped (manual setup 2026-04-27:
+#     lvcreate --stripes 7 vg_local/lv_scratch on 7 raw NVMe → /mnt/nvme = 25 TB)
+#   - EFA 16 NICs visible
+#   - IAM role lets s5cmd read s3://yanxi-validation-788668107894-ohio/models/
+# =============================================================================
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: customer-1p1d-launcher
+  namespace: yanxi-validation
+data:
+  prefetch.sh: |
+    #!/usr/bin/env bash
+    set -eux
+    MODEL_ID="${MODEL_ID:?need MODEL_ID}"         # e.g. deepseek-ai/DeepSeek-V3.1
+    S3_BUCKET="${S3_BUCKET:?need S3_BUCKET}"      # yanxi-validation-788668107894-ohio
+    DST=/host-nvme/models/${MODEL_ID}
+    SENTINEL="$DST/.s3-prefetch-done"
+
+    if [ -f "$SENTINEL" ]; then
+      echo "[prefetch] sentinel exists, skip: $DST"
+      du -sh "$DST" 2>/dev/null || true
+      exit 0
+    fi
+
+    # Install s5cmd (amazonlinux 2023 has amazon-ssm-agent; s5cmd is separate)
+    command -v s5cmd >/dev/null 2>&1 || {
+      echo "[prefetch] installing s5cmd"
+      curl -sL https://github.com/peak/s5cmd/releases/download/v2.2.2/s5cmd_2.2.2_Linux-64bit.tar.gz \
+        | tar -xz -C /usr/local/bin s5cmd
+    }
+
+    mkdir -p "$DST"
+    echo "[prefetch] s5cmd cp s3://${S3_BUCKET}/models/${MODEL_ID}/ -> ${DST}"
+    time s5cmd cp --concurrency 64 \
+      "s3://${S3_BUCKET}/models/${MODEL_ID}/*" "${DST}/"
+    touch "$SENTINEL"
+    echo "[prefetch] done"
+    du -sh "$DST"
+
+  sglang-launcher.sh: |
+    #!/usr/bin/env bash
+    set -eu
+    ROLE="${ROLE:?need ROLE=prefill|decode|lb}"
+
+    # torch/lib on LD_LIBRARY_PATH for libc10.so resolution (all roles need this)
+    TORCH_LIB=$(python3 -c 'import torch, os; print(os.path.join(os.path.dirname(torch.__file__), "lib"))' 2>/dev/null || echo "")
+    [ -n "${TORCH_LIB}" ] && export LD_LIBRARY_PATH="${TORCH_LIB}:${LD_LIBRARY_PATH:-}"
+    export FI_PROVIDER="${FI_PROVIDER:-efa}"
+    export FI_EFA_USE_DEVICE_RDMA=1
+    export FI_EFA_FORK_SAFE=1
+
+    case "${ROLE}" in
+      prefill|decode)
+        # === Runtime hotfix #2 (2026-04-27 bench; retained for compat) ===
+        # customer image 2026.04.28-h200.1 still missing `ninja` binary in PATH
+        # (Triton JIT fallback needs it). Python wheel installs binary to
+        # /usr/local/bin/ninja but runtime stage only copied dist-packages.
+        # For next rebuild: add `pip install ninja` to runtime apt section OR
+        # explicit `COPY --from=builder /usr/local/bin/ninja /usr/local/bin/ninja`.
+        # apt ninja-build puts binary at /usr/bin/ninja — visible to all subprocesses
+        # (pip install ninja ends up in /usr/local/bin but some tvm_ffi subprocess
+        # lookups via LookupError don't see it).
+        if ! command -v ninja >/dev/null 2>&1 || ! [ -x /usr/bin/ninja ]; then
+          echo "[launcher] installing ninja-build (runtime hotfix, will fix in h200.2)"
+          DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>&1 | tail -2 || true
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ninja-build 2>&1 | tail -2 || true
+          command -v ninja && ninja --version
+        fi
+
+        # These vars only required for server roles; lb has no MODEL_PATH.
+        MODEL_PATH="${MODEL_PATH:?need MODEL_PATH}"
+        TP="${TP:-8}"
+        DP_SIZE="${DP_SIZE:-1}"
+        EP_SIZE="${EP_SIZE:-${TP}}"           # default: EP==TP (single node)
+        NNODES="${NNODES:-1}"
+        NODE_RANK="${NODE_RANK:-0}"
+        DIST_INIT_ADDR="${DIST_INIT_ADDR:-}"  # required when NNODES>1
+        ENABLE_DP_ATTENTION="${ENABLE_DP_ATTENTION:-0}"
+        PORT="${PORT:-30000}"
+        BOOTSTRAP_PORT="${BOOTSTRAP_PORT:-8998}"
+        CTX_LEN="${CONTEXT_LEN:-131072}"
+        MEM_FRAC="${MEM_FRAC_STATIC:-0.85}"
+        CHUNKED="${CHUNKED_PREFILL:-4096}"
+        KV_BACKEND="${KV_TRANSPORT_BACKEND:-mooncake}"
+        MOE_A2A="${MOE_A2A_BACKEND:-none}"
+
+        # Multi-node decode: resolve DIST_INIT_ADDR from headless service if
+        # POD_NAME is set. StatefulSet pod-0 is the dist-init leader.
+        # Example: c1p1d-decode-0.c1p1d-decode-headless.yanxi-validation.svc:10010
+        # NB: we use the StatefulSet-prefixed pod name (c1p1d-decode-0), not ${ROLE}-0.
+        if [ "${NNODES}" -gt 1 ] && [ -z "${DIST_INIT_ADDR}" ] && [ -n "${DIST_INIT_SVC:-}" ] && [ -n "${POD_NAME:-}" ]; then
+          # POD_NAME = c1p1d-decode-{0,1}; strip the numeric suffix → c1p1d-decode
+          SS_PREFIX="${POD_NAME%-*}"
+          DIST_INIT_ADDR="${SS_PREFIX}-0.${DIST_INIT_SVC}.${POD_NAMESPACE:-yanxi-validation}.svc:${DIST_INIT_PORT:-10010}"
+          echo "[launcher] computed DIST_INIT_ADDR=${DIST_INIT_ADDR}"
+        fi
+
+        # Derive NODE_RANK from StatefulSet pod name suffix (e.g. c1p1d-decode-0 → 0).
+        if [ "${NNODES}" -gt 1 ] && [ -z "${NODE_RANK_OVERRIDE:-}" ] && [ -n "${POD_NAME:-}" ]; then
+          NODE_RANK="${POD_NAME##*-}"
+          echo "[launcher] derived NODE_RANK=${NODE_RANK} from POD_NAME=${POD_NAME}"
+        fi
+
+        IB_DEVICE="${IB_DEVICE:-}"
+        if [ -z "${IB_DEVICE}" ] && command -v fi_info >/dev/null 2>&1; then
+          IB_DEVICE=$(fi_info -p efa 2>/dev/null | awk '/domain:/ {print $2}' | sed 's/-rdm$//;s/-dgrm$//' | sort -u | paste -sd, -)
+        fi
+        [ -n "${IB_DEVICE}" ] && echo "[launcher] IB_DEVICE=${IB_DEVICE}"
+
+        # SGLang 0.5.10 hardcodes mooncake protocol="rdma"; flip to "efa" for EFA path.
+        MC_PY=/usr/local/lib/python3.10/dist-packages/sglang/srt/distributed/device_communicators/mooncake_transfer_engine.py
+        if [ -f "${MC_PY}" ] && grep -q '"rdma",' "${MC_PY}"; then
+          echo "[launcher] patching ${MC_PY}: rdma -> efa"
+          sed -i 's/"rdma",$/"efa",/' "${MC_PY}"
+          rm -f /usr/local/lib/python3.10/dist-packages/sglang/srt/distributed/device_communicators/__pycache__/mooncake_transfer_engine.cpython-310.pyc 2>/dev/null || true
+        fi
+
+        # DS-V3.1 是 block-FP8，ep_moe/layer.py:109-112 的 deprecate_flag=True
+        # 路径能正常工作（super().run_moe_core → Fp8MoEMethod.apply），不需要
+        # disable-cuda-graph。跟 BF16+deepep 场景不一样。
+        # 参见 feedback_sglang_0_5_10_uccl_ep_bf16_moe_broken memory。
+        DISABLE_CG_ARGS=()
+
+        # --watchdog-timeout 1800: 默认 300s，但 DS-V3.1 FP8 首次启动要跑
+        # DeepGEMM JIT Pre-Compile 16384 kernels（实测 12-15 min）。如果此间有
+        # bench 请求到达 scheduler，scheduler 会阻塞等 kernel 就绪，超过 300s
+        # 默认 watchdog 就 SIGQUIT 自杀，crashloop。设 30 min 让首次 warmup 过去。
+        # sglang.compile_deep_gemm 预编译也可以绕过（cookbook 推荐），但那要换
+        # entrypoint，现场改不便。
+        WATCHDOG_TIMEOUT="${WATCHDOG_TIMEOUT:-1800}"
+
+        COMMON_ARGS=(
+          --model-path "${MODEL_PATH}"
+          --tp "${TP}"
+          --host 0.0.0.0 --port "${PORT}"
+          --trust-remote-code
+          --context-length "${CTX_LEN}"
+          --mem-fraction-static "${MEM_FRAC}"
+          --chunked-prefill-size "${CHUNKED}"
+          --attention-backend fa3
+          --moe-a2a-backend "${MOE_A2A}"
+          --watchdog-timeout "${WATCHDOG_TIMEOUT}"
+          "${DISABLE_CG_ARGS[@]}"
+        )
+        # 不加 --skip-server-warmup: DS-V3.1 FP8 需要 DeepGEMM JIT Pre-Compile
+        # 16384 kernels; skip-warmup 下 JIT 推迟到第一个 forward，scheduler 阻塞
+        # 超 300s watchdog → SIGQUIT crashloop。加上 server warmup 让 sglang 启动
+        # 时一次把 kernel 编译掉（~12-15 min per restart），之后 forward 就快了。
+
+        # Multi-node: --tp TOTAL (not per-node), --nnodes, --node-rank, --dist-init-addr.
+        # When NNODES>1 with moe_a2a_backend=deepep, sglang auto-forces
+        # ep_size=tp_size (no need to pass --ep-size). The tp=16 / nnodes=2 combo
+        # gives 8 GPUs/node TP + EP=16 spanning both nodes over EFA. This is the
+        # path that invokes UCCL-EP's internode_ll kernel.
+        DIST_ARGS=()
+        if [ "${NNODES}" -gt 1 ]; then
+          : "${DIST_INIT_ADDR:?need DIST_INIT_ADDR when NNODES>1}"
+          DIST_ARGS+=(--nnodes "${NNODES}" --node-rank "${NODE_RANK}" --dist-init-addr "${DIST_INIT_ADDR}")
+        fi
+
+        DISAGG_EXTRA=()
+        [ -n "${IB_DEVICE}" ] && DISAGG_EXTRA+=(--disaggregation-ib-device "${IB_DEVICE}")
+        exec python3 -m sglang.launch_server \
+          "${COMMON_ARGS[@]}" \
+          "${DIST_ARGS[@]}" \
+          --disaggregation-mode "${ROLE}" \
+          --disaggregation-transfer-backend "${KV_BACKEND}" \
+          --disaggregation-bootstrap-port "${BOOTSTRAP_PORT}" \
+          "${DISAGG_EXTRA[@]}"
+        ;;
+      lb)
+        : "${PREFILL_URL:?need PREFILL_URL}"
+        : "${DECODE_URL:?need DECODE_URL}"
+        LB_PORT="${LB_PORT:-8000}"
+        if ! python3 -c "import sglang_router" 2>/dev/null; then
+          pip install --no-cache-dir "sglang-router==0.3.2" || exit 3
+        fi
+        PREFILL_ARGS=()
+        for u in ${PREFILL_URL//,/ }; do PREFILL_ARGS+=(--prefill "${u}"); done
+        DECODE_ARGS=()
+        for u in ${DECODE_URL//,/ }; do DECODE_ARGS+=(--decode "${u}"); done
+        # --mini-lb: sglang_router 0.3.2 的 full 模式会先跑 detect_connection_mode
+        # 探测 prefill 的 /health。sglang 0.5.10 在 --disaggregation-mode prefill
+        # 下 /health 会 block（内部做 generate canary 但 prefill 独立无法 generate，
+        # 要 decode pair）。decode 侧 /health 正常。结果 router 无限 retry prefill
+        # detect，LB 一直 503 "No prefill workers available"。
+        # mini-lb 模式跳过 detect workflow，直接信任配置的 URL，轮询转发 /generate。
+        # 对单 prefill+单 decode 足够，不需要 full router 的动态发现 & 复杂 policy。
+        exec python3 -m sglang_router.launch_router \
+          --pd-disaggregation \
+          --mini-lb \
+          --disable-health-check \
+          "${PREFILL_ARGS[@]}" "${DECODE_ARGS[@]}" \
+          --host 0.0.0.0 --port "${LB_PORT}"
+        ;;
+      *) echo "unknown ROLE=${ROLE}"; exit 2 ;;
+    esac
+
+---
+# ==== Services ====
+apiVersion: v1
+kind: Service
+metadata: { name: c1p1d-prefill, namespace: yanxi-validation }
+spec:
+  selector: { app: c1p1d, role: prefill }
+  ports:
+    - { name: http, port: 30000, targetPort: 30000 }
+    - { name: bootstrap, port: 8998, targetPort: 8998 }
+---
+# ClusterIP decode service: decode-0 exposes the bench/bootstrap endpoints that
+# the router and prefill talk to. The router sees only one decode URL (decode-0)
+# — decode-1 participates via sglang dist init, not via HTTP. See GLM5 spec.
+apiVersion: v1
+kind: Service
+metadata: { name: c1p1d-decode, namespace: yanxi-validation }
+spec:
+  selector:
+    app: c1p1d
+    role: decode
+    statefulset.kubernetes.io/pod-name: c1p1d-decode-0
+  ports:
+    - { name: http, port: 30000, targetPort: 30000 }
+    - { name: bootstrap, port: 8998, targetPort: 8998 }
+---
+# Headless service: required by StatefulSet for stable per-pod DNS.
+# c1p1d-decode-0 and c1p1d-decode-1 get DNS names
+#   <pod>.c1p1d-decode-headless.yanxi-validation.svc
+# sglang's --dist-init-addr uses decode-0 on port 10010 for tcp bootstrap.
+apiVersion: v1
+kind: Service
+metadata: { name: c1p1d-decode-headless, namespace: yanxi-validation }
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: { app: c1p1d, role: decode }
+  ports:
+    - { name: distinit, port: 10010, targetPort: 10010 }
+    - { name: http, port: 30000, targetPort: 30000 }
+    - { name: bootstrap, port: 8998, targetPort: 8998 }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: c1p1d-lb, namespace: yanxi-validation }
+spec:
+  selector: { app: c1p1d-lb }
+  ports:
+    - { name: http, port: 8000, targetPort: 8000 }
+
+---
+# ==== Prefill pod ====
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: c1p1d-prefill
+  namespace: yanxi-validation
+  labels: { app: c1p1d, role: prefill }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: c1p1d, role: prefill } }
+  template:
+    metadata:
+      labels: { app: c1p1d, role: prefill }
+    spec:
+      tolerations:
+        - { key: nvidia.com/gpu, operator: Equal, value: "true", effect: NoSchedule }
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - { key: node.kubernetes.io/instance-type, operator: In, values: [p5en.48xlarge] }
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector: { matchLabels: { app: c1p1d } }
+              topologyKey: kubernetes.io/hostname
+      initContainers:
+        - name: s3-prefetch
+          image: public.ecr.aws/amazonlinux/amazonlinux:2023
+          # amazonlinux:2023 has curl-minimal preinstalled (conflicts with full curl).
+          # s5cmd tarball only needs: curl (curl-minimal OK), tar, gzip.
+          command: ["/bin/bash","-lc","dnf install -y -q tar gzip; command -v curl && command -v tar && command -v gzip; exec /scripts/prefetch.sh"]
+          env:
+            - { name: MODEL_ID, value: "deepseek-ai/DeepSeek-V3.1" }
+            - { name: S3_BUCKET, value: "yanxi-validation-788668107894-ohio" }
+          volumeMounts:
+            - { name: local-nvme, mountPath: /host-nvme }
+            - { name: scripts, mountPath: /scripts }
+          resources:
+            requests: { cpu: "4", memory: "8Gi" }
+            limits:   { cpu: "16", memory: "64Gi" }   # was 32Gi; s5cmd OOM'd on first prefetch
+      containers:
+        - name: server
+          image: public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.04.28-h200.2
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: ROLE, value: "prefill" }
+            - { name: MODEL_PATH, value: "/models/deepseek-ai/DeepSeek-V3.1" }
+            - { name: TP, value: "8" }
+            - { name: CONTEXT_LEN, value: "32768" }
+            - { name: MEM_FRAC_STATIC, value: "0.85" }
+            - { name: CHUNKED_PREFILL, value: "4096" }
+            - { name: KV_TRANSPORT_BACKEND, value: "mooncake" }
+            # Prefill: FORCE moe-a2a-backend=none regardless of variant. Prefill
+            # runs DeepEP `normal` mode which does CPU-side per-batch handshake
+            # (runtime.intranode_prepare). sglang 0.5.10 PD-disagg warmup can't
+            # synchronize the 8 TP ranks' CPU handshake in time → CPU recv timeout
+            # → SIGQUIT crashloop. UCCL's deep_ep_wrapper doesn't substitute the
+            # intranode path (UCCL only replaces internode_ll over EFA), so this
+            # bug hits UCCL and DeepEP images identically.
+            # UCCL-EP's value is exclusively on decode's internode_ll path, so
+            # forcing prefill=none doesn't invalidate the A/B comparison.
+            - { name: MOE_A2A_BACKEND, value: "none" }
+            # Prefill: single-node TP=8 EP=8, no DP attention, no multi-node.
+          command: ["/bin/bash", "-lc"]
+          args: ["exec /scripts/sglang-launcher.sh"]
+          readinessProbe:
+            httpGet: { path: /get_model_info, port: 30000 }
+            initialDelaySeconds: 180
+            periodSeconds: 10
+            failureThreshold: 120
+          ports:
+            - { containerPort: 30000, name: http }
+            - { containerPort: 8998, name: bootstrap }
+          securityContext: { capabilities: { add: [IPC_LOCK] } }
+          resources:
+            limits:   { nvidia.com/gpu: 8, vpc.amazonaws.com/efa: 16, hugepages-2Mi: 5120Mi, memory: 500Gi }
+            requests: { nvidia.com/gpu: 8, vpc.amazonaws.com/efa: 16, hugepages-2Mi: 5120Mi, memory: 500Gi }
+          volumeMounts:
+            - { name: local-nvme, mountPath: /models, subPath: models }
+            - { name: shm, mountPath: /dev/shm }
+            - { name: scripts, mountPath: /scripts }
+      volumes:
+        - name: local-nvme
+          # Ohio p5en: NVMe manually LVM-striped 2026-04-27 → /mnt/nvme (25 TB xfs)
+          # (7 raw NVMe striped via lvcreate --stripes 7 --stripesize 256)
+          hostPath: { path: /mnt/nvme, type: Directory }
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 64Gi }
+        - name: scripts
+          configMap: { name: customer-1p1d-launcher, defaultMode: 0755 }
+
+---
+# ==== Decode StatefulSet — 2 pods across 2 nodes (TP=8, DP=2, EP=16) ====
+# StatefulSet gives stable pod ordinals (0, 1) for NODE_RANK derivation and
+# stable DNS via the headless service. sglang --dist-init-addr targets
+# c1p1d-decode-0.c1p1d-decode-headless:10010 on TCP.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: c1p1d-decode
+  namespace: yanxi-validation
+  labels: { app: c1p1d, role: decode }
+spec:
+  serviceName: c1p1d-decode-headless
+  replicas: 2
+  podManagementPolicy: Parallel   # both pods start concurrently, not serially
+  selector: { matchLabels: { app: c1p1d, role: decode } }
+  template:
+    metadata:
+      labels: { app: c1p1d, role: decode }
+    spec:
+      tolerations:
+        - { key: nvidia.com/gpu, operator: Equal, value: "true", effect: NoSchedule }
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - { key: node.kubernetes.io/instance-type, operator: In, values: [p5en.48xlarge] }
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector: { matchLabels: { app: c1p1d } }
+              topologyKey: kubernetes.io/hostname
+      initContainers:
+        - name: s3-prefetch
+          image: public.ecr.aws/amazonlinux/amazonlinux:2023
+          command: ["/bin/bash","-lc","dnf install -y -q tar gzip; command -v curl && command -v tar && command -v gzip; exec /scripts/prefetch.sh"]
+          env:
+            - { name: MODEL_ID, value: "deepseek-ai/DeepSeek-V3.1" }
+            - { name: S3_BUCKET, value: "yanxi-validation-788668107894-ohio" }
+          volumeMounts:
+            - { name: local-nvme, mountPath: /host-nvme }
+            - { name: scripts, mountPath: /scripts }
+          resources:
+            requests: { cpu: "4", memory: "8Gi" }
+            limits:   { cpu: "16", memory: "64Gi" }   # was 32Gi; s5cmd OOM'd on first prefetch
+      containers:
+        - name: server
+          image: public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.04.28-h200.2
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: ROLE, value: "decode" }
+            - { name: MODEL_PATH, value: "/models/deepseek-ai/DeepSeek-V3.1" }
+            # sglang convention: --tp is TOTAL tp size across nnodes.
+            # tp_size=16 + nnodes=2 → 8 GPU per node, 16 total ranks,
+            # each rank is one EP expert owner (deepep forces ep_size=tp_size).
+            # MoE alltoall now spans 2 nodes → cross-node EFA → UCCL-EP.
+            - { name: TP, value: "16" }
+            - { name: NNODES, value: "2" }
+            - { name: DIST_INIT_SVC, value: "c1p1d-decode-headless" }
+            - { name: DIST_INIT_PORT, value: "10010" }
+            - { name: POD_NAME, valueFrom: { fieldRef: { fieldPath: metadata.name } } }
+            - { name: POD_NAMESPACE, valueFrom: { fieldRef: { fieldPath: metadata.namespace } } }
+            - { name: CONTEXT_LEN, value: "32768" }
+            - { name: MEM_FRAC_STATIC, value: "0.85" }
+            - { name: CHUNKED_PREFILL, value: "4096" }
+            - { name: KV_TRANSPORT_BACKEND, value: "mooncake" }
+            - { name: MOE_A2A_BACKEND, value: "deepep" }
+          command: ["/bin/bash", "-lc"]
+          args: ["exec /scripts/sglang-launcher.sh"]
+          # tcpSocket instead of httpGet: node-rank != 0 only runs a dummy health
+          # server that responds on /health, not /get_model_info. TCP connectivity
+          # on :30000 is sufficient to mark both leader (serves real HTTP) and
+          # follower (dummy) pods as ready.
+          readinessProbe:
+            tcpSocket: { port: 30000 }
+            initialDelaySeconds: 180
+            periodSeconds: 10
+            failureThreshold: 240    # 40 min, DeepGEMM 16-rank warmup slower than single-node
+          ports:
+            - { containerPort: 30000, name: http }
+            - { containerPort: 8998, name: bootstrap }
+            - { containerPort: 10010, name: distinit }
+          securityContext: { capabilities: { add: [IPC_LOCK] } }
+          resources:
+            limits:   { nvidia.com/gpu: 8, vpc.amazonaws.com/efa: 16, hugepages-2Mi: 5120Mi, memory: 500Gi }
+            requests: { nvidia.com/gpu: 8, vpc.amazonaws.com/efa: 16, hugepages-2Mi: 5120Mi, memory: 500Gi }
+          volumeMounts:
+            - { name: local-nvme, mountPath: /models, subPath: models }
+            - { name: shm, mountPath: /dev/shm }
+            - { name: scripts, mountPath: /scripts }
+      volumes:
+        - name: local-nvme
+          hostPath: { path: /mnt/nvme, type: Directory }
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 64Gi }
+        - name: scripts
+          configMap: { name: customer-1p1d-launcher, defaultMode: 0755 }
+
+---
+# ==== Router (load balancer) ====
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: c1p1d-lb
+  namespace: yanxi-validation
+  labels: { app: c1p1d-lb }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: c1p1d-lb } }
+  template:
+    metadata:
+      labels: { app: c1p1d-lb }
+    spec:
+      tolerations:
+        - { key: nvidia.com/gpu, operator: Equal, value: "true", effect: NoSchedule }
+      containers:
+        - name: lb
+          image: public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.04.28-h200.2
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: ROLE, value: "lb" }
+            - { name: PREFILL_URL, value: "http://c1p1d-prefill.yanxi-validation.svc:30000" }
+            - { name: DECODE_URL,  value: "http://c1p1d-decode.yanxi-validation.svc:30000" }
+          command: ["/bin/bash", "-lc"]
+          args: ["exec /scripts/sglang-launcher.sh"]
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 30
+          ports:
+            - { containerPort: 8000, name: http }
+          volumeMounts:
+            - { name: scripts, mountPath: /scripts }
+      volumes:
+        - name: scripts
+          configMap: { name: customer-1p1d-launcher, defaultMode: 0755 }

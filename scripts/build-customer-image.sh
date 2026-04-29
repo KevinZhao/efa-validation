@@ -35,6 +35,11 @@ DATE="${1:-$(date -u +%Y.%m.%d)}"
 ARCH="${2:-h200}"
 VARIANT="${3:-uccl}"
 
+# Optional hotfix suffix: when set (e.g. TAG_SUFFIX=.3), primary tag becomes
+# "<DATE>-<ARCH><SUFFIX>" (e.g. 2026.04.28-h200.3) and monthly/latest moving
+# tags are NOT overwritten (hotfixes must not promote themselves without soak).
+TAG_SUFFIX="${TAG_SUFFIX:-}"
+
 case "${VARIANT}" in
   uccl) WITH_UCCL=true  ; IMAGE_NAME="sglang-mooncake-uccl" ;;
   nccl) WITH_UCCL=false ; IMAGE_NAME="sglang-mooncake-nccl" ;;
@@ -52,9 +57,16 @@ DRY_RUN="${DRY_RUN:-0}"
 VCS_REF=$(cd "${REPO_ROOT}" && git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-TAG_PRIMARY="${DATE}-${ARCH}"
+TAG_PRIMARY="${DATE}-${ARCH}${TAG_SUFFIX}"
 TAG_MONTHLY="$(echo "${DATE}" | cut -c1-7)-${ARCH}"   # 2026.04-h200
 TAG_LATEST="latest"
+
+# Hotfix mode: only primary tag is pushed / tagged. Protect monthly / latest
+# from being overwritten until soak promotes them via promote-customer-image.sh.
+HOTFIX_MODE=0
+if [ -n "${TAG_SUFFIX}" ]; then
+  HOTFIX_MODE=1
+fi
 
 # Private ECR tag for internal soak (pushed in parallel to public)
 PRIVATE_REG="${ECR_REG}"
@@ -130,22 +142,32 @@ BUILD_CMD="${BUILD_CMD} --build-arg WITH_UCCL=${WITH_UCCL}"
 BUILD_CMD="${BUILD_CMD} --build-arg VARIANT=${VARIANT}"
 BUILD_CMD="${BUILD_CMD} -t ${PRIVATE_IMAGE} ."
 
-TAG_CMD="docker tag ${PRIVATE_IMAGE} ${PRIVATE_REG}/yanxi/${IMAGE_NAME}:${TAG_MONTHLY}"
-TAG_CMD="${TAG_CMD} && docker tag ${PRIVATE_IMAGE} ${PRIVATE_REG}/yanxi/${IMAGE_NAME}:${TAG_LATEST}"
-
-PUSH_CMD="docker push ${PRIVATE_IMAGE}"
-PUSH_CMD="${PUSH_CMD} && docker push ${PRIVATE_REG}/yanxi/${IMAGE_NAME}:${TAG_MONTHLY}"
-PUSH_CMD="${PUSH_CMD} && docker push ${PRIVATE_REG}/yanxi/${IMAGE_NAME}:${TAG_LATEST}"
+if [ "${HOTFIX_MODE}" = "1" ]; then
+  # Hotfix: only primary tag. Do not touch monthly/latest — promotion is manual.
+  # NOTE: INNER is wrapped in single-quotes by the outer bash -c, so the
+  # TAG_CMD must NOT contain single-quotes (they'd terminate the wrapper
+  # and break the entire && chain). Use no-op true instead of echo.
+  TAG_CMD="true"
+  PUSH_CMD="docker push ${PRIVATE_IMAGE}"
+else
+  TAG_CMD="docker tag ${PRIVATE_IMAGE} ${PRIVATE_REG}/yanxi/${IMAGE_NAME}:${TAG_MONTHLY}"
+  TAG_CMD="${TAG_CMD} && docker tag ${PRIVATE_IMAGE} ${PRIVATE_REG}/yanxi/${IMAGE_NAME}:${TAG_LATEST}"
+  PUSH_CMD="docker push ${PRIVATE_IMAGE}"
+  PUSH_CMD="${PUSH_CMD} && docker push ${PRIVATE_REG}/yanxi/${IMAGE_NAME}:${TAG_MONTHLY}"
+  PUSH_CMD="${PUSH_CMD} && docker push ${PRIVATE_REG}/yanxi/${IMAGE_NAME}:${TAG_LATEST}"
+fi
 
 PUBLIC_CMD=""
 if [ "${PUBLISH}" = "1" ]; then
   PUBLIC_CMD=" && aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws"
   PUBLIC_CMD="${PUBLIC_CMD} && docker tag ${PRIVATE_IMAGE} ${PUBLIC_IMAGE}:${TAG_PRIMARY}"
-  PUBLIC_CMD="${PUBLIC_CMD} && docker tag ${PRIVATE_IMAGE} ${PUBLIC_IMAGE}:${TAG_MONTHLY}"
-  PUBLIC_CMD="${PUBLIC_CMD} && docker tag ${PRIVATE_IMAGE} ${PUBLIC_IMAGE}:${TAG_LATEST}"
   PUBLIC_CMD="${PUBLIC_CMD} && docker push ${PUBLIC_IMAGE}:${TAG_PRIMARY}"
-  PUBLIC_CMD="${PUBLIC_CMD} && docker push ${PUBLIC_IMAGE}:${TAG_MONTHLY}"
-  PUBLIC_CMD="${PUBLIC_CMD} && docker push ${PUBLIC_IMAGE}:${TAG_LATEST}"
+  if [ "${HOTFIX_MODE}" != "1" ]; then
+    PUBLIC_CMD="${PUBLIC_CMD} && docker tag ${PRIVATE_IMAGE} ${PUBLIC_IMAGE}:${TAG_MONTHLY}"
+    PUBLIC_CMD="${PUBLIC_CMD} && docker tag ${PRIVATE_IMAGE} ${PUBLIC_IMAGE}:${TAG_LATEST}"
+    PUBLIC_CMD="${PUBLIC_CMD} && docker push ${PUBLIC_IMAGE}:${TAG_MONTHLY}"
+    PUBLIC_CMD="${PUBLIC_CMD} && docker push ${PUBLIC_IMAGE}:${TAG_LATEST}"
+  fi
 fi
 
 INNER="${BUILD_CMD} && ${TAG_CMD} && ${PUSH_CMD}${PUBLIC_CMD} && echo BUILD_DONE"

@@ -1,0 +1,97 @@
+version: '3.4'
+
+services:
+
+  ds32-chat-1:
+    image: public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.04.28-h200.2
+
+    privileged: true
+    restart: always
+    pull_policy: always
+    deploy:
+      resources:
+        reservations:
+          devices:
+          - driver: nvidia
+            device_ids: ['0','1','2','3','4','5','6','7']
+            capabilities: [gpu]
+    shm_size: 8192gb
+    ipc: host
+
+
+    environment:
+      - NVIDIA_SPARSE_ENABLE=1
+      - MC_TE_METRIC=true
+      - MC_LOG_LEVEL=ERROR
+      - MC_LOG_DIR=/sglang/logs
+      - SGLANG_SET_CPU_AFFINITY=1
+      - SGLANG_ENABLE_JIT_DEEPGEMM=1
+      - SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS=32
+      - SGLANG_DG_CACHE_DIR=/sglang/deep_gemm
+      - PYTHONUNBUFFERED=1
+      - SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL=10
+      - SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=300
+      - SGLANG_DISAGGREGATION_WAITING_TIMEOUT=300
+
+    network_mode: host  # 使用 host 网络模式
+
+    volumes:
+      # 模型挂载
+      - /export/models/zai-org/GLM-5.1-FP8:/models/model
+      - /export/logs:/sglang/logs
+      - /export/sglang/pd_glm5/dp8_pd_prefill/torch-compile:/sglang/torch-compile
+      - /export/sglang/pd_glm5/dp8_pd_prefill/deep_gemm:/sglang/deep_gemm
+
+    entrypoint: python3 -m sglang.launch_server
+
+    command:
+      --model-path /models/model
+      --served-model-name glm-5-fp8-long-pd
+      --enable-metrics
+      --log-level-http debug
+      --log-requests-level 3
+      --watchdog-timeout 1200
+      --decode-log-interval 50
+      --collect-tokens-histogram
+      --show-time-cost
+      --disaggregation-mode decode
+      --disaggregation-ib-device rdmap110s0,rdmap111s0,rdmap112s0,rdmap113s0,rdmap135s0,rdmap136s0,rdmap137s0,rdmap138s0,rdmap160s0,rdmap161s0,rdmap162s0,rdmap163s0,rdmap85s0,rdmap86s0,rdmap87s0,rdmap88s0
+      --host 0.0.0.0
+      --port 30081
+      --trust-remote-code
+      --tp-size 16
+      --dp-size 16
+      --nnodes 2
+      --node-rank 0
+      --dist-init-addr 6.166.123.15:5757
+      --enable-dp-attention
+      --moe-dense-tp-size 1
+      --enable-dp-lm-head
+      --ep-dispatch-algorithm dynamic
+      --eplb-algorithm deepseek
+      --disable-shared-experts-fusion
+      --deepep-mode low_latency
+      --mem-fraction-static 0.74
+      --cuda-graph-max-bs 16
+      --max-running-requests 256
+      --context-length 202752
+      --moe-a2a-backend deepep
+      --prefill-round-robin-balance
+      --tokenizer-worker-num 8
+      --enable-dynamic-batch-tokenizer
+      --dynamic-batch-tokenizer-batch-size 8
+      --attention-backend nsa
+      --page-size 64
+      --speculative-algorithm EAGLE
+      --speculative-num-steps 3
+      --speculative-eagle-topk 1
+      --speculative-num-draft-tokens 4
+      --crash-dump-folder /sglang/logs
+      --tool-call-parser glm47
+      --reasoning-parser glm45
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "5g"
+        max-file: "3"
