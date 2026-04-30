@@ -87,10 +87,10 @@ services:
       --dynamic-batch-tokenizer-batch-size 8
       --attention-backend nsa
       --page-size 64
-#      --speculative-algorithm EAGLE
-#      --speculative-num-steps 3
-#      --speculative-eagle-topk 1
-#     --speculative-num-draft-tokens 4
+      --speculative-algorithm EAGLE
+      --speculative-num-steps 3
+      --speculative-eagle-topk 1
+      --speculative-num-draft-tokens 4
       --crash-dump-folder /sglang/logs
       --tool-call-parser glm47
       --reasoning-parser glm45
