@@ -34,7 +34,7 @@ services:
       - SGLANG_DISAGGREGATION_WAITING_TIMEOUT=179
       - PYTHONUNBUFFERED=1
       - SGLANG_HEALTH_CHECK_MEM_FREE=50
-
+      - FI_EFA_IFACE=rdmap87s0,rdmap88s0,rdmap112s0,rdmap113s0,rdmap137s0,rdmap138s0,rdmap162s0,rdmap163s0
 
     network_mode: host  # 使用 host 网络模式
 
@@ -57,7 +57,7 @@ services:
       --collect-tokens-histogram
       --show-time-cost
       --disaggregation-mode prefill
-      --disaggregation-ib-device rdmap110s0,rdmap111s0,rdmap112s0,rdmap113s0,rdmap135s0,rdmap136s0,rdmap137s0,rdmap138s0,rdmap160s0,rdmap161s0,rdmap162s0,rdmap163s0,rdmap85s0,rdmap86s0,rdmap87s0,rdmap88s0
+      --disaggregation-ib-device rdmap85s0,rdmap86s0,rdmap110s0,rdmap111s0,rdmap135s0,rdmap136s0,rdmap160s0,rdmap161s0
       --host 0.0.0.0
       --port 30082
       --trust-remote-code
