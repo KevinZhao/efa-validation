@@ -1,0 +1,19 @@
+{
+    "SpotPlacementScores": [
+        {
+            "Region": "us-west-2",
+            "AvailabilityZoneId": "usw2-az4",
+            "Score": 9
+        },
+        {
+            "Region": "us-west-2",
+            "AvailabilityZoneId": "usw2-az3",
+            "Score": 9
+        },
+        {
+            "Region": "us-west-2",
+            "AvailabilityZoneId": "usw2-az2",
+            "Score": 2
+        }
+    ]
+}

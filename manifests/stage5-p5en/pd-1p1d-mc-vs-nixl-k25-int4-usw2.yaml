@@ -1,0 +1,502 @@
+# =============================================================================
+# Stage 5 / PD-1P1D / A/B — Mooncake vs NIXL on EFA
+# Model : Kimi-K2.5 (compressed-tensors INT4, ~555 GiB, 64 shards)
+# Image : Oregon nodes cross-region pull from us-east-2 ECR
+#         sglang-mooncake-nixl-uccl:2026.04.30-h200.6
+#         (same image toggles backend via --disaggregation-transfer-backend)
+# Cluster: gpu-cluster-oregon  (us-west-2)
+# AZ    : usw2-az4 (SPS=9, 2x target-capacity); ASG VPCZoneIdentifier pinned
+# Subnet: subnet-0e4dc6ed86312302f (10.0.14.0/24)
+#
+# Single variable between A/B runs:
+#   KV_BACKEND=${mooncake|nixl}  →  --disaggregation-transfer-backend <value>
+#
+# Apply sequence (from bastion i-081b2b010b6af530c):
+#   1. kubectl create ns yanxi-validation  (idempotent)
+#   2. Scale ASG to desired=2, wait for Ready
+#   3. KV_BACKEND=mooncake envsubst < manifest | kubectl apply -f -
+#   4. Wait for both pods /get_model_info
+#   5. Run bench against LB  →  raw/<scenario>-mooncake-rN.json
+#   6. kubectl delete -f, KV_BACKEND=nixl envsubst, re-apply
+#   7. Alternate A/B/A/B/A/B across rounds and scenarios
+# =============================================================================
+
+---
+apiVersion: v1
+kind: Namespace
+metadata: { name: yanxi-validation }
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pd-1p1d-mc-vs-nixl-k25-launcher
+  namespace: yanxi-validation
+data:
+  prefetch.sh: |
+    #!/usr/bin/env bash
+    # Idempotent S3→NVMe prefetch for Kimi-K2.5 INT4 (~555 GiB).
+    # Region-local pull from Oregon bucket (Oregon prefetch finished 16:52Z).
+    # Traffic goes through the VPC S3 gateway endpoint → free, fast.
+    set -eux
+    MODEL_ID="${MODEL_ID:-moonshotai/Kimi-K2.5}"
+    S3_BUCKET="${S3_BUCKET:-yanxi-validation-788668107894-oregon}"
+    S3_REGION="${S3_REGION:-us-west-2}"
+    DST=/host-nvme/models/${MODEL_ID}
+    SENTINEL="$DST/.s3-prefetch-done"
+
+    if [ -f "$SENTINEL" ]; then
+      echo "[prefetch] sentinel exists, skip: $DST"
+      du -sh "$DST" 2>/dev/null || true
+      exit 0
+    fi
+
+    command -v s5cmd >/dev/null 2>&1 || {
+      echo "[prefetch] installing s5cmd"
+      curl -sL https://github.com/peak/s5cmd/releases/download/v2.2.2/s5cmd_2.2.2_Linux-64bit.tar.gz \
+        | tar -xz -C /usr/local/bin s5cmd
+    }
+
+    # Verify bucket reachable and sentinel upstream exists before committing
+    # to a multi-hundred-GiB cross-region transfer.
+    aws s3api head-object --region "${S3_REGION}" \
+      --bucket "${S3_BUCKET}" \
+      --key "models/${MODEL_ID}/.prefetch-complete" \
+      >/dev/null || { echo "[prefetch] upstream sentinel missing — refuse to pull"; exit 1; }
+
+    mkdir -p "$DST"
+    echo "[prefetch] s5cmd cp s3://${S3_BUCKET}/models/${MODEL_ID}/ (region=${S3_REGION}) -> ${DST}"
+    time AWS_REGION="${S3_REGION}" s5cmd --endpoint-url "https://s3.${S3_REGION}.amazonaws.com" \
+      cp --concurrency 64 \
+      "s3://${S3_BUCKET}/models/${MODEL_ID}/*" "${DST}/"
+    touch "$SENTINEL"
+    echo "[prefetch] done"
+    du -sh "$DST"
+
+  sglang-launcher.sh: |
+    #!/usr/bin/env bash
+    # PD-1P1D K2.5 INT4 launcher — picks prefill|decode|lb by ROLE env,
+    # picks mooncake|nixl by KV_BACKEND env (only this var differs across A/B).
+    set -eu
+    ROLE="${ROLE:?need ROLE=prefill|decode|lb}"
+
+    TORCH_LIB=$(python3 -c 'import torch, os; print(os.path.join(os.path.dirname(torch.__file__), "lib"))' 2>/dev/null || echo "")
+    [ -n "${TORCH_LIB}" ] && export LD_LIBRARY_PATH="${TORCH_LIB}:${LD_LIBRARY_PATH:-}"
+    export FI_PROVIDER="${FI_PROVIDER:-efa}"
+    export FI_EFA_USE_DEVICE_RDMA=1
+    export FI_EFA_FORK_SAFE=1
+
+    # http_server.py VLM bypass patch (K2.5 is VLM; stock sglang blocks
+    # disaggregation mode on VLM — customer-verified fix). Image baked
+    # "rdma→efa" for mooncake already; this patch still needs to be applied.
+    python3 - <<'PYEOF'
+    import os
+    p = '/usr/local/lib/python3.10/dist-packages/sglang/srt/entrypoints/http_server.py'
+    if os.path.exists(p):
+        s = open(p).read()
+        old = 'if is_vlm and not server_args.skip_tokenizer_init:'
+        new = 'if is_vlm and not server_args.skip_tokenizer_init and server_args.disaggregation_mode == "null":'
+        if old in s:
+            open(p,'w').write(s.replace(old,new))
+            pyc = '/usr/local/lib/python3.10/dist-packages/sglang/srt/entrypoints/__pycache__/http_server.cpython-310.pyc'
+            if os.path.exists(pyc): os.remove(pyc)
+            print('[launcher] patched http_server.py')
+        else:
+            print('[launcher] http_server.py already patched or pattern missing')
+    PYEOF
+
+    case "${ROLE}" in
+      prefill|decode)
+        MODEL_PATH="${MODEL_PATH:?need MODEL_PATH}"
+        TP="${TP:-8}"
+        PORT="${PORT:-30000}"
+        BOOTSTRAP_PORT="${BOOTSTRAP_PORT:-8998}"
+        CTX_LEN="${CONTEXT_LEN:-262144}"
+        MEM_FRAC="${MEM_FRAC_STATIC:-0.85}"
+        KV_BACKEND="${KV_BACKEND:?need KV_BACKEND=mooncake|nixl}"
+
+        IB_DEVICE="${IB_DEVICE:-}"
+        if [ -z "${IB_DEVICE}" ] && command -v fi_info >/dev/null 2>&1; then
+          IB_DEVICE=$(fi_info -p efa 2>/dev/null | awk '/domain:/ {print $2}' | sed 's/-rdm$//;s/-dgrm$//' | sort -u | paste -sd, -)
+        fi
+        [ -n "${IB_DEVICE}" ] && echo "[launcher] IB_DEVICE=${IB_DEVICE}"
+        echo "[launcher] ROLE=${ROLE} KV_BACKEND=${KV_BACKEND} TP=${TP}"
+
+        COMMON=(
+          --model-path "${MODEL_PATH}"
+          --served-model-name kimi-k2-5-pd
+          --tp "${TP}"
+          --host 0.0.0.0 --port "${PORT}"
+          --trust-remote-code
+          --context-length "${CTX_LEN}"
+          --mem-fraction-static "${MEM_FRAC}"
+          --page-size 64
+          --ep-dispatch-algorithm dynamic
+          --eplb-algorithm deepseek
+          --disable-shared-experts-fusion
+          --moe-dense-tp-size 1
+          --tokenizer-worker-num 8
+          --enable-dynamic-batch-tokenizer
+          --dynamic-batch-tokenizer-batch-size 8
+          --tool-call-parser kimi_k2
+          --reasoning-parser kimi_k2
+          --enable-metrics
+          --log-requests-level 3
+          --collect-tokens-histogram
+          --show-time-cost
+          --max-running-requests 256
+          --skip-server-warmup
+        )
+
+        DISAGG=(
+          --disaggregation-mode "${ROLE}"
+          --disaggregation-transfer-backend "${KV_BACKEND}"
+          --disaggregation-bootstrap-port "${BOOTSTRAP_PORT}"
+        )
+        [ -n "${IB_DEVICE}" ] && DISAGG+=(--disaggregation-ib-device "${IB_DEVICE}")
+
+        if [ "${ROLE}" = "prefill" ]; then
+          exec python3 -m sglang.launch_server \
+            "${COMMON[@]}" "${DISAGG[@]}" \
+            --chunked-prefill-size 16384 \
+            --attention-backend fa3 \
+            --disable-cuda-graph \
+            --enable-multimodal \
+            --mm-enable-dp-encoder \
+            --watchdog-timeout 3600
+        else
+          exec python3 -m sglang.launch_server \
+            "${COMMON[@]}" "${DISAGG[@]}" \
+            --cuda-graph-max-bs 32 \
+            --prefill-round-robin-balance \
+            --watchdog-timeout 1200 \
+            --decode-log-interval 50
+        fi
+        ;;
+      lb)
+        : "${PREFILL_URL:?need PREFILL_URL}"
+        : "${DECODE_URL:?need DECODE_URL}"
+        LB_PORT="${LB_PORT:-8000}"
+        if ! python3 -c "import sglang_router" 2>/dev/null; then
+          pip install --no-cache-dir "sglang-router==0.3.2" || exit 3
+        fi
+        PA=(); for u in ${PREFILL_URL//,/ }; do PA+=(--prefill "$u"); done
+        DA=(); for u in ${DECODE_URL//,/ }; do DA+=(--decode "$u"); done
+        exec python3 -m sglang_router.launch_router \
+          --pd-disaggregation \
+          "${PA[@]}" "${DA[@]}" \
+          --host 0.0.0.0 --port "${LB_PORT}"
+        ;;
+      *) echo "unknown ROLE=${ROLE}"; exit 2 ;;
+    esac
+
+---
+apiVersion: v1
+kind: Service
+metadata: { name: c1p1d-prefill, namespace: yanxi-validation }
+spec:
+  selector: { app: c1p1d, role: prefill }
+  ports:
+    - { name: http, port: 30000, targetPort: 30000 }
+    - { name: bootstrap, port: 8998, targetPort: 8998 }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: c1p1d-decode, namespace: yanxi-validation }
+spec:
+  selector: { app: c1p1d, role: decode }
+  ports:
+    - { name: http, port: 30000, targetPort: 30000 }
+    - { name: bootstrap, port: 8998, targetPort: 8998 }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: c1p1d-lb, namespace: yanxi-validation }
+spec:
+  selector: { app: c1p1d-lb }
+  ports:
+    - { name: http, port: 8000, targetPort: 8000 }
+
+---
+# ==== Prefill pod ====
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: c1p1d-prefill
+  namespace: yanxi-validation
+  labels: { app: c1p1d, role: prefill }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: c1p1d, role: prefill } }
+  template:
+    metadata:
+      labels: { app: c1p1d, role: prefill }
+      annotations:
+        # Ensures pods land on the same AZ (ASG already pinned to usw2-az4,
+        # but this makes the scheduler intent explicit).
+        scheduler.alpha.kubernetes.io/preferAvoidPods: ""
+    spec:
+      tolerations:
+        - { key: nvidia.com/gpu, operator: Equal, value: "true", effect: NoSchedule }
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - { key: node.kubernetes.io/instance-type, operator: In, values: [p5en.48xlarge] }
+                  - { key: topology.kubernetes.io/zone, operator: In, values: [us-west-2d] }
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector: { matchLabels: { app: c1p1d } }
+              topologyKey: kubernetes.io/hostname
+      initContainers:
+        - name: s3-prefetch
+          image: public.ecr.aws/amazonlinux/amazonlinux:2023
+          command: ["/bin/bash","-lc","dnf install -y -q tar gzip awscli; exec /scripts/prefetch.sh"]
+          env:
+            - { name: MODEL_ID, value: "moonshotai/Kimi-K2.5" }
+            - { name: S3_BUCKET, value: "yanxi-validation-788668107894-oregon" }
+            - { name: S3_REGION, value: "us-west-2" }
+          volumeMounts:
+            - { name: local-nvme, mountPath: /host-nvme }
+            - { name: scripts, mountPath: /scripts }
+          resources:
+            requests: { cpu: "4", memory: "8Gi" }
+            limits:   { cpu: "32", memory: "64Gi" }
+      containers:
+        - name: server
+          image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake-nixl-uccl:2026.04.30-h200.6
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: ROLE, value: "prefill" }
+            - { name: MODEL_PATH, value: "/models/moonshotai/Kimi-K2.5" }
+            - { name: TP, value: "8" }
+            - { name: CONTEXT_LEN, value: "262144" }
+            - { name: MEM_FRAC_STATIC, value: "0.85" }
+            # *** THE A/B VARIABLE — set to "mooncake" or "nixl" at apply time ***
+            - { name: KV_BACKEND, value: "${KV_BACKEND}" }
+
+            # --- SGLang internals (verbatim from customer) -----------------
+            - { name: NVIDIA_SPARSE_ENABLE, value: "1" }
+            - { name: OMP_NUM_THREADS, value: "16" }
+            - { name: SGLANG_SET_CPU_AFFINITY, value: "1" }
+            - { name: SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN, value: "1" }
+            - { name: SGLANG_MOE_PADDING, value: "1" }
+            - { name: SGLANG_ENABLE_JIT_DEEPGEMM, value: "1" }
+            - { name: SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS, value: "32" }
+            - { name: SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD, value: "16384" }
+            - { name: SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL, value: "10" }
+            - { name: SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT, value: "181" }
+            - { name: SGLANG_DISAGGREGATION_WAITING_TIMEOUT, value: "179" }
+            - { name: PYTHONUNBUFFERED, value: "1" }
+            - { name: SGLANG_HEALTH_CHECK_MEM_FREE, value: "50" }
+
+            # --- Networking ------------------------------------------------
+            - { name: FI_PROVIDER, value: "efa" }
+            - { name: FI_EFA_USE_DEVICE_RDMA, value: "1" }
+            - { name: FI_MR_CACHE_MAX_COUNT, value: "524288" }
+            - { name: FI_MR_CACHE_MERGE_REGIONS, value: "1" }
+            - { name: NCCL_DEBUG, value: "WARN" }
+
+            # --- Mooncake-only (NIXL path ignores these) --------------------
+            - { name: MOONCAKE_PROTOCOL, value: "efa" }
+            - { name: MC_NUM_CQ_PER_CTX, value: "4" }
+            - { name: MC_MAX_WR, value: "16384" }
+            - { name: MC_MAX_CQ_PER_CTX, value: "65536" }
+
+            - { name: NVSHMEM_REMOTE_TRANSPORT, value: "libfabric" }
+            - { name: NVSHMEM_LIBFABRIC_PROVIDER, value: "efa" }
+          command: ["/bin/bash", "-lc"]
+          args: ["exec /scripts/sglang-launcher.sh"]
+          readinessProbe:
+            httpGet: { path: /get_model_info, port: 30000 }
+            initialDelaySeconds: 240
+            periodSeconds: 15
+            failureThreshold: 120
+          ports:
+            - { containerPort: 30000, name: http }
+            - { containerPort: 8998, name: bootstrap }
+          securityContext: { capabilities: { add: [IPC_LOCK] } }
+          resources:
+            limits:
+              nvidia.com/gpu: 8
+              vpc.amazonaws.com/efa: 16
+              hugepages-2Mi: 5120Mi
+              memory: 1000Gi
+            requests:
+              nvidia.com/gpu: 8
+              vpc.amazonaws.com/efa: 16
+              hugepages-2Mi: 5120Mi
+              memory: 500Gi
+          volumeMounts:
+            - { name: local-nvme, mountPath: /models, subPath: models }
+            - { name: shm, mountPath: /dev/shm }
+            - { name: scripts, mountPath: /scripts }
+            - { name: crash-dumps, mountPath: /sglang/logs }
+      volumes:
+        - name: local-nvme
+          hostPath: { path: /data, type: Directory }
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 64Gi }
+        - name: scripts
+          configMap: { name: pd-1p1d-mc-vs-nixl-k25-launcher, defaultMode: 0755 }
+        - name: crash-dumps
+          emptyDir: {}
+
+---
+# ==== Decode pod ====
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: c1p1d-decode
+  namespace: yanxi-validation
+  labels: { app: c1p1d, role: decode }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: c1p1d, role: decode } }
+  template:
+    metadata:
+      labels: { app: c1p1d, role: decode }
+    spec:
+      tolerations:
+        - { key: nvidia.com/gpu, operator: Equal, value: "true", effect: NoSchedule }
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - { key: node.kubernetes.io/instance-type, operator: In, values: [p5en.48xlarge] }
+                  - { key: topology.kubernetes.io/zone, operator: In, values: [us-west-2d] }
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector: { matchLabels: { app: c1p1d } }
+              topologyKey: kubernetes.io/hostname
+      initContainers:
+        - name: s3-prefetch
+          image: public.ecr.aws/amazonlinux/amazonlinux:2023
+          command: ["/bin/bash","-lc","dnf install -y -q tar gzip awscli; exec /scripts/prefetch.sh"]
+          env:
+            - { name: MODEL_ID, value: "moonshotai/Kimi-K2.5" }
+            - { name: S3_BUCKET, value: "yanxi-validation-788668107894-oregon" }
+            - { name: S3_REGION, value: "us-west-2" }
+          volumeMounts:
+            - { name: local-nvme, mountPath: /host-nvme }
+            - { name: scripts, mountPath: /scripts }
+          resources:
+            requests: { cpu: "4", memory: "8Gi" }
+            limits:   { cpu: "32", memory: "64Gi" }
+      containers:
+        - name: server
+          image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake-nixl-uccl:2026.04.30-h200.6
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: ROLE, value: "decode" }
+            - { name: MODEL_PATH, value: "/models/moonshotai/Kimi-K2.5" }
+            - { name: TP, value: "8" }
+            - { name: CONTEXT_LEN, value: "262144" }
+            - { name: MEM_FRAC_STATIC, value: "0.85" }
+            - { name: KV_BACKEND, value: "${KV_BACKEND}" }
+
+            - { name: NVIDIA_SPARSE_ENABLE, value: "1" }
+            - { name: OMP_NUM_THREADS, value: "16" }
+            - { name: SGLANG_SET_CPU_AFFINITY, value: "1" }
+            - { name: SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN, value: "1" }
+            - { name: SGLANG_MOE_PADDING, value: "1" }
+            - { name: SGLANG_ENABLE_JIT_DEEPGEMM, value: "1" }
+            - { name: SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS, value: "32" }
+            - { name: SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD, value: "16384" }
+            - { name: SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL, value: "10" }
+            - { name: SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT, value: "181" }
+            - { name: SGLANG_DISAGGREGATION_WAITING_TIMEOUT, value: "179" }
+            - { name: PYTHONUNBUFFERED, value: "1" }
+            - { name: SGLANG_HEALTH_CHECK_MEM_FREE, value: "50" }
+
+            - { name: FI_PROVIDER, value: "efa" }
+            - { name: FI_EFA_USE_DEVICE_RDMA, value: "1" }
+            - { name: FI_MR_CACHE_MAX_COUNT, value: "524288" }
+            - { name: FI_MR_CACHE_MERGE_REGIONS, value: "1" }
+            - { name: NCCL_DEBUG, value: "WARN" }
+
+            - { name: MOONCAKE_PROTOCOL, value: "efa" }
+            - { name: MC_NUM_CQ_PER_CTX, value: "4" }
+            - { name: MC_MAX_WR, value: "16384" }
+            - { name: MC_MAX_CQ_PER_CTX, value: "65536" }
+
+            - { name: NVSHMEM_REMOTE_TRANSPORT, value: "libfabric" }
+            - { name: NVSHMEM_LIBFABRIC_PROVIDER, value: "efa" }
+          command: ["/bin/bash", "-lc"]
+          args: ["exec /scripts/sglang-launcher.sh"]
+          readinessProbe:
+            httpGet: { path: /get_model_info, port: 30000 }
+            initialDelaySeconds: 240
+            periodSeconds: 15
+            failureThreshold: 120
+          ports:
+            - { containerPort: 30000, name: http }
+            - { containerPort: 8998, name: bootstrap }
+          securityContext: { capabilities: { add: [IPC_LOCK] } }
+          resources:
+            limits:
+              nvidia.com/gpu: 8
+              vpc.amazonaws.com/efa: 16
+              hugepages-2Mi: 5120Mi
+              memory: 1000Gi
+            requests:
+              nvidia.com/gpu: 8
+              vpc.amazonaws.com/efa: 16
+              hugepages-2Mi: 5120Mi
+              memory: 500Gi
+          volumeMounts:
+            - { name: local-nvme, mountPath: /models, subPath: models }
+            - { name: shm, mountPath: /dev/shm }
+            - { name: scripts, mountPath: /scripts }
+            - { name: crash-dumps, mountPath: /sglang/logs }
+      volumes:
+        - name: local-nvme
+          hostPath: { path: /data, type: Directory }
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 64Gi }
+        - name: scripts
+          configMap: { name: pd-1p1d-mc-vs-nixl-k25-launcher, defaultMode: 0755 }
+        - name: crash-dumps
+          emptyDir: {}
+
+---
+# ==== Router (sglang-router LB) ====
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: c1p1d-lb
+  namespace: yanxi-validation
+  labels: { app: c1p1d-lb }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: c1p1d-lb } }
+  template:
+    metadata:
+      labels: { app: c1p1d-lb }
+    spec:
+      tolerations:
+        - { key: nvidia.com/gpu, operator: Equal, value: "true", effect: NoSchedule }
+      containers:
+        - name: lb
+          image: 788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake-nixl-uccl:2026.04.30-h200.6
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: ROLE, value: "lb" }
+            - { name: PREFILL_URL, value: "http://c1p1d-prefill.yanxi-validation.svc:30000" }
+            - { name: DECODE_URL,  value: "http://c1p1d-decode.yanxi-validation.svc:30000" }
+          command: ["/bin/bash", "-lc"]
+          args: ["exec /scripts/sglang-launcher.sh"]
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 30
+          ports:
+            - { containerPort: 8000, name: http }
+          volumeMounts:
+            - { name: scripts, mountPath: /scripts }
+      volumes:
+        - name: scripts
+          configMap: { name: pd-1p1d-mc-vs-nixl-k25-launcher, defaultMode: 0755 }

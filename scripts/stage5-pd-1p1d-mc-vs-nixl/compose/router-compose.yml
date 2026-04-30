@@ -1,0 +1,28 @@
+version: '3.4'
+# Router runs on the Prefill node (same host, CPU only).
+# sglang-router 0.3.2 with --pd-disaggregation; dispatches new requests to
+# a prefill worker, then hands off to a decode worker for streaming tokens.
+services:
+  k2-5-router:
+    image: lmsysorg/sglang-router:v0.3.2
+    restart: "no"
+    network_mode: host
+    environment:
+      - PREFILL_URL=${PREFILL_URL:-http://127.0.0.1:30081}
+      - DECODE_URL=${DECODE_URL:-http://10.99.10.106:30082}
+      - ROUTER_PORT=${ROUTER_PORT:-38000}
+    entrypoint:
+      - /bin/bash
+      - -ec
+      - |
+        exec python -m sglang_router.launch_router \
+          --pd-disaggregation \
+          --prefill "$${PREFILL_URL}" \
+          --decode "$${DECODE_URL}" \
+          --host 0.0.0.0 \
+          --port "$${ROUTER_PORT}"
+    logging:
+      driver: json-file
+      options:
+        max-size: "1g"
+        max-file: "2"
