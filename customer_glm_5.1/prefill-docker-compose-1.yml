@@ -3,7 +3,7 @@ version: '3.4'
 services:
 
   ds32-chat-1:
-    image: public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.04.28-h200.2
+    image: public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.04.28-h200.3
 
     privileged: true
     restart: always

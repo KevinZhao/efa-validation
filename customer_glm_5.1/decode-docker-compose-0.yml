@@ -3,7 +3,7 @@ version: '3.4'
 services:
 
   ds32-chat-1:
-    image: public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.04.28-h200.2
+    image: public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.04.28-h200.3
 
     privileged: true
     restart: always
@@ -32,6 +32,9 @@ services:
       - SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL=10
       - SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=300
       - SGLANG_DISAGGREGATION_WAITING_TIMEOUT=300
+      - UCCL_IB_MAX_INFLIGHT_LOW_LATENCY=128
+      - SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
+      - UCCL_SOCKET_IFNAME=enp
 
     network_mode: host  # 使用 host 网络模式
 
@@ -82,10 +85,10 @@ services:
       --dynamic-batch-tokenizer-batch-size 8
       --attention-backend nsa
       --page-size 64
-      --speculative-algorithm EAGLE
-      --speculative-num-steps 3
-      --speculative-eagle-topk 1
-      --speculative-num-draft-tokens 4
+#      --speculative-algorithm EAGLE
+#      --speculative-num-steps 3
+#      --speculative-eagle-topk 1
+#     --speculative-num-draft-tokens 4
       --crash-dump-folder /sglang/logs
       --tool-call-parser glm47
       --reasoning-parser glm45
