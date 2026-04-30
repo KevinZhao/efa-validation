@@ -1,0 +1,27 @@
+version: '3.4'
+services:
+  sglang-router:
+    image: public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.04.28-h200.3
+    restart: "no"
+    network_mode: host
+    environment:
+      - PYTHONUNBUFFERED=1
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        set -e
+        if ! python3 -c "import sglang_router" 2>/dev/null; then
+          pip install --no-cache-dir "sglang-router==0.3.2" >/dev/null
+        fi
+        echo "[router] starting pd-disaggregation router (new --prefill URL format, bootstrap via sglang /metrics)"
+        exec python3 -m sglang_router.launch_router \
+          --pd-disaggregation \
+          --prefill http://${PREFILL_HOST}:30081 \
+          --decode http://${DECODE_HOST}:30082 \
+          --host 0.0.0.0 --port 38000
+    logging:
+      driver: json-file
+      options:
+        max-size: "500m"
+        max-file: "2"

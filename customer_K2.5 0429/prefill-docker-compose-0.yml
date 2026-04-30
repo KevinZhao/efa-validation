@@ -1,0 +1,58 @@
+version: '3.4'
+services:
+  k2-5-pd-1:
+    image: public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.04.28-h200.3
+    privileged: true
+    restart: always
+    pull_policy: always
+    deploy:
+      resources:
+        reservations:
+          devices:
+          - driver: nvidia
+            device_ids: ['0','1','2','3','4','5','6','7']
+            capabilities: [gpu]
+    shm_size: 8192gb
+    ipc: host
+    environment:
+      - NVIDIA_SPARSE_ENABLE=1
+      - OMP_NUM_THREADS=16
+      - SGLANG_SET_CPU_AFFINITY=1
+      - SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
+      - SGLANG_MOE_PADDING=1
+      - SGLANG_ENABLE_JIT_DEEPGEMM=1
+      - SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS=32
+      - SGLANG_DG_CACHE_DIR=/sglang/deep_gemm
+      - SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD=16384
+      - SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL=10
+      - SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=181
+      - SGLANG_DISAGGREGATION_WAITING_TIMEOUT=179
+      - PYTHONUNBUFFERED=1
+      - SGLANG_HEALTH_CHECK_MEM_FREE=50
+      - GLOO_SOCKET_IFNAME=enp71s0
+      - PYTHONUNBUFFERED=1
+      - MOONCAKE_PROTOCOL=efa
+      - NVSHMEM_REMOTE_TRANSPORT=libfabric
+      - NVSHMEM_LIBFABRIC_PROVIDER=efa
+      - NCCL_DEBUG=INFO
+      - NCCL_SOCKET_IFNAME=enp71s0
+      - FI_PROVIDER=efa
+      - FI_EFA_USE_DEVICE_RDMA=1
+      - MC_NUM_CQ_PER_CTX=4
+      - MC_MAX_WR=16384
+      - MC_MAX_CQ_PER_CTX=65536
+      - FI_MR_CACHE_MAX_COUNT=524288
+      - FI_MR_CACHE_MERGE_REGIONS=1
+    network_mode: host  # 使用 host 网络模式
+    volumes:
+      - /export:/export
+      - /export/models/moonshotai/Kimi-K2.5:/models/model
+      - /export/logs:/sglang/logs
+      - /export/sglang/pd_k2.5/tp8_pd_prefill/torch-compile:/sglang/torch-compile
+      - /export/sglang/pd_k2.5/tp8_pd_prefill/deep_gemm:/sglang/deep_gemm
+    entrypoint: /bin/bash /export/prefill_entrypoint.sh
+    logging:
+      driver: json-file
+      options:
+        max-size: "5g"
+        max-file: "3"
