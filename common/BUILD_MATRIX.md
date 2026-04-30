@@ -33,6 +33,29 @@ Both variants share identical Mooncake TE, SGLang, EFA, NCCL, torch — **only t
 - **Latest tag**: `latest` → current release (per variant)
 - **Stable alias**: `stable` → promoted manually after 1 week of internal soak (per variant)
 
+### 2026.04.28-h200.5 hotfix (2026-04-29 rebuild)
+
+Shipped 2026-04-29 to let customers run the **full official Mooncake EFA test
+suite** from
+https://kvcache-ai.github.io/Mooncake/design/transfer-engine/efa_transport.html
+— specifically the ctest unit tests (10 subtests under `efa_transport_test`
+gtest binary) plus benchmarking matrix (block size, concurrency, buffer size
+sweeps, and CPU-to-CPU variants).
+
+| New artifact | Why it matters |
+|---|---|
+| `/opt/mooncake/install/bin/efa_transport_test` (gtest binary) | `.4` was built with `BUILD_UNIT_TESTS=OFF`, so the ctest suite referenced in the official doc (InstallTransport, LoopbackWrite, WriteAndRead, MultiWrite, StressMultipleBatches, WarmupSegmentLoopback, WarmupSegmentNotFound, RegisterMemoryBatch, LargeTransfer, RepeatedOpenSegment — 10 tests) was unavailable in the image. `.5` flips `BUILD_UNIT_TESTS=ON` and ships the binary |
+
+**Fix**: Dockerfile builder stage now passes `-DBUILD_UNIT_TESTS=ON` to
+cmake and conditionally copies `efa_transport_test` to the install prefix
+(same defensive pattern as `efa_first_submit_probe` in `.4`).
+
+**Tag policy**: patch-bump to `2026.04.28-h200.5`; no other changes (Mooncake
+/ UCCL / SGLang / torch / CUDA / EFA / the rdma→efa patch all unchanged from
+`.4`). `.4` remains valid; `.5` strictly adds a diagnostic/test binary.
+
+**Size impact**: `efa_transport_test` adds ~20-30 MB to runtime image.
+
 ### 2026.04.28-h200.4 hotfix (2026-04-29 rebuild)
 
 Shipped 2026-04-29 after validating `.3` on a real p5.48xlarge and realizing

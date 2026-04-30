@@ -223,17 +223,18 @@ RUN mkdir -p /opt/mooncake/build && cd /opt/mooncake/build && \
       -DWITH_EP=OFF \
       -DSTORE_USE_ETCD=OFF \
       -DSTORE_USE_REDIS=OFF \
-      -DBUILD_UNIT_TESTS=OFF && \
+      -DBUILD_UNIT_TESTS=ON && \
     ninja -j"$(nproc)" && \
     ninja install && \
     ldconfig && \
     # ninja install does NOT copy example binaries (they stay in build/).
     # Mooncake official EFA test protocol
     # (https://kvcache-ai.github.io/Mooncake/design/transfer-engine/efa_transport.html)
-    # references transfer_engine_bench for throughput and efa_first_submit_probe
-    # for first-submit latency. We ship both so customers can reproduce without
-    # a source checkout. efa_first_submit_probe may not exist on older Mooncake
-    # SHAs, so make its copy non-fatal.
+    # references transfer_engine_bench for throughput, efa_first_submit_probe
+    # for first-submit latency, and efa_transport_test (gtest) for ctest unit
+    # tests. We ship all three so customers can reproduce without a source
+    # checkout. Probe + unit tests may not exist on older Mooncake SHAs, so
+    # make their copies non-fatal (but warn).
     mkdir -p /opt/mooncake/install/bin && \
     cp /opt/mooncake/build/mooncake-transfer-engine/example/transfer_engine_bench \
        /opt/mooncake/install/bin/ && \
@@ -243,6 +244,17 @@ RUN mkdir -p /opt/mooncake/build && cd /opt/mooncake/build && \
         echo "[build] efa_first_submit_probe shipped" ; \
     else \
         echo "[build] efa_first_submit_probe not built (older Mooncake SHA); skipping" ; \
+    fi && \
+    # Ship EFA unit test binary so customers can run the official ctest suite
+    # (InstallTransport, LoopbackWrite, WriteAndRead, MultiWrite,
+    # StressMultipleBatches, WarmupSegmentLoopback, WarmupSegmentNotFound,
+    # RegisterMemoryBatch, LargeTransfer, RepeatedOpenSegment).
+    if [ -x /opt/mooncake/build/mooncake-transfer-engine/tests/efa_transport_test ]; then \
+        cp /opt/mooncake/build/mooncake-transfer-engine/tests/efa_transport_test \
+           /opt/mooncake/install/bin/ && \
+        echo "[build] efa_transport_test (gtest) shipped" ; \
+    else \
+        echo "[build] efa_transport_test not built; check BUILD_UNIT_TESTS flag" ; \
     fi
 
 # Python binding (wheel install; headers not kept at runtime)

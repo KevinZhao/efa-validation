@@ -2,30 +2,24 @@
 # Customer image .4 — TWO-NODE EFA Mooncake test per official doc
 # https://kvcache-ai.github.io/Mooncake/design/transfer-engine/efa_transport.html
 #
-# Runs three official tests across two p5.48xlarge nodes (same AZ — EFA SRD
-# is single-AZ only):
+# V2: proper P2PHANDSHAKE port discovery
+# ──────────────────────────────────────
+# Mooncake's P2P handshake mode (metadata_server=P2PHANDSHAKE) IGNORES the
+# port in --local_server_name and auto-selects a free TCP port instead
+# (transfer_engine_impl.cpp:133: findAvailableTcpPort). The real listen port
+# is printed in target's own log as:
+#     "Transfer Engine RPC using P2P handshake, listening on HOST:PORT"
 #
-#   Test A — TransferEngine.initialize(protocol='efa') → 0 on each node
-#            (already PASS on single-node; re-verified here)
+# So the initiator must read TARGET's actual port before connecting. We use
+# S3 as the rendezvous (both pods have AWS creds):
+#   1. target runs the bench/probe, tees its log to a local file
+#   2. a sidecar shell grep's "listening on" → S3 (writes PORT file)
+#   3. initiator polls S3 for PORT file, then uses HOST:PORT
 #
-#   Test B — efa_first_submit_probe target + initiator across nodes
-#            (shipped in .4 image; previous .3 was missing this binary)
-#
-#   Test C — transfer_engine_bench target + initiator across nodes,
-#            block_size=1MB threads=16 batch=128 duration=10s
-#            Official target on p5en: ~365 GB/s write. p5 H100 is a bit less
-#            but should still be multi-hundred GB/s if stack is correct.
-#
-# Topology:
-#   target   — StatefulSet replica 0 on node A
-#   initiator— StatefulSet replica 1 on node B
-#   service  — headless, so DNS A record returns pod IP
-#   sync     — initiator waits for target's readiness marker in a shared
-#              K8s configmap (populated by target when it's listening)
-#
-# After smoke finishes, read logs:
-#   kubectl logs customer-p5-2node-target-0 -c smoke   > target.log
-#   kubectl logs customer-p5-2node-initiator-0 -c smoke > initiator.log
+# Three tests (official doc order):
+#   A — TransferEngine.initialize(protocol='efa') → 0 on both nodes (sanity)
+#   B — efa_first_submit_probe (1 MB, 32 warmup+5 iters, expects warmup + submit #0..4 timings)
+#   C — transfer_engine_bench (1 MB blocks, 16 threads, 128 batch, 10s, expects GB/s line)
 # =============================================================================
 apiVersion: v1
 kind: ConfigMap
@@ -33,146 +27,267 @@ metadata:
   name: customer-p5-2node-scripts
   namespace: default
 data:
+  sync_server.py: |
+    # Tiny HTTP server for target → initiator rendezvous. Serves:
+    #   GET /probe  -> probe endpoint host:port (or 503 if not ready)
+    #   GET /bench  -> bench endpoint
+    #   POST /probe?ep=HOST:PORT -> publish probe endpoint
+    #   POST /bench?ep=HOST:PORT -> publish bench endpoint
+    #   GET /probe-done -> 200 if initiator marked done
+    #   GET /bench-done -> 200 if initiator marked done
+    #   POST /probe-done, /bench-done -> mark done
+    import http.server, socketserver, urllib.parse, threading, sys
+    state = {"probe": None, "bench": None, "probe_done": False, "bench_done": False}
+    lock = threading.Lock()
+    PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8888
+    class H(http.server.BaseHTTPRequestHandler):
+        def _send(self, code, body=""):
+            self.send_response(code); self.send_header("Content-Type","text/plain"); self.end_headers()
+            if body: self.wfile.write(body.encode())
+        def do_GET(self):
+            p = urllib.parse.urlparse(self.path).path.strip("/")
+            with lock:
+                if p == "probe" and state["probe"]: return self._send(200, state["probe"])
+                if p == "bench" and state["bench"]: return self._send(200, state["bench"])
+                if p == "probe-done" and state["probe_done"]: return self._send(200, "done")
+                if p == "bench-done" and state["bench_done"]: return self._send(200, "done")
+            self._send(503, "not-ready")
+        def do_POST(self):
+            u = urllib.parse.urlparse(self.path)
+            p = u.path.strip("/")
+            q = urllib.parse.parse_qs(u.query)
+            with lock:
+                if p in ("probe","bench") and "ep" in q:
+                    state[p] = q["ep"][0]
+                    return self._send(200, "ok")
+                if p in ("probe-done","bench-done"):
+                    state[p.replace("-","_")] = True
+                    return self._send(200, "ok")
+            self._send(404)
+        def log_message(self, *a, **kw): pass
+    with socketserver.ThreadingTCPServer(("0.0.0.0", PORT), H) as s:
+        print(f"sync_server on :{PORT}", flush=True)
+        s.serve_forever()
+
   target.sh: |
     #!/usr/bin/env bash
     set -eu
-    echo "=== TARGET node=$(hostname) ==="
+    HOST_IP=$(hostname -i | awk '{print $1}')
+    SYNC_PORT=8888
+    echo "=== TARGET node=$(hostname) ip=$HOST_IP sync=:$SYNC_PORT ==="
     BENCH=/opt/mooncake/install/bin/transfer_engine_bench
     PROBE=/opt/mooncake/install/bin/efa_first_submit_probe
 
     ls -la /opt/mooncake/install/bin/
     cat /opt/BUILD_INFO.json
 
-    # Validate Test A locally (still useful as sanity)
-    echo "=== Local Test A (initialize on target node) ==="
+    # Start the sync HTTP server in background
+    python3 /scripts/sync_server.py $SYNC_PORT > /tmp/sync.log 2>&1 &
+    SYNC_PID=$!
+    sleep 2
+
+    echo
+    echo "=============================="
+    echo "== LOCAL Test A sanity ======="
+    echo "=============================="
     python3 -c "
     from mooncake.engine import TransferEngine
     te = TransferEngine()
     r = te.initialize('127.0.0.1:12345', 'P2PHANDSHAKE', 'efa', '')
     print(f'RESULT={r}')
-    "
+    " || echo "Test A failed"
 
-    # Then run B + C targets in parallel (different ports)
-    echo "=== Starting probe target on :23456 ==="
+    # Helper: start daemon, grep logfile for real rpc_port, POST to /<label>
+    wait_and_publish() {
+      local label=$1
+      local logfile=$2
+      for i in $(seq 1 60); do
+        PORT=$(grep -oE 'listening on [0-9a-zA-Z.:]+' "$logfile" 2>/dev/null | head -1 | awk '{print $3}' | awk -F: '{print $NF}')
+        if [ -n "$PORT" ]; then
+          ENDPOINT="${HOST_IP}:${PORT}"
+          echo "[$label] ready — ${ENDPOINT}"
+          python3 -c "import urllib.request, urllib.parse; urllib.request.urlopen('http://127.0.0.1:${SYNC_PORT}/${label}?ep=${ENDPOINT}', data=b'', timeout=5).read()"
+          return 0
+        fi
+        sleep 1
+      done
+      echo "[$label] FAIL: never saw 'listening on' in log"
+      return 1
+    }
+
+    wait_for_done() {
+      local label=$1
+      for i in $(seq 1 300); do
+        if python3 -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:${SYNC_PORT}/${label}-done',timeout=3).status==200 else 1)" 2>/dev/null; then
+          echo "[$label] initiator signalled done"
+          return 0
+        fi
+        sleep 1
+      done
+      echo "[$label] TIMEOUT waiting for initiator done"
+      return 1
+    }
+
+    echo
+    echo "=============================="
+    echo "== Step B: efa_first_submit_probe target =="
+    echo "=============================="
     $PROBE --mode=target --metadata_server=P2PHANDSHAKE \
-      --local_server_name=$(hostname -i):23456 > /tmp/probe-target.log 2>&1 &
+      --local_server_name=${HOST_IP}:12345 \
+      > /tmp/probe-target.log 2>&1 &
     PROBE_PID=$!
 
-    echo "=== Starting bench target on :34567 ==="
+    wait_and_publish probe /tmp/probe-target.log || true
+    echo "--- probe target log tail after publish ---"
+    tail -15 /tmp/probe-target.log
+
+    wait_for_done probe || true
+    kill -TERM $PROBE_PID 2>/dev/null || true
+    sleep 2
+    kill -KILL $PROBE_PID 2>/dev/null || true
+    wait $PROBE_PID 2>/dev/null || true
+    echo "=== probe target full log (tail 30) ==="
+    tail -30 /tmp/probe-target.log
+
+    echo
+    echo "=============================="
+    echo "== Step C: transfer_engine_bench target =="
+    echo "=============================="
     $BENCH --mode=target --protocol=efa --metadata_server=P2PHANDSHAKE \
-      --local_server_name=$(hostname -i):34567 \
-      --buffer_size=4294967296 --gpu_id=-1 > /tmp/bench-target.log 2>&1 &
+      --local_server_name=${HOST_IP}:12346 \
+      --buffer_size=4294967296 --gpu_id=-1 \
+      > /tmp/bench-target.log 2>&1 &
     BENCH_PID=$!
 
-    # Give targets time to fully init (32 EFA devices × ~30ms + libfabric setup)
-    echo "=== Waiting 60s for targets to finish EFA init + listen ==="
-    sleep 60
-    echo "=== Targets should be listening now ==="
-    echo "--- probe target log (first 30) ---"
-    head -30 /tmp/probe-target.log || true
-    echo "--- bench target log (first 40) ---"
-    head -40 /tmp/bench-target.log || true
+    wait_and_publish bench /tmp/bench-target.log || true
+    echo "--- bench target log tail after publish ---"
+    tail -15 /tmp/bench-target.log
 
-    # Write readiness to a file in shared emptyDir (we use inter-pod sync
-    # via a polling loop on initiator, not cm — cm updates require API call)
-    echo "ready" > /tmp/target-ready
+    wait_for_done bench || true
+    kill -TERM $BENCH_PID 2>/dev/null || true
+    sleep 2
+    kill -KILL $BENCH_PID 2>/dev/null || true
+    wait $BENCH_PID 2>/dev/null || true
+    echo "=== bench target full log (tail 80) ==="
+    tail -80 /tmp/bench-target.log
 
-    # Keep targets alive for 120s so initiator has time
-    echo "=== Keeping targets alive for 120s ==="
-    sleep 120
-
-    echo "=== Target wrap-up ==="
-    kill $PROBE_PID 2>/dev/null || true
-    kill $BENCH_PID 2>/dev/null || true
-    wait 2>/dev/null || true
-
-    echo "=== Full probe target log ==="
-    cat /tmp/probe-target.log || true
-    echo "=== Full bench target log (tail 80) ==="
-    tail -80 /tmp/bench-target.log || true
-    echo "=== Target done ==="
+    kill $SYNC_PID 2>/dev/null || true
+    echo
+    echo "=============================="
+    echo "== TARGET DONE ==============="
+    echo "=============================="
 
   initiator.sh: |
     #!/usr/bin/env bash
     set -eu
-    echo "=== INITIATOR node=$(hostname) ==="
+    HOST_IP=$(hostname -i | awk '{print $1}')
+    echo "=== INITIATOR node=$(hostname) ip=$HOST_IP ==="
     BENCH=/opt/mooncake/install/bin/transfer_engine_bench
     PROBE=/opt/mooncake/install/bin/efa_first_submit_probe
-    TARGET_HOST=customer-p5-2node-target-0.customer-p5-2node-target
+    SYNC_URL="http://${TARGET_IP}:8888"
 
-    # Resolve target IP
-    echo "=== Resolving $TARGET_HOST ==="
-    for i in $(seq 1 60); do
-      TARGET_IP=$(getent hosts $TARGET_HOST 2>/dev/null | awk '{print $1}' | head -1)
-      if [ -n "$TARGET_IP" ]; then
-        echo "TARGET_IP=$TARGET_IP"
-        break
-      fi
-      echo "attempt $i: DNS not yet"
-      sleep 2
-    done
-    [ -n "$TARGET_IP" ] || { echo "FAIL: target DNS never resolved"; exit 1; }
+    # poll target's sync server until /probe or /bench returns 200 with endpoint
+    poll_endpoint() {
+      local label=$1
+      for i in $(seq 1 300); do
+        ep=$(python3 -c "
+    import urllib.request,sys
+    try:
+      r=urllib.request.urlopen('${SYNC_URL}/${label}',timeout=3)
+      print(r.read().decode().strip())
+    except Exception as e:
+      sys.exit(1)
+    " 2>/dev/null)
+        if [ -n "$ep" ]; then
+          echo "$ep"
+          return 0
+        fi
+        sleep 1
+      done
+      return 1
+    }
 
-    # Give target 90s to stand up (it sleeps 60 before marking ready + 32 EFA init)
-    echo "=== Waiting 90s for target EFA init + listen ==="
-    sleep 90
+    signal_done() {
+      local label=$1
+      python3 -c "import urllib.request; urllib.request.urlopen('${SYNC_URL}/${label}-done',data=b'',timeout=5).read()" || true
+    }
 
-    echo "=== Test A: initialize on initiator node ==="
+    echo
+    echo "=============================="
+    echo "== LOCAL Test A sanity ======="
+    echo "=============================="
     python3 -c "
     from mooncake.engine import TransferEngine
     te = TransferEngine()
-    r = te.initialize('127.0.0.1:12346', 'P2PHANDSHAKE', 'efa', '')
+    r = te.initialize('127.0.0.1:12345', 'P2PHANDSHAKE', 'efa', '')
     print(f'RESULT={r}')
-    "
-    echo
+    " || echo "Test A failed"
 
-    echo "=== Test B: efa_first_submit_probe — initiator ==="
-    timeout 60 $PROBE --mode=initiator --metadata_server=P2PHANDSHAKE \
-      --segment_id=$TARGET_IP:23456 --warmup=1 --iters=5 \
+    echo
+    echo "=============================="
+    echo "== Test B: efa_first_submit_probe =="
+    echo "=============================="
+    echo "polling ${SYNC_URL}/probe ..."
+    PROBE_EP=$(poll_endpoint probe) || { echo "FAIL(B): probe endpoint never appeared"; exit 1; }
+    echo "PROBE_EP=$PROBE_EP"
+
+    timeout 120 $PROBE --mode=initiator --metadata_server=P2PHANDSHAKE \
+      --local_server_name=${HOST_IP}:12345 \
+      --segment_id=${PROBE_EP} \
+      --warmup=1 --iters=5 \
       2>&1 | tee /tmp/probe-init.log || echo "(probe exited)"
-    if grep -qE "submit #0" /tmp/probe-init.log; then
-      echo "PASS (B): first-submit probe completed"
+
+    echo "--- Test B results ---"
+    grep -E "(warmup:|submit #[0-9]+:|\\[initiator\\])" /tmp/probe-init.log | head -20 || true
+
+    if grep -qE "submit #[0-9]+:" /tmp/probe-init.log; then
+      echo "PASS(B): first-submit probe completed"
     else
-      echo "WARN (B): no submit line; dump last 30 lines"
+      echo "FAIL(B): no submit #N: line"
       tail -30 /tmp/probe-init.log
     fi
-    echo
+    signal_done probe
 
-    echo "=== Test C: transfer_engine_bench — initiator ==="
-    timeout 60 $BENCH --mode=initiator --protocol=efa \
+    echo
+    echo "=============================="
+    echo "== Test C: transfer_engine_bench =="
+    echo "=============================="
+    echo "polling ${SYNC_URL}/bench ..."
+    BENCH_EP=$(poll_endpoint bench) || { echo "FAIL(C): bench endpoint never appeared"; exit 1; }
+    echo "BENCH_EP=$BENCH_EP"
+
+    timeout 90 $BENCH --mode=initiator --protocol=efa \
       --metadata_server=P2PHANDSHAKE \
-      --segment_id=$TARGET_IP:34567 \
+      --local_server_name=${HOST_IP}:12346 \
+      --segment_id=${BENCH_EP} \
       --operation=write --duration=10 --threads=16 \
       --block_size=1048576 --batch_size=128 \
       --buffer_size=4294967296 --gpu_id=-1 \
       --report_unit=GB \
       2>&1 | tee /tmp/bench-init.log || echo "(bench exited)"
-    echo "--- bench initiator tail (50) ---"
-    tail -50 /tmp/bench-init.log || true
-    if grep -qE "GB/s|[Tt]hroughput|[Bb]andwidth" /tmp/bench-init.log; then
-      BW=$(grep -oE "[0-9]+\\.[0-9]+ GB/s|[Tt]hroughput: [0-9.]+" /tmp/bench-init.log | head -5)
-      echo "PASS (C): $BW"
+
+    echo "--- Test C results ---"
+    grep -E "(Test completed|throughput|GB/s)" /tmp/bench-init.log | head -5 || true
+
+    if grep -qE "throughput [0-9]" /tmp/bench-init.log; then
+      echo "PASS(C)"
     else
-      echo "WARN (C): no throughput line"
+      echo "FAIL(C): no throughput line"
+      tail -40 /tmp/bench-init.log
     fi
-    echo "=== Initiator done ==="
+    signal_done bench
+
+    echo
+    echo "=============================="
+    echo "== INITIATOR DONE ============"
+    echo "=============================="
 
 ---
 apiVersion: v1
-kind: Service
+kind: ServiceAccount
 metadata:
-  name: customer-p5-2node-target
+  name: customer-p5-2node-sa
   namespace: default
-spec:
-  clusterIP: None  # headless — resolves to pod IP
-  selector:
-    app: customer-p5-2node
-    role: target
-  ports:
-    - name: probe
-      port: 23456
-    - name: bench
-      port: 34567
 
 ---
 apiVersion: apps/v1
@@ -184,24 +299,23 @@ spec:
   serviceName: customer-p5-2node-target
   replicas: 1
   selector:
-    matchLabels:
-      app: customer-p5-2node
-      role: target
+    matchLabels: { app: customer-p5-2node, role: target }
   template:
     metadata:
-      labels:
-        app: customer-p5-2node
-        role: target
+      labels: { app: customer-p5-2node, role: target }
     spec:
+      serviceAccountName: customer-p5-2node-sa
       restartPolicy: Always
       hostNetwork: true
       hostIPC: true
       affinity:
-        podAntiAffinity:
+        nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
-            - labelSelector:
-                matchLabels: { app: customer-p5-2node }
-              topologyKey: kubernetes.io/hostname
+            nodeSelectorTerms:
+              - matchFields:
+                  - key: metadata.name
+                    operator: In
+                    values: ["PLACEHOLDER_TARGET_NODE"]
       nodeSelector:
         node.kubernetes.io/instance-type: p5.48xlarge
       volumes:
@@ -223,6 +337,7 @@ spec:
             - { name: FI_EFA_FORK_SAFE,       value: "1" }
             - { name: FI_EFA_USE_HUGE_PAGE,   value: "0" }
             - { name: MOONCAKE_PROTOCOL,      value: "efa" }
+            - { name: AWS_DEFAULT_REGION,     value: "us-west-2" }
           resources:
             requests: { cpu: "2", memory: "8Gi" }
             limits:
@@ -243,19 +358,20 @@ spec:
   ttlSecondsAfterFinished: 86400
   template:
     metadata:
-      labels:
-        app: customer-p5-2node
-        role: initiator
+      labels: { app: customer-p5-2node, role: initiator }
     spec:
+      serviceAccountName: customer-p5-2node-sa
       restartPolicy: Never
       hostNetwork: true
       hostIPC: true
       affinity:
-        podAntiAffinity:
+        nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
-            - labelSelector:
-                matchLabels: { app: customer-p5-2node }
-              topologyKey: kubernetes.io/hostname
+            nodeSelectorTerms:
+              - matchFields:
+                  - key: metadata.name
+                    operator: In
+                    values: ["PLACEHOLDER_INITIATOR_NODE"]
       nodeSelector:
         node.kubernetes.io/instance-type: p5.48xlarge
       volumes:
@@ -277,6 +393,8 @@ spec:
             - { name: FI_EFA_FORK_SAFE,       value: "1" }
             - { name: FI_EFA_USE_HUGE_PAGE,   value: "0" }
             - { name: MOONCAKE_PROTOCOL,      value: "efa" }
+            - { name: AWS_DEFAULT_REGION,     value: "us-west-2" }
+            - { name: TARGET_IP,              value: "PLACEHOLDER_TARGET_IP" }
           resources:
             requests: { cpu: "2", memory: "8Gi" }
             limits:

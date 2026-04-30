@@ -1,0 +1,447 @@
+# =============================================================================
+# Customer image .5 — FULL official Mooncake EFA test suite
+# https://kvcache-ai.github.io/Mooncake/design/transfer-engine/efa_transport.html
+#
+# Runs on 2 × p5.48xlarge (H100 + 32 EFA × 100 Gbps) in same AZ.
+# Test matrix:
+#
+#   A.   TransferEngine.initialize(efa) local (both nodes)
+#
+#   CTEST. gtest suite efa_transport_test (10 subtests) — LOOPBACK, run on
+#          each node independently. Subtests per official doc:
+#             InstallTransport, LoopbackWrite, WriteAndRead, MultiWrite,
+#             StressMultipleBatches, WarmupSegmentLoopback,
+#             WarmupSegmentNotFound, RegisterMemoryBatch, LargeTransfer,
+#             RepeatedOpenSegment
+#
+#   B1.  efa_first_submit_probe  warmup=1 iters=5  (eager warmup)
+#   B2.  efa_first_submit_probe  warmup=0 iters=5  (cold first-submit)
+#
+#   C1-C3 GPU baseline:
+#   C1.  transfer_engine_bench  operation=write threads=16 batch=128 block=1M
+#   C2.  transfer_engine_bench  operation=read  threads=16 batch=32  block=1M
+#   C3.  transfer_engine_bench  operation=write threads=32 batch=64  block=1M (write peak alt)
+#
+#   D1-D6 Block-size sweep (write threads=16 batch=128):
+#   D1-D6: 64K, 128K, 256K, 512K, 1M (re-run baseline), 2M
+#
+#   E1-E4 Concurrency sweep (write block=1M):
+#     E1   threads=16 batch=128                (baseline, already = C1)
+#     E2   threads=32 batch=64                 (already = C3)
+#     E3   threads=16 batch=32                 (read alt, if read tested)
+#     E4   threads=32 batch=128                (high-load read)
+#
+#   F1-F2 Buffer-size sweep (write threads=16 batch=128 block=1M):
+#     F1   buffer_size=2G   (minimum: block × batch × threads)
+#     F2   buffer_size=4G   (baseline)
+#
+#   G1-G2 CPU-to-CPU (use_vram=false):
+#     G1   write threads=16 batch=128 block=1M
+#     G2   read  threads=48 batch=32  block=1M
+#
+# Rendezvous: Python HTTP sync server on target:8888 (proven pattern from
+# v2 smoke). Initiator reads target's real P2P port per test.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: customer-p5-2node-full-scripts
+  namespace: default
+data:
+  sync_server.py: |
+    # HTTP rendezvous: GET /<label> -> "host:port" once target has POSTed.
+    import http.server, socketserver, urllib.parse, threading, sys
+    state = {}
+    lock = threading.Lock()
+    PORT = int(sys.argv[1])
+    class H(http.server.BaseHTTPRequestHandler):
+        def _send(self, code, body=""):
+            self.send_response(code); self.send_header("Content-Type","text/plain"); self.end_headers()
+            if body: self.wfile.write(body.encode())
+        def do_GET(self):
+            p = urllib.parse.urlparse(self.path).path.strip("/")
+            with lock:
+                if state.get(p): return self._send(200, state[p])
+            self._send(503, "not-ready")
+        def do_POST(self):
+            u = urllib.parse.urlparse(self.path); p = u.path.strip("/")
+            q = urllib.parse.parse_qs(u.query)
+            with lock:
+                if "v" in q:
+                    state[p] = q["v"][0]
+                    return self._send(200, "ok")
+                state[p] = "done"
+                return self._send(200, "ok")
+        def log_message(self, *a, **kw): pass
+    with socketserver.ThreadingTCPServer(("0.0.0.0", PORT), H) as s:
+        print(f"sync on :{PORT}", flush=True); s.serve_forever()
+
+  target.sh: |
+    #!/usr/bin/env bash
+    set -eu
+    HOST_IP=$(hostname -i | awk '{print $1}')
+    SYNC=8888
+    BENCH=/opt/mooncake/install/bin/transfer_engine_bench
+    PROBE=/opt/mooncake/install/bin/efa_first_submit_probe
+    CTEST=/opt/mooncake/install/bin/efa_transport_test
+    LABELS=(probe_warm probe_cold c1_write c2_read c3_write32 d1_64k d2_128k d3_256k d4_512k d5_1m d6_2m e4_t32b128 f1_buf2g f2_buf4g g1_cpu_write g2_cpu_read)
+
+    echo "=== TARGET node=$(hostname) ip=$HOST_IP ==="
+    ls -la /opt/mooncake/install/bin/
+    cat /opt/BUILD_INFO.json
+
+    python3 /scripts/sync_server.py $SYNC > /tmp/sync.log 2>&1 &
+    SYNC_PID=$!
+    sleep 2
+
+    # ====== Test A: local Python init ======
+    echo; echo "=============================="
+    echo "== Test A (target) ============"
+    echo "=============================="
+    python3 -c "from mooncake.engine import TransferEngine; te=TransferEngine(); print('RESULT=', te.initialize('127.0.0.1:12340','P2PHANDSHAKE','efa',''))"
+
+    # ====== CTEST: 10 unit tests on target ======
+    echo; echo "=============================="
+    echo "== CTEST (target) ============="
+    echo "=============================="
+    if [ -x "$CTEST" ]; then
+      # Loopback mode: target runs its own initiator/target internally
+      timeout 300 $CTEST --gtest_list_tests > /tmp/ctest-list.txt 2>&1 || true
+      cat /tmp/ctest-list.txt
+      echo "--- running all tests ---"
+      timeout 600 $CTEST --gtest_color=no 2>&1 | tee /tmp/ctest-target.log | tail -200 || true
+      # summary
+      echo; echo "--- CTEST (target) summary ---"
+      grep -E "^\\[       OK \\]|^\\[  FAILED  \\]|^\\[==========\\].*(ran|passed|failed)" /tmp/ctest-target.log | tail -30
+      echo -n "done" | python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${SYNC}/ctest-done',data=b'',timeout=5)"
+    else
+      echo "SKIP: $CTEST not found"
+      echo -n "skipped" | python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${SYNC}/ctest-done',data=b'',timeout=5)"
+    fi
+
+    # Helper: wait log for "listening on HOST:PORT" and POST to sync
+    publish_endpoint() {
+      local label=$1 logfile=$2
+      for _ in $(seq 1 90); do
+        PORT=$(grep -oE 'listening on [0-9a-zA-Z.:]+' "$logfile" 2>/dev/null | head -1 | awk '{print $3}' | awk -F: '{print $NF}')
+        if [ -n "$PORT" ]; then
+          ENDPOINT="${HOST_IP}:${PORT}"
+          echo "[$label] -> $ENDPOINT"
+          python3 -c "import urllib.request,urllib.parse; urllib.request.urlopen('http://127.0.0.1:${SYNC}/${label}?v='+urllib.parse.quote('${ENDPOINT}'),data=b'',timeout=5)"
+          return 0
+        fi
+        sleep 1
+      done
+      echo "[$label] FAIL: no listening-on line"
+      return 1
+    }
+
+    wait_done() {
+      local label=$1
+      for _ in $(seq 1 300); do
+        if python3 -c "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:${SYNC}/${label}-done',timeout=3)" 2>/dev/null; then
+          return 0
+        fi
+        sleep 1
+      done
+      echo "[$label] TIMEOUT waiting for done"
+      return 1
+    }
+
+    # Wrapper: launch target in background, wait log for port, publish, wait for done, kill.
+    run_target() {
+      local label=$1 bin=$2; shift 2
+      local logfile=/tmp/target-${label}.log
+      echo; echo ">>> [$label] starting target"
+      $bin "$@" --mode=target --metadata_server=P2PHANDSHAKE \
+         --local_server_name=${HOST_IP}:12345 > "$logfile" 2>&1 &
+      local pid=$!
+      publish_endpoint "$label" "$logfile" || { kill $pid 2>/dev/null; return 1; }
+      wait_done "$label" || true
+      kill -TERM $pid 2>/dev/null || true
+      sleep 2
+      kill -KILL $pid 2>/dev/null || true
+      wait $pid 2>/dev/null || true
+      echo "[$label] target exited"
+    }
+
+    # ====== Test B1: probe warmup=1 ======
+    run_target probe_warm $PROBE
+
+    # ====== Test B2: probe warmup=0 ======
+    run_target probe_cold $PROBE
+
+    # ====== Test C1: GPU write baseline ======
+    run_target c1_write $BENCH --protocol=efa --buffer_size=4294967296 --gpu_id=-1
+
+    # ====== Test C2: GPU read baseline ======
+    run_target c2_read  $BENCH --protocol=efa --buffer_size=4294967296 --gpu_id=-1
+
+    # ====== Test C3: GPU write peak alt ======
+    run_target c3_write32 $BENCH --protocol=efa --buffer_size=2147483648 --gpu_id=-1
+
+    # ====== Block size sweep (D1-D6) — target uses default buffer; initiator drives block size ======
+    for lbl in d1_64k d2_128k d3_256k d4_512k d5_1m d6_2m; do
+      run_target $lbl $BENCH --protocol=efa --buffer_size=4294967296 --gpu_id=-1
+    done
+
+    # ====== Concurrency extra (E4: threads=32 batch=128) ======
+    run_target e4_t32b128 $BENCH --protocol=efa --buffer_size=4294967296 --gpu_id=-1
+
+    # ====== Buffer size F1 / F2 ======
+    run_target f1_buf2g $BENCH --protocol=efa --buffer_size=2147483648 --gpu_id=-1
+    run_target f2_buf4g $BENCH --protocol=efa --buffer_size=4294967296 --gpu_id=-1
+
+    # ====== G1/G2 CPU-to-CPU ======
+    run_target g1_cpu_write $BENCH --protocol=efa --buffer_size=4294967296 --use_vram=false
+    run_target g2_cpu_read  $BENCH --protocol=efa --buffer_size=4294967296 --use_vram=false
+
+    kill $SYNC_PID 2>/dev/null || true
+    echo; echo "=== TARGET ALL DONE ==="
+
+  initiator.sh: |
+    #!/usr/bin/env bash
+    set -eu
+    HOST_IP=$(hostname -i | awk '{print $1}')
+    BENCH=/opt/mooncake/install/bin/transfer_engine_bench
+    PROBE=/opt/mooncake/install/bin/efa_first_submit_probe
+    CTEST=/opt/mooncake/install/bin/efa_transport_test
+    SYNC="http://${TARGET_IP}:8888"
+
+    echo "=== INITIATOR node=$(hostname) ip=$HOST_IP ==="
+
+    # ====== Test A local ======
+    echo; echo "=============================="
+    echo "== Test A (initiator) ========="
+    echo "=============================="
+    python3 -c "from mooncake.engine import TransferEngine; te=TransferEngine(); print('RESULT=', te.initialize('127.0.0.1:12341','P2PHANDSHAKE','efa',''))"
+
+    # ====== CTEST on initiator side ======
+    echo; echo "=============================="
+    echo "== CTEST (initiator) =========="
+    echo "=============================="
+    if [ -x "$CTEST" ]; then
+      timeout 600 $CTEST --gtest_color=no 2>&1 | tee /tmp/ctest-init.log | tail -200 || true
+      echo "--- CTEST (initiator) summary ---"
+      grep -E "^\\[       OK \\]|^\\[  FAILED  \\]|^\\[==========\\]" /tmp/ctest-init.log | tail -30
+    fi
+
+    # Poll sync for target endpoint
+    poll() {
+      local label=$1
+      for _ in $(seq 1 300); do
+        ep=$(python3 -c "import urllib.request,sys; r=urllib.request.urlopen('${SYNC}/${label}',timeout=3); print(r.read().decode().strip())" 2>/dev/null || echo "")
+        [ -n "$ep" ] && { echo "$ep"; return 0; }
+        sleep 1
+      done
+      return 1
+    }
+    signal_done() {
+      local label=$1
+      python3 -c "import urllib.request; urllib.request.urlopen('${SYNC}/${label}-done',data=b'',timeout=5)" 2>/dev/null || true
+    }
+
+    # Run one bench invocation, extract throughput line, signal done
+    run_bench() {
+      local label=$1; shift
+      local EP=$(poll $label) || { echo "[$label] NO ENDPOINT"; return 1; }
+      echo; echo ">>> [$label] EP=$EP"
+      local log=/tmp/init-${label}.log
+      timeout 90 $BENCH --mode=initiator --protocol=efa \
+        --metadata_server=P2PHANDSHAKE \
+        --local_server_name=${HOST_IP}:12346 \
+        --segment_id=$EP \
+        --report_unit=GB --duration=10 \
+        "$@" 2>&1 | tee $log | tail -20 || echo "(exited)"
+      local tp=$(grep -oE 'throughput [0-9.]+[^ ]* [GMK]?B/s' $log | tail -1)
+      echo "[$label] ${tp:-NO_THROUGHPUT}"
+      signal_done $label
+    }
+
+    # ====== B1 probe warmup=1 ======
+    EP=$(poll probe_warm) || echo "(no probe_warm ep)"
+    echo; echo ">>> probe_warm EP=$EP"
+    timeout 60 $PROBE --mode=initiator --metadata_server=P2PHANDSHAKE \
+      --local_server_name=${HOST_IP}:12345 --segment_id=$EP \
+      --warmup=1 --iters=5 2>&1 | tee /tmp/init-probe-warm.log | tail -15 || echo "(probe warm exited)"
+    grep -E "warmup:|submit #" /tmp/init-probe-warm.log || true
+    signal_done probe_warm
+
+    # ====== B2 probe warmup=0 ======
+    EP=$(poll probe_cold) || echo "(no probe_cold ep)"
+    echo; echo ">>> probe_cold EP=$EP"
+    timeout 60 $PROBE --mode=initiator --metadata_server=P2PHANDSHAKE \
+      --local_server_name=${HOST_IP}:12345 --segment_id=$EP \
+      --warmup=0 --iters=5 2>&1 | tee /tmp/init-probe-cold.log | tail -15 || echo "(probe cold exited)"
+    grep -E "warmup:|submit #" /tmp/init-probe-cold.log || true
+    signal_done probe_cold
+
+    # ====== C1 GPU write baseline ======
+    run_bench c1_write --operation=write --threads=16 --batch_size=128 --block_size=1048576 --buffer_size=4294967296 --gpu_id=-1
+
+    # ====== C2 GPU read baseline ======
+    run_bench c2_read  --operation=read  --threads=16 --batch_size=32  --block_size=1048576 --buffer_size=4294967296 --gpu_id=-1
+
+    # ====== C3 GPU write peak alt ======
+    run_bench c3_write32 --operation=write --threads=32 --batch_size=64 --block_size=1048576 --buffer_size=2147483648 --gpu_id=-1
+
+    # ====== D1-D6 block size sweep (write threads=16 batch=128 buffer=4G) ======
+    run_bench d1_64k  --operation=write --threads=16 --batch_size=128 --block_size=65536   --buffer_size=4294967296 --gpu_id=-1
+    run_bench d2_128k --operation=write --threads=16 --batch_size=128 --block_size=131072  --buffer_size=4294967296 --gpu_id=-1
+    run_bench d3_256k --operation=write --threads=16 --batch_size=128 --block_size=262144  --buffer_size=4294967296 --gpu_id=-1
+    run_bench d4_512k --operation=write --threads=16 --batch_size=128 --block_size=524288  --buffer_size=4294967296 --gpu_id=-1
+    run_bench d5_1m   --operation=write --threads=16 --batch_size=128 --block_size=1048576 --buffer_size=4294967296 --gpu_id=-1
+    run_bench d6_2m   --operation=write --threads=16 --batch_size=128 --block_size=2097152 --buffer_size=4294967296 --gpu_id=-1
+
+    # ====== E4 concurrency extra (threads=32 batch=128) ======
+    run_bench e4_t32b128 --operation=write --threads=32 --batch_size=128 --block_size=1048576 --buffer_size=4294967296 --gpu_id=-1
+
+    # ====== F1 buffer=2G ======
+    run_bench f1_buf2g --operation=write --threads=16 --batch_size=128 --block_size=1048576 --buffer_size=2147483648 --gpu_id=-1
+
+    # ====== F2 buffer=4G ======
+    run_bench f2_buf4g --operation=write --threads=16 --batch_size=128 --block_size=1048576 --buffer_size=4294967296 --gpu_id=-1
+
+    # ====== G1 CPU-to-CPU write ======
+    run_bench g1_cpu_write --operation=write --threads=16 --batch_size=128 --block_size=1048576 --buffer_size=4294967296 --use_vram=false
+
+    # ====== G2 CPU-to-CPU read ======
+    run_bench g2_cpu_read  --operation=read  --threads=48 --batch_size=32  --block_size=1048576 --buffer_size=4294967296 --use_vram=false
+
+    echo; echo "=============================="
+    echo "== INITIATOR ALL DONE ========="
+    echo "=============================="
+    echo
+    echo "=== FINAL THROUGHPUT SUMMARY ==="
+    for lbl in c1_write c2_read c3_write32 d1_64k d2_128k d3_256k d4_512k d5_1m d6_2m e4_t32b128 f1_buf2g f2_buf4g g1_cpu_write g2_cpu_read; do
+      f=/tmp/init-${lbl}.log
+      if [ -f "$f" ]; then
+        tp=$(grep -oE 'throughput [0-9.]+[^ ]* [GMK]?B/s' $f | tail -1)
+        echo "$lbl : ${tp:-FAIL}"
+      fi
+    done
+    echo
+    echo "=== PROBE SUMMARY ==="
+    for f in probe-warm probe-cold; do
+      l=/tmp/init-${f}.log
+      [ -f "$l" ] && grep -E "warmup:|submit #" $l || true
+      echo "---"
+    done
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: customer-p5-2node-sa
+  namespace: default
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: customer-p5-2node-target
+  namespace: default
+spec:
+  serviceName: customer-p5-2node-target
+  replicas: 1
+  selector:
+    matchLabels: { app: customer-p5-2node, role: target }
+  template:
+    metadata:
+      labels: { app: customer-p5-2node, role: target }
+    spec:
+      serviceAccountName: customer-p5-2node-sa
+      restartPolicy: Always
+      hostNetwork: true
+      hostIPC: true
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchFields:
+                  - key: metadata.name
+                    operator: In
+                    values: ["PLACEHOLDER_TARGET_NODE"]
+      nodeSelector:
+        node.kubernetes.io/instance-type: p5.48xlarge
+      volumes:
+        - name: scripts
+          configMap:
+            name: customer-p5-2node-full-scripts
+            defaultMode: 0755
+      containers:
+        - name: smoke
+          image: public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.04.28-h200.5
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+            capabilities: { add: ["IPC_LOCK","SYS_NICE","SYS_RESOURCE","NET_RAW","NET_ADMIN"] }
+          env:
+            - { name: FI_PROVIDER,            value: "efa" }
+            - { name: FI_EFA_USE_DEVICE_RDMA, value: "1" }
+            - { name: FI_EFA_FORK_SAFE,       value: "1" }
+            - { name: FI_EFA_USE_HUGE_PAGE,   value: "0" }
+            - { name: MOONCAKE_PROTOCOL,      value: "efa" }
+          resources:
+            requests: { cpu: "2", memory: "8Gi" }
+            limits:
+              nvidia.com/gpu: "8"
+              vpc.amazonaws.com/efa: "32"
+          volumeMounts:
+            - { name: scripts, mountPath: /scripts }
+          command: ["/bin/bash","/scripts/target.sh"]
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: customer-p5-2node-initiator
+  namespace: default
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels: { app: customer-p5-2node, role: initiator }
+    spec:
+      serviceAccountName: customer-p5-2node-sa
+      restartPolicy: Never
+      hostNetwork: true
+      hostIPC: true
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchFields:
+                  - key: metadata.name
+                    operator: In
+                    values: ["PLACEHOLDER_INITIATOR_NODE"]
+      nodeSelector:
+        node.kubernetes.io/instance-type: p5.48xlarge
+      volumes:
+        - name: scripts
+          configMap:
+            name: customer-p5-2node-full-scripts
+            defaultMode: 0755
+      containers:
+        - name: smoke
+          image: public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.04.28-h200.5
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+            capabilities: { add: ["IPC_LOCK","SYS_NICE","SYS_RESOURCE","NET_RAW","NET_ADMIN"] }
+          env:
+            - { name: FI_PROVIDER,            value: "efa" }
+            - { name: FI_EFA_USE_DEVICE_RDMA, value: "1" }
+            - { name: FI_EFA_FORK_SAFE,       value: "1" }
+            - { name: FI_EFA_USE_HUGE_PAGE,   value: "0" }
+            - { name: MOONCAKE_PROTOCOL,      value: "efa" }
+            - { name: TARGET_IP,              value: "PLACEHOLDER_TARGET_IP" }
+          resources:
+            requests: { cpu: "2", memory: "8Gi" }
+            limits:
+              nvidia.com/gpu: "8"
+              vpc.amazonaws.com/efa: "32"
+          volumeMounts:
+            - { name: scripts, mountPath: /scripts }
+          command: ["/bin/bash","/scripts/initiator.sh"]

@@ -1,0 +1,234 @@
+# =============================================================================
+# Customer image .5 — SINGLE-NODE loopback full test suite
+# https://kvcache-ai.github.io/Mooncake/design/transfer-engine/efa_transport.html
+#
+# Runs on 1 × p5.48xlarge (H100 + 32 EFA). Both target and initiator run as
+# background processes in a single pod, talking over loopback 127.0.0.1.
+# This covers:
+#
+#   A    Python TransferEngine.initialize(efa) returns 0
+#   CTEST efa_transport_test gtest suite (10 subtests, all loopback-based
+#         per Mooncake source: LoopbackWrite, WriteAndRead, etc.)
+#   B1   efa_first_submit_probe warmup=1 iters=5
+#   B2   efa_first_submit_probe warmup=0 iters=5
+#   C1   transfer_engine_bench write threads=16 batch=128 block=1M (loopback)
+#   C2   transfer_engine_bench read  threads=16 batch=32  block=1M
+#   D1-D6 block size sweep (64K/128K/256K/512K/1M/2M)
+#   F1-F2 buffer 2G/4G
+#   G1   CPU-to-CPU write (--use_vram=false)
+#   G2   CPU-to-CPU read
+#
+# NOTE: loopback numbers are informational; 跨节点 bandwidth 已经通过 .4 smoke
+# 验证为 377.53 GB/s write. Loopback bench 主要验证 code path 完整性，不是
+# peak throughput.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: customer-p5-loopback-scripts
+  namespace: default
+data:
+  run.sh: |
+    #!/usr/bin/env bash
+    set -eu
+    HOST_IP=127.0.0.1
+    BENCH=/opt/mooncake/install/bin/transfer_engine_bench
+    PROBE=/opt/mooncake/install/bin/efa_first_submit_probe
+    CTEST=/opt/mooncake/install/bin/efa_transport_test
+
+    echo "=============================="
+    echo "== ENV ========================"
+    echo "=============================="
+    hostname -i
+    ls -la /opt/mooncake/install/bin/
+    cat /opt/BUILD_INFO.json
+    fi_info -p efa -t FI_EP_RDM 2>/dev/null | awk '/domain:/ {print $2}' | sort -u | head -35
+    EFA_CNT=$(fi_info -p efa -t FI_EP_RDM 2>/dev/null | awk '/domain:/ {print $2}' | sort -u | wc -l)
+    echo "EFA devices: $EFA_CNT"
+
+    echo
+    echo "=============================="
+    echo "== TEST A: Python init ========"
+    echo "=============================="
+    python3 -c "from mooncake.engine import TransferEngine; te=TransferEngine(); print('RESULT=', te.initialize('127.0.0.1:12340','P2PHANDSHAKE','efa',''))"
+
+    echo
+    echo "=============================="
+    echo "== CTEST: efa_transport_test =="
+    echo "=============================="
+    if [ -x "$CTEST" ]; then
+      echo "--- listing tests ---"
+      $CTEST --gtest_list_tests 2>&1 | head -30
+      echo "--- running all tests (timeout 600s) ---"
+      timeout 600 $CTEST --gtest_color=no 2>&1 | tee /tmp/ctest.log | tail -150 || echo "(ctest exited code $?)"
+      echo
+      echo "--- CTEST pass/fail summary ---"
+      grep -E "^\[       OK \]|^\[  FAILED  \]|^\[==========\]" /tmp/ctest.log | tail -30
+      PASS=$(grep -cE "^\[       OK \]" /tmp/ctest.log || echo 0)
+      FAIL=$(grep -cE "^\[  FAILED  \]" /tmp/ctest.log || echo 0)
+      echo "CTEST RESULT: $PASS passed, $FAIL failed"
+    else
+      echo "SKIP: $CTEST not found"
+    fi
+
+    # --- Helper: launch $BENCH/target, wait for port, then run initiator ---
+    bench_loopback() {
+      local label=$1; shift
+      echo
+      echo ">>> BENCH [$label] $*"
+      local tlog=/tmp/t-${label}.log
+      local ilog=/tmp/i-${label}.log
+      # Target
+      $BENCH "$@" --mode=target --protocol=efa --metadata_server=P2PHANDSHAKE \
+        --local_server_name=${HOST_IP}:$((RANDOM+20000)) > $tlog 2>&1 &
+      local tpid=$!
+      # Wait for target's actual port
+      local EP=""
+      for _ in $(seq 1 60); do
+        PORT=$(grep -oE 'listening on [0-9a-zA-Z.:]+' "$tlog" 2>/dev/null | head -1 | awk '{print $3}' | awk -F: '{print $NF}')
+        if [ -n "$PORT" ]; then
+          EP="${HOST_IP}:${PORT}"; break
+        fi
+        sleep 1
+      done
+      [ -z "$EP" ] && { echo "[$label] NO EP"; kill $tpid 2>/dev/null; return 1; }
+      echo "[$label] target EP=$EP"
+      # Initiator
+      timeout 60 $BENCH "$@" --mode=initiator --protocol=efa --metadata_server=P2PHANDSHAKE \
+        --local_server_name=${HOST_IP}:$((RANDOM+40000)) \
+        --segment_id=$EP --report_unit=GB --duration=10 > $ilog 2>&1 || echo "(init exited)"
+      local tp=$(grep -oE 'throughput [0-9.]+[^ ]* [GMK]?B/s' $ilog | tail -1)
+      echo "[$label] RESULT: ${tp:-NO_THROUGHPUT}"
+      # Kill target
+      kill -TERM $tpid 2>/dev/null || true; sleep 2
+      kill -KILL $tpid 2>/dev/null || true
+      wait $tpid 2>/dev/null || true
+    }
+
+    probe_loopback() {
+      local label=$1 warmup=$2
+      echo
+      echo ">>> PROBE [$label] warmup=$warmup"
+      local tlog=/tmp/pt-${label}.log
+      local ilog=/tmp/pi-${label}.log
+      $PROBE --mode=target --metadata_server=P2PHANDSHAKE \
+        --local_server_name=${HOST_IP}:$((RANDOM+20000)) > $tlog 2>&1 &
+      local tpid=$!
+      local EP=""
+      for _ in $(seq 1 60); do
+        PORT=$(grep -oE 'listening on [0-9a-zA-Z.:]+' "$tlog" 2>/dev/null | head -1 | awk '{print $3}' | awk -F: '{print $NF}')
+        if [ -n "$PORT" ]; then
+          EP="${HOST_IP}:${PORT}"; break
+        fi
+        sleep 1
+      done
+      [ -z "$EP" ] && { echo "[$label] NO EP"; kill $tpid 2>/dev/null; return 1; }
+      echo "[$label] probe target EP=$EP"
+      timeout 60 $PROBE --mode=initiator --metadata_server=P2PHANDSHAKE \
+        --local_server_name=${HOST_IP}:$((RANDOM+40000)) \
+        --segment_id=$EP --warmup=$warmup --iters=5 > $ilog 2>&1 || echo "(probe exited)"
+      echo "[$label] results:"
+      grep -E "warmup:|submit #" $ilog || echo "NO OUTPUT"
+      kill -TERM $tpid 2>/dev/null || true; sleep 2
+      kill -KILL $tpid 2>/dev/null || true
+      wait $tpid 2>/dev/null || true
+    }
+
+    echo
+    echo "=============================="
+    echo "== PROBE B1: warmup=1 ========="
+    echo "=============================="
+    probe_loopback b1_warm 1
+
+    echo
+    echo "=============================="
+    echo "== PROBE B2: warmup=0 ========="
+    echo "=============================="
+    probe_loopback b2_cold 0
+
+    echo
+    echo "=============================="
+    echo "== BENCH C/D/F/G matrix ======="
+    echo "=============================="
+    # Baseline
+    bench_loopback c1_write --operation=write --threads=16 --batch_size=128 --block_size=1048576 --buffer_size=4294967296 --gpu_id=-1
+    bench_loopback c2_read  --operation=read  --threads=16 --batch_size=32  --block_size=1048576 --buffer_size=4294967296 --gpu_id=-1
+    # Block size sweep (write)
+    bench_loopback d1_64k  --operation=write --threads=16 --batch_size=128 --block_size=65536   --buffer_size=4294967296 --gpu_id=-1
+    bench_loopback d2_128k --operation=write --threads=16 --batch_size=128 --block_size=131072  --buffer_size=4294967296 --gpu_id=-1
+    bench_loopback d3_256k --operation=write --threads=16 --batch_size=128 --block_size=262144  --buffer_size=4294967296 --gpu_id=-1
+    bench_loopback d4_512k --operation=write --threads=16 --batch_size=128 --block_size=524288  --buffer_size=4294967296 --gpu_id=-1
+    bench_loopback d5_1m   --operation=write --threads=16 --batch_size=128 --block_size=1048576 --buffer_size=4294967296 --gpu_id=-1
+    bench_loopback d6_2m   --operation=write --threads=16 --batch_size=128 --block_size=2097152 --buffer_size=4294967296 --gpu_id=-1
+    # Buffer size
+    bench_loopback f1_buf2g --operation=write --threads=16 --batch_size=128 --block_size=1048576 --buffer_size=2147483648 --gpu_id=-1
+    bench_loopback f2_buf4g --operation=write --threads=16 --batch_size=128 --block_size=1048576 --buffer_size=4294967296 --gpu_id=-1
+    # CPU-to-CPU
+    bench_loopback g1_cpu_w --operation=write --threads=16 --batch_size=128 --block_size=1048576 --buffer_size=4294967296 --use_vram=false
+    bench_loopback g2_cpu_r --operation=read  --threads=48 --batch_size=32  --block_size=1048576 --buffer_size=4294967296 --use_vram=false
+
+    echo
+    echo "=============================="
+    echo "== FINAL SUMMARY =============="
+    echo "=============================="
+    for lbl in c1_write c2_read d1_64k d2_128k d3_256k d4_512k d5_1m d6_2m f1_buf2g f2_buf4g g1_cpu_w g2_cpu_r; do
+      f=/tmp/i-${lbl}.log
+      if [ -f "$f" ]; then
+        tp=$(grep -oE 'throughput [0-9.]+[^ ]* [GMK]?B/s' $f | tail -1)
+        echo "$lbl : ${tp:-FAIL}"
+      fi
+    done
+    echo
+    echo "CTEST $(grep -cE '^\[       OK \]' /tmp/ctest.log 2>/dev/null || echo 0) passed, $(grep -cE '^\[  FAILED  \]' /tmp/ctest.log 2>/dev/null || echo 0) failed"
+    echo
+    echo "== DONE =="
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: customer-p5-loopback
+  namespace: default
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels: { app: customer-p5-loopback }
+    spec:
+      restartPolicy: Never
+      hostNetwork: true
+      hostIPC: true
+      tolerations:
+        - { key: nvidia.com/gpu,         operator: Exists, effect: NoSchedule }
+        - { key: vpc.amazonaws.com/efa,  operator: Exists, effect: NoSchedule }
+        - { key: node.kubernetes.io/unreachable, operator: Exists, effect: NoSchedule }
+        - { key: node.kubernetes.io/unreachable, operator: Exists, effect: NoExecute, tolerationSeconds: 3600 }
+      nodeSelector:
+        node.kubernetes.io/instance-type: p5.48xlarge
+      volumes:
+        - name: scripts
+          configMap:
+            name: customer-p5-loopback-scripts
+            defaultMode: 0755
+      containers:
+        - name: smoke
+          image: public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.04.28-h200.5
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+            capabilities: { add: ["IPC_LOCK","SYS_NICE","SYS_RESOURCE","NET_RAW","NET_ADMIN"] }
+          env:
+            - { name: FI_PROVIDER,            value: "efa" }
+            - { name: FI_EFA_USE_DEVICE_RDMA, value: "1" }
+            - { name: FI_EFA_FORK_SAFE,       value: "1" }
+            - { name: FI_EFA_USE_HUGE_PAGE,   value: "0" }
+            - { name: MOONCAKE_PROTOCOL,      value: "efa" }
+          resources:
+            requests: { cpu: "4", memory: "16Gi" }
+            limits:
+              nvidia.com/gpu: "8"
+              vpc.amazonaws.com/efa: "32"
+          volumeMounts:
+            - { name: scripts, mountPath: /scripts }
+          command: ["/bin/bash","/scripts/run.sh"]
