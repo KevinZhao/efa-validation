@@ -62,13 +62,32 @@ if [ "${DRY_RUN}" = "1" ]; then
   exit 0
 fi
 
-# ---- Upload Dockerfile to S3 ----
+# ---- Upload Dockerfile + patch overlay to S3 ----
+# Dockerfile references patches/*.patch via COPY, so the patch files must
+# ride along into the build context on the builder EC2.
 DOCKERFILE_REL="common/Dockerfile.sglang-mooncake-nixl-uccl"
+PATCH_DIR_REL="patches"
 STAMP="$(ts)"
 DOCKERFILE_S3_KEY="dockerfiles/sglang-mooncake-nixl-uccl-${STAMP}/Dockerfile"
+PATCH_S3_PREFIX="dockerfiles/sglang-mooncake-nixl-uccl-${STAMP}/patches"
 
 log "Uploading Dockerfile to s3://${S3_BUCKET}/${DOCKERFILE_S3_KEY}"
 aws s3 cp "${REPO_ROOT}/${DOCKERFILE_REL}" "s3://${S3_BUCKET}/${DOCKERFILE_S3_KEY}" --quiet
+
+PATCH_FILES=()
+if [ -d "${REPO_ROOT}/${PATCH_DIR_REL}" ]; then
+  while IFS= read -r f; do
+    PATCH_FILES+=("$f")
+  done < <(find "${REPO_ROOT}/${PATCH_DIR_REL}" -maxdepth 1 -type f -name '*.patch' | sort)
+fi
+if [ ${#PATCH_FILES[@]} -eq 0 ]; then
+  log "WARN: no *.patch files under ${PATCH_DIR_REL}/ — Dockerfile COPY will fail if patches are referenced"
+fi
+for patch_local in "${PATCH_FILES[@]}"; do
+  patch_name=$(basename "${patch_local}")
+  log "Uploading patch: ${patch_name}"
+  aws s3 cp "${patch_local}" "s3://${S3_BUCKET}/${PATCH_S3_PREFIX}/${patch_name}" --quiet
+done
 
 # ---- Build command ----
 BUILD_CMD="docker build --progress=plain"
@@ -85,7 +104,22 @@ BUILD_CMD="${BUILD_CMD} -t ${PRIVATE_IMAGE} ."
 
 PUSH_CMD="docker push ${PRIVATE_IMAGE}"
 
-INNER="${BUILD_CMD} && ${PUSH_CMD} && echo BUILD_DONE"
+# Optional public push (opt-in via PUBLISH=1). Only pushes the primary tag;
+# does not touch `latest`/monthly moving tags (this is an internal comparison
+# image, moving tags are reserved for customer release streams).
+PUBLISH="${PUBLISH:-0}"
+PUBLIC_CMD=""
+PUBLIC_IMAGE=""
+if [ "${PUBLISH}" = "1" ]; then
+  ECR_PUBLIC_ALIAS="${ECR_PUBLIC_ALIAS:-n3l4x8f3}"
+  PUBLIC_IMAGE="public.ecr.aws/${ECR_PUBLIC_ALIAS}/${IMAGE_NAME}:${TAG_PRIMARY}"
+  PUBLIC_CMD=" && aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws"
+  PUBLIC_CMD="${PUBLIC_CMD} && docker tag ${PRIVATE_IMAGE} ${PUBLIC_IMAGE}"
+  PUBLIC_CMD="${PUBLIC_CMD} && docker push ${PUBLIC_IMAGE}"
+  log "  public tag : ${PUBLIC_IMAGE}"
+fi
+
+INNER="${BUILD_CMD} && ${PUSH_CMD}${PUBLIC_CMD} && echo BUILD_DONE"
 
 # Build JSON payload using python (same pattern as build-customer-image.sh)
 PAYLOAD_FILE=$(mktemp)
@@ -98,8 +132,10 @@ cmds = [
     "docker --version",
     "aws ecr get-login-password --region ${AWS_REGION_PRIMARY} | docker login --username AWS --password-stdin ${ECR_REG}",
     "WORKDIR=/root/build/sglang-mooncake-nixl-uccl-${STAMP}",
-    "mkdir -p \$WORKDIR && cd \$WORKDIR",
+    "mkdir -p \$WORKDIR/patches && cd \$WORKDIR",
     "aws s3 cp s3://${S3_BUCKET}/${DOCKERFILE_S3_KEY} ./Dockerfile",
+    "aws s3 sync s3://${S3_BUCKET}/${PATCH_S3_PREFIX}/ ./patches/ || echo 'no patches'",
+    "ls -la ./patches/",
     "nohup bash -c '${INNER}' > \$WORKDIR/build.log 2>&1 &",
     "sleep 3",
     "echo build started, log=\$WORKDIR/build.log",

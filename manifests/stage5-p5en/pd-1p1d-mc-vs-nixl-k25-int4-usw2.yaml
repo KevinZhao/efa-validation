@@ -276,6 +276,10 @@ spec:
             # *** THE A/B VARIABLE — set to "mooncake" or "nixl" at apply time ***
             - { name: KV_BACKEND, value: "${KV_BACKEND}" }
 
+            # --- NIXL plugin fix: sglang reads SGLANG_DISAGGREGATION_NIXL_BACKEND
+            # (default UCX). LIBFABRIC avoids UCX's EFA fallback-to-TCP hang on p5en.
+            - { name: SGLANG_DISAGGREGATION_NIXL_BACKEND, value: "LIBFABRIC" }
+
             # --- SGLang internals (verbatim from customer) -----------------
             - { name: NVIDIA_SPARSE_ENABLE, value: "1" }
             - { name: OMP_NUM_THREADS, value: "16" }
@@ -396,6 +400,10 @@ spec:
             - { name: CONTEXT_LEN, value: "262144" }
             - { name: MEM_FRAC_STATIC, value: "0.85" }
             - { name: KV_BACKEND, value: "${KV_BACKEND}" }
+
+            # --- NIXL plugin fix: sglang reads SGLANG_DISAGGREGATION_NIXL_BACKEND
+            # (default UCX). LIBFABRIC avoids UCX's EFA fallback-to-TCP hang on p5en.
+            - { name: SGLANG_DISAGGREGATION_NIXL_BACKEND, value: "LIBFABRIC" }
 
             - { name: NVIDIA_SPARSE_ENABLE, value: "1" }
             - { name: OMP_NUM_THREADS, value: "16" }

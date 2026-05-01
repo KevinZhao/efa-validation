@@ -207,6 +207,25 @@ RUN git clone --recursive ${MOONCAKE_REPO} /opt/mooncake && \
     git submodule update --init --recursive && \
     if [ -x dependencies.sh ]; then yes | ./dependencies.sh || ./dependencies.sh -y || true; fi
 
+# ---- Apply Mooncake EFA patches (upstream PRs not yet merged) ----
+# PR #2023: [EFA] Fix segfault race between setPeerNicPath and in-flight
+# submitPostSend. Holds a read lock across the entire submitSlicesOnPeer
+# call so disconnect() / setPeerNicPath() (write lock) cannot fi_av_remove
+# our AV slot while an fi_write() is still in flight.
+# Reproduced on SGLang 2P2D GLM-5.1-FP8 PP=2/TP=8/CP=8/EP=8 with
+# moe_a2a=deepep — peer reshuffles RPC port on restart, CONNECTED branch
+# of setPeerNicPath fires while sender threads still have fi_write calls
+# in flight → libfabric segfault on stale fi_addr_t.
+# Remove this block + the COPY above once MOONCAKE_REF is bumped past merge.
+COPY patches/mooncake-pr-2023-efa-reconnect-race.patch /tmp/mooncake-pr-2023.patch
+RUN cd /opt/mooncake && \
+    git apply --check /tmp/mooncake-pr-2023.patch && \
+    git apply /tmp/mooncake-pr-2023.patch && \
+    grep -q "Hold a read lock for the entire submit window" \
+      mooncake-transfer-engine/src/transport/efa_transport/efa_endpoint.cpp || \
+      { echo "ERROR: PR #2023 sentinel comment not found after apply" >&2; exit 1; } && \
+    echo "[patch] Mooncake PR #2023 (setPeerNicPath race) applied"
+
 ENV PATH="/usr/local/go/bin:${PATH}"
 
 RUN mkdir -p /opt/mooncake/build && cd /opt/mooncake/build && \
@@ -333,6 +352,7 @@ LABEL org.opencontainers.image.title="sglang-mooncake-${VARIANT}" \
       org.opencontainers.image.vendor="AWS Account Team" \
       aws.efa.installer="${EFA_INSTALLER_VERSION}" \
       aws.mooncake.ref="${MOONCAKE_REF}" \
+      aws.mooncake.patches="pr-2023" \
       aws.uccl.ref="${UCCL_REF}" \
       aws.sglang.version="${SGLANG_VERSION}" \
       aws.variant="${VARIANT}"
@@ -435,6 +455,7 @@ RUN UCCL_SHA=$(cat /opt/BUILD_INFO.uccl-sha) && \
     printf '  "build_date": "%s",\n' "${BUILD_DATE}" >> /opt/BUILD_INFO.json && \
     printf '  "vcs_ref": "%s",\n' "${VCS_REF}" >> /opt/BUILD_INFO.json && \
     printf '  "mooncake_ref": "%s",\n' "${MOONCAKE_SHA}" >> /opt/BUILD_INFO.json && \
+    printf '  "mooncake_patches": ["pr-2023"],\n' >> /opt/BUILD_INFO.json && \
     printf '  "uccl_ref": "%s",\n' "${UCCL_SHA}" >> /opt/BUILD_INFO.json && \
     printf '  "sglang_version": "%s",\n' "${SGLANG_VER}" >> /opt/BUILD_INFO.json && \
     printf '  "torch_version": "%s",\n' "${TORCH_VER}" >> /opt/BUILD_INFO.json && \
@@ -451,6 +472,9 @@ RUN UCCL_SHA=$(cat /opt/BUILD_INFO.uccl-sha) && \
 RUN python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)" && \
     python -c "import mooncake; print('mooncake OK')" && \
     python -c "from mooncake.engine import TransferEngine; print('mooncake.engine.TransferEngine OK')" && \
+    python -c "import json; bi = json.load(open('/opt/BUILD_INFO.json')); \
+               assert 'pr-2023' in bi.get('mooncake_patches', []), 'pr-2023 not recorded in BUILD_INFO.json'; \
+               print('mooncake_patches recorded:', bi['mooncake_patches'])" && \
     test -f /usr/lib/x86_64-linux-gnu/libpython3.10.so.1.0 && echo "libpython3.10.so.1.0 OK" && \
     test -f /usr/include/python3.10/Python.h && echo "Python.h OK" && \
     test -x /usr/bin/ninja && ninja --version && echo "ninja OK" && \

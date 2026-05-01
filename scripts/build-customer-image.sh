@@ -102,16 +102,38 @@ if [ "${DRY_RUN}" = "1" ]; then
   exit 0
 fi
 
-# ---- Upload Dockerfile + matrix to S3 ----
+# ---- Upload Dockerfile + matrix + patch overlay to S3 ----
+# Dockerfile references patches/*.patch via COPY, so the patch files must
+# ride along into the build context on the builder EC2.
 DOCKERFILE_REL="common/Dockerfile.customer-h200"
 MATRIX_REL="common/BUILD_MATRIX.md"
+PATCH_DIR_REL="patches"
 STAMP="$(ts)"
 DOCKERFILE_S3_KEY="dockerfiles/customer-h200-${STAMP}/Dockerfile"
 MATRIX_S3_KEY="dockerfiles/customer-h200-${STAMP}/BUILD_MATRIX.md"
+PATCH_S3_PREFIX="dockerfiles/customer-h200-${STAMP}/patches"
 
 log "Uploading Dockerfile + BUILD_MATRIX.md to s3://${S3_BUCKET}/dockerfiles/customer-h200-${STAMP}/"
 aws s3 cp "${REPO_ROOT}/${DOCKERFILE_REL}" "s3://${S3_BUCKET}/${DOCKERFILE_S3_KEY}" --quiet
 aws s3 cp "${REPO_ROOT}/${MATRIX_REL}"     "s3://${S3_BUCKET}/${MATRIX_S3_KEY}" --quiet
+
+# Enumerate patch files (only the ones actually referenced by Dockerfile COPY).
+# Today: patches/mooncake-pr-2023-efa-reconnect-race.patch. Glob keeps the
+# script stable if we add more later (same naming convention).
+PATCH_FILES=()
+if [ -d "${REPO_ROOT}/${PATCH_DIR_REL}" ]; then
+  while IFS= read -r f; do
+    PATCH_FILES+=("$f")
+  done < <(find "${REPO_ROOT}/${PATCH_DIR_REL}" -maxdepth 1 -type f -name '*.patch' | sort)
+fi
+if [ ${#PATCH_FILES[@]} -eq 0 ]; then
+  log "WARN: no *.patch files under ${PATCH_DIR_REL}/ — Dockerfile COPY will fail if patches are referenced"
+fi
+for patch_local in "${PATCH_FILES[@]}"; do
+  patch_name=$(basename "${patch_local}")
+  log "Uploading patch: ${patch_name}"
+  aws s3 cp "${patch_local}" "s3://${S3_BUCKET}/${PATCH_S3_PREFIX}/${patch_name}" --quiet
+done
 
 # ---- Assemble builder payload ----
 # Note: ECR Public login goes against us-east-1 only. Private ECR stays us-east-2.
@@ -184,9 +206,11 @@ cmds = [
     "docker --version",
     "aws ecr get-login-password --region ${AWS_REGION_PRIMARY} | docker login --username AWS --password-stdin ${PRIVATE_REG}",
     "WORKDIR=/root/build/customer-h200-${STAMP}",
-    "mkdir -p \$WORKDIR && cd \$WORKDIR",
+    "mkdir -p \$WORKDIR/patches && cd \$WORKDIR",
     "aws s3 cp s3://${S3_BUCKET}/${DOCKERFILE_S3_KEY} ./Dockerfile",
     "aws s3 cp s3://${S3_BUCKET}/${MATRIX_S3_KEY} ./BUILD_MATRIX.md",
+    "aws s3 sync s3://${S3_BUCKET}/${PATCH_S3_PREFIX}/ ./patches/ || echo 'no patches'",
+    "ls -la ./patches/",
     "nohup bash -c '${INNER}' > \$WORKDIR/build.log 2>&1 &",
     "sleep 3",
     "echo build started, log=\$WORKDIR/build.log",

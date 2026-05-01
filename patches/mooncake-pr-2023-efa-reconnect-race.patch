@@ -1,0 +1,67 @@
+From f421bad08e375cb83506131e107866b24e0bc859 Mon Sep 17 00:00:00 2001
+From: whn09 <wanghenan09@gmail.com>
+Date: Thu, 30 Apr 2026 20:02:59 +0800
+Subject: [PATCH] Fix segfault race between setPeerNicPath and in-flight
+ submitPostSend
+
+EfaEndPoint::submitPostSend was latching peer_fi_addr_ under lock_ and
+releasing the lock before calling EfaContext::submitSlicesOnPeer, which
+calls fi_write(shared_ep_, ..., peer_fi_addr, ...) outside the lock. A
+concurrent setPeerNicPath() / disconnect() (both take the write lock and
+call context_.removePeerAddr, i.e. fi_av_remove) could invalidate the
+AV slot between the latch and the fi_write, causing libfabric's EFA
+provider to dereference a stale entry and segfault.
+
+Repro: SGLang 2P2D GLM-5.1-FP8 prefill, PP=2 TP=8 CP=8 EP=8 topology,
+moe_a2a=deepep, 16 EFA NICs, MC_MAX_WR=16384. The P2P handshake port
+changes for a peer process after a rebind, setPeerNicPath() takes the
+CONNECTED branch and disconnects while sender threads have fi_write
+calls in flight for that peer.
+
+Fix: hold the read lock across the entire submitSlicesOnPeer call so
+disconnect (write lock) cannot remove the AV entry while a submit is
+in flight. Re-check status_ under the lock and fail the batch if a
+disconnect raced in between, letting the caller retry with a fresh
+setupConnectionsByActive(). Read locks still allow multiple senders to
+the same peer to submit in parallel, so no throughput regression.
+
+Refs: https://github.com/kvcache-ai/Mooncake/issues/2022
+---
+ .../transport/efa_transport/efa_endpoint.cpp  | 23 +++++++++++++++----
+ 1 file changed, 19 insertions(+), 4 deletions(-)
+
+diff --git a/mooncake-transfer-engine/src/transport/efa_transport/efa_endpoint.cpp b/mooncake-transfer-engine/src/transport/efa_transport/efa_endpoint.cpp
+index 29a1ca2ae..b67db6f14 100644
+--- a/mooncake-transfer-engine/src/transport/efa_transport/efa_endpoint.cpp
++++ b/mooncake-transfer-engine/src/transport/efa_transport/efa_endpoint.cpp
+@@ -165,11 +165,26 @@ int EfaEndPoint::submitPostSend(
+         }
+     }
+ 
+-    fi_addr_t peer;
+-    {
+-        RWSpinlock::ReadGuard guard(lock_);
+-        peer = peer_fi_addr_;
++    // Hold a read lock for the entire submit window so setPeerNicPath() /
++    // disconnect() (which take the write lock) cannot fi_av_remove() our
++    // slot while an fi_write() inside submitSlicesOnPeer is still in
++    // flight.  The previous code latched peer_fi_addr_ under the lock and
++    // released it before calling into the context, leaving a race: a
++    // concurrent peer reconnect could remove the AV entry after the latch,
++    // and libfabric would segfault on the stale fi_addr_t.  Read locks
++    // stack, so multiple senders to the same peer still submit in parallel.
++    RWSpinlock::ReadGuard guard(lock_);
++
++    // Re-check status under the lock — a racing disconnect() could have
++    // flipped us to UNCONNECTED between the outer check and acquiring the
++    // lock.  Fail the batch so the caller retries with a fresh setup.
++    if (status_.load(std::memory_order_acquire) != CONNECTED) {
++        for (auto* slice : slice_list) failed_slice_list.push_back(slice);
++        slice_list.clear();
++        return ERR_ENDPOINT;
+     }
++
++    fi_addr_t peer = peer_fi_addr_;
+     if (peer == FI_ADDR_UNSPEC) {
+         for (auto* slice : slice_list) failed_slice_list.push_back(slice);
+         slice_list.clear();
