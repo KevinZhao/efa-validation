@@ -130,3 +130,35 @@ backends saturated by the 32K prefill KV traffic).
 - For each scenario, 3 rounds per backend, alternating A/B to cancel drift.
 - Metrics from `sglang.bench_serving` (random dataset).
 - Bootstrap 95% CI on the mean across 3 rounds (2000 resamples).
+
+---
+## S5/S6 long-context extension — postponed
+
+Attempted 2026-05-01 03:20-04:15Z. Two additional scenarios were designed to
+extend the A/B to long-context: S5 = 60K/1K (cc=8, np=60) and S6 = 120K/1K
+(cc=4, np=30).
+
+**Blocker: p5en Spot capacity shortage** at attempt time:
+- Oregon usw2-az2 / az3 / az4 — all `UnfulfillableCapacity` for 10+ min
+- Ohio use2-az2 — `InsufficientInstanceCapacity` (AWS hint: use az1/az3)
+- Ohio use2-az1 — 2× p5en fulfilled, but new EKS nodes shipped without
+  `/data` LVM-striped instance-store NVMe mount (FailedMount on hostPath).
+  Manually LVM-striped 8× 3.5 TB NVMe, restarted pods, s5cmd pulled 595 GB OK.
+- Final blocker: sglang PD pods stuck at `detokenizer heartbeat timeout` +
+  router `detect_connection_mode` loop (269 retries in 15 min). Cross-node
+  peer bring-up on fresh Ohio nodes did not complete within 30-min timeout
+  — likely a node image / EFA userspace config difference vs. the Oregon
+  nodegroup that S1-S4 used.
+
+**Decision**: released Ohio GPU (ASG desired=0 at 04:15Z). S5/S6 deferred to
+a future run when Oregon usw2-az4 capacity returns, so results aggregate
+cleanly with S1-S4 under identical infra.
+
+Rerun artifacts saved:
+- `scripts/stage5-pd-1p1d-mc-vs-nixl/run_s5s6_eks.sh` (Oregon reuse, same stamp)
+- `scripts/stage5-pd-1p1d-mc-vs-nixl/run_s5s6_use2.sh` (Ohio variant)
+- `manifests/stage5-p5en/pd-1p1d-mc-vs-nixl-k25-int4-use2.yaml` (Ohio manifest)
+
+S1-S4 results above are complete and interpretable. Core conclusion stands:
+**NIXL/LIBFABRIC on EFA outperforms Mooncake by ~25-30% geo-mean (TTFT/E2E
+faster, throughput higher) on short/mid-context PD workloads in this config.**
