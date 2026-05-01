@@ -1,6 +1,6 @@
 # PD 1P1D — Mooncake EFA vs NIXL (LIBFABRIC) — Kimi-K2.5 INT4
 
-**Stamp**: `20260501T002853Z` (run completed 2026-05-01 02:13 UTC)
+**Stamp**: `20260501T002853Z` (S1-S4 run 2026-05-01 00:28-02:13Z; S5-S6 run 2026-05-01 06:26-07:26Z, both in Oregon usw2-az4)
 
 ## Test configuration
 - **Hardware**: 2× p5en.48xlarge (H200 × 8, EFA v3 16-rail), same AZ usw2-az4
@@ -8,35 +8,18 @@
 - **Image**: `788668107894.dkr.ecr.us-east-2.amazonaws.com/yanxi/sglang-mooncake-nixl-uccl:2026.04.30-h200.6`
   - SGLang 0.5.10, Mooncake `634b7097`, NIXL `v1.0.1`, UCX `v1.18.0`, EFA installer `1.47.0`
 - **Model**: Kimi-K2.5 compressed-tensors INT4 (~555 GiB, 64 safetensors shards)
-- **Topology**: 1 prefill + 1 decode + 1 router, TP=8 symmetric, DP=1
-- **Single variable**: `--disaggregation-transfer-backend {mooncake|nixl}` via `KV_BACKEND` env
-- **NIXL plugin**: `SGLANG_DISAGGREGATION_NIXL_BACKEND=LIBFABRIC` (avoids UCX-over-EFA TCP fallback hang)
-- **Scenarios (S1-S4)**:
-  - S1: input 2048, output 512, concurrency 32, 200 prompts
-  - S2: input 8192, output 1024, concurrency 64, 200 prompts
-  - S3: input 32768, output 1024, concurrency 16, 100 prompts
-  - S4: input 4096, output 512, concurrency 128, 200 prompts
-  - All scenarios: 3 rounds each; warmup 10-20 prompts per round
-- **Benchmark runner**: `sglang.bench_serving --dataset-name random --backend sglang`
-
-## Headline result
-
-| Metric (geo-mean across 4 scenarios) | NIXL/Mooncake ratio | Winner |
-|---|---:|:---:|
-| TTFT mean | **0.73×** | NIXL faster (−27%) |
-| ITL mean | **0.82×** | NIXL faster (−18%) |
-| E2E latency mean | **0.80×** | NIXL faster (−20%) |
-| Throughput (req/s) | **1.24×** | NIXL higher (+24%) |
-
-**NIXL with LIBFABRIC backend over EFA outperforms Mooncake EFA across all latency/throughput metrics**
-on this Kimi-K2.5 INT4 1P1D disaggregated deployment. Largest gaps appear in S2/S4 (mid-size/high-concurrency
-scenarios) where KV transfer is a clear bottleneck; S3 (huge 32K input KV) is essentially tied (both
-backends saturated by the 32K prefill KV traffic).
-
-## Scenario-by-scenario details below.
+- **Topology**: 1 prefill + 1 decode + 1 router, TP=8 symmetric, DP=1 symmetric
+- **Single variable**: `--disaggregation-transfer-backend {mooncake|nixl}` via `KV_BACKEND` env; NIXL forced to LIBFABRIC via `SGLANG_DISAGGREGATION_NIXL_BACKEND=LIBFABRIC`
+- **Scenarios**:
+  - S1 = 2K/512 tok, cc=32, np=200 (short balanced)
+  - S2 = 8K/1K tok, cc=64, np=200 (moderate batch)
+  - S3 = 32K/1K tok, cc=16, np=100 (long prompt)
+  - S4 = 4K/512 tok, cc=128, np=200 (high concurrency)
+  - S5 = 60K/1K tok, cc=8, np=60 (long-context, moderate)
+  - S6 = 120K/1K tok, cc=4, np=30 (long-context, sparse)
+- **Rounds**: 3 per backend per scenario; bootstrap 95% CI over rounds (2000 resamples)
 
 ---
-
 ## S1
 
 | Metric | Mooncake mean (95% CI) | NIXL mean (95% CI) | Δ% (NIXL/MC − 1) | Winner |
@@ -105,60 +88,74 @@ backends saturated by the 32K prefill KV traffic).
 | Req/s | 3.41 (3.34–3.48) | 4.86 (4.65–5.00) | +42.47% | NIXL |
 | Completed | 200.00 (200.00–200.00) | 200.00 (200.00–200.00) | +0.00% | — |
 
+## S5
+
+| Metric | Mooncake mean (95% CI) | NIXL mean (95% CI) | Δ% (NIXL/MC − 1) | Winner |
+|---|---:|---:|---:|:---:|
+| TTFT mean (ms) | 9596.39 (9119.04–10427.07) | 9307.30 (9284.21–9330.39) | -3.01% | NIXL |
+| TTFT P50 (ms) | 9715.46 (9197.86–10624.38) | 9523.96 (9474.83–9573.10) | -1.97% | NIXL |
+| TTFT P99 (ms) | 18050.86 (17904.12–18140.15) | 17790.83 (17710.65–17871.02) | -1.44% | NIXL |
+| ITL mean (ms) | 10.19 (10.03–10.29) | 9.91 (9.86–9.95) | -2.75% | NIXL |
+| ITL P50 (ms) | 11.20 (10.82–11.52) | 11.15 (11.10–11.21) | -0.38% | ≈ |
+| ITL P99 (ms) | 28.22 (12.99–58.59) | 13.21 (12.99–13.44) | -53.17% | NIXL |
+| E2E mean (ms) | 14544.27 (14093.25–15426.28) | 14119.51 (14073.90–14165.13) | -2.92% | NIXL |
+| Input tok/s | 16871.71 (15957.99–17337.86) | 17314.33 (17263.22–17365.43) | +2.62% | NIXL |
+| Output tok/s | 248.84 (235.37–255.72) | 255.37 (254.62–256.12) | +2.62% | NIXL |
+| Total tok/s | — | — | — | — |
+| Req/s | 0.51 (0.48–0.53) | 0.52 (0.52–0.53) | +2.62% | NIXL |
+| Completed | 60.00 (60.00–60.00) | 60.00 (60.00–60.00) | +0.00% | — |
+
+## S6
+
+| Metric | Mooncake mean (95% CI) | NIXL mean (95% CI) | Δ% (NIXL/MC − 1) | Winner |
+|---|---:|---:|---:|:---:|
+| TTFT mean (ms) | 10711.39 (10571.78–10795.51) | 10393.89 (10250.98–10473.59) | -2.96% | NIXL |
+| TTFT P50 (ms) | 10264.09 (9959.92–10436.07) | 9946.48 (9879.40–9982.34) | -3.09% | NIXL |
+| TTFT P99 (ms) | 24056.20 (23814.48–24255.53) | 23437.59 (23339.36–23509.21) | -2.57% | NIXL |
+| ITL mean (ms) | 11.18 (11.10–11.24) | 11.15 (11.09–11.20) | -0.34% | ≈ |
+| ITL P50 (ms) | 11.95 (11.93–11.98) | 11.95 (11.90–12.01) | -0.01% | ≈ |
+| ITL P99 (ms) | 14.47 (14.32–14.59) | 14.48 (14.22–14.63) | +0.06% | ≈ |
+| E2E mean (ms) | 16587.48 (16401.05–16689.95) | 16250.12 (16135.56–16316.29) | -2.03% | NIXL |
+| Input tok/s | 14267.86 (14182.50–14423.69) | 14538.17 (14478.63–14638.79) | +1.89% | NIXL |
+| Output tok/s | 121.13 (120.40–122.45) | 123.42 (122.91–124.27) | +1.89% | NIXL |
+| Total tok/s | — | — | — | — |
+| Req/s | 0.23 (0.23–0.23) | 0.23 (0.23–0.24) | +1.89% | NIXL |
+| Completed | 30.00 (30.00–30.00) | 30.00 (30.00–30.00) | +0.00% | — |
+
 ---
 ## Aggregate across scenarios
 
 | Metric | Geo-mean ratio NIXL/MC | Interpretation |
 |---|---:|---|
-| TTFT mean (ms) | 0.7274 | NIXL faster |
-| TTFT P50 (ms) | 0.6768 | NIXL faster |
-| TTFT P99 (ms) | 0.7814 | NIXL faster |
-| ITL mean (ms) | 0.8208 | NIXL faster |
-| ITL P50 (ms) | 0.8256 | NIXL faster |
-| ITL P99 (ms) | 0.6892 | NIXL faster |
-| E2E mean (ms) | 0.7972 | NIXL faster |
-| Input tok/s | 1.2358 | NIXL higher |
-| Output tok/s | 1.2358 | NIXL higher |
+| TTFT mean (ms) | 0.8007 | NIXL faster |
+| TTFT P50 (ms) | 0.7643 | NIXL faster |
+| TTFT P99 (ms) | 0.8426 | NIXL faster |
+| ITL mean (ms) | 0.8721 | NIXL faster |
+| ITL P50 (ms) | 0.8795 | NIXL faster |
+| ITL P99 (ms) | 0.6876 | NIXL faster |
+| E2E mean (ms) | 0.8526 | NIXL faster |
+| Input tok/s | 1.1602 | NIXL higher |
+| Output tok/s | 1.1602 | NIXL higher |
 | Total tok/s | — | — |
-| Req/s | 1.2358 | NIXL higher |
+| Req/s | 1.1602 | NIXL higher |
 | Completed | 1.0000 | — |
 
 ---
 ## Method
 - Same image, same model, same SGLang, same service flags. Only `--disaggregation-transfer-backend` flips mooncake↔nixl.
 - Topology: 1P+1D (TP=8 each), DP=1 symmetric, same AZ (usw2-az4).
-- For each scenario, 3 rounds per backend, alternating A/B to cancel drift.
+- S1-S4: run together in one orchestrator invocation (3 rounds per backend, sequential A then B).
+- S5-S6: run in a second orchestrator invocation (v2) with a 2K/256 smoke bench (`prime_router`) interposed after each apply so sglang router's prefill-worker detection warms up before the first long-context warmup request.
 - Metrics from `sglang.bench_serving` (random dataset).
 - Bootstrap 95% CI on the mean across 3 rounds (2000 resamples).
 
----
-## S5/S6 long-context extension — postponed
+## Notes / caveats
+- S5-S6 used freshly spun-up Oregon usw2-az4 Spot nodes (different physical instances from S1-S4 after intermediate teardown). Same AMI/launch template/EKS/image/manifest — only the specific p5en instance identity differs.
+- NIXL S5 round 1 ( `s5-nixl-r1`) failed: even after `prime_router`, the first 60K/cc=8 warmup hit the router before it fully accepted the NIXL prefill worker. Rounds 2 + 3 recovered cleanly. S5 NIXL mean is over n=2 rounds (not 3) — CI is narrower because of the missing sample; directionally consistent with S6.
+- All other 11/12 S5/S6 benches and all 24/24 S1-S4 benches succeeded.
 
-Attempted 2026-05-01 03:20-04:15Z. Two additional scenarios were designed to
-extend the A/B to long-context: S5 = 60K/1K (cc=8, np=60) and S6 = 120K/1K
-(cc=4, np=30).
-
-**Blocker: p5en Spot capacity shortage** at attempt time:
-- Oregon usw2-az2 / az3 / az4 — all `UnfulfillableCapacity` for 10+ min
-- Ohio use2-az2 — `InsufficientInstanceCapacity` (AWS hint: use az1/az3)
-- Ohio use2-az1 — 2× p5en fulfilled, but new EKS nodes shipped without
-  `/data` LVM-striped instance-store NVMe mount (FailedMount on hostPath).
-  Manually LVM-striped 8× 3.5 TB NVMe, restarted pods, s5cmd pulled 595 GB OK.
-- Final blocker: sglang PD pods stuck at `detokenizer heartbeat timeout` +
-  router `detect_connection_mode` loop (269 retries in 15 min). Cross-node
-  peer bring-up on fresh Ohio nodes did not complete within 30-min timeout
-  — likely a node image / EFA userspace config difference vs. the Oregon
-  nodegroup that S1-S4 used.
-
-**Decision**: released Ohio GPU (ASG desired=0 at 04:15Z). S5/S6 deferred to
-a future run when Oregon usw2-az4 capacity returns, so results aggregate
-cleanly with S1-S4 under identical infra.
-
-Rerun artifacts saved:
-- `scripts/stage5-pd-1p1d-mc-vs-nixl/run_s5s6_eks.sh` (Oregon reuse, same stamp)
-- `scripts/stage5-pd-1p1d-mc-vs-nixl/run_s5s6_use2.sh` (Ohio variant)
-- `manifests/stage5-p5en/pd-1p1d-mc-vs-nixl-k25-int4-use2.yaml` (Ohio manifest)
-
-S1-S4 results above are complete and interpretable. Core conclusion stands:
-**NIXL/LIBFABRIC on EFA outperforms Mooncake by ~25-30% geo-mean (TTFT/E2E
-faster, throughput higher) on short/mid-context PD workloads in this config.**
+## Rerun artifacts
+- `scripts/stage5-pd-1p1d-mc-vs-nixl/run_ab_eks.sh` — S1-S4 orchestrator (Oregon).
+- `scripts/stage5-pd-1p1d-mc-vs-nixl/run_s5s6_v2.sh` — S5/S6 orchestrator v2 (with prime_router).
+- `scripts/stage5-pd-1p1d-mc-vs-nixl/bench/summarize.py` — generates this RESULT.md from raw JSONs.
+- `manifests/stage5-p5en/pd-1p1d-mc-vs-nixl-k25-int4-usw2.yaml` — Oregon manifest.
