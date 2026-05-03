@@ -4,7 +4,8 @@
 # Image : public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.05.02-h200.dp16
 #         (Mooncake PR #2023 tip 4a306de8 DP>1 fix; sglang 0.5.10; Henan 5 PRs)
 # Cluster: gpu-cluster-oregon (us-west-2)
-# AZ     : usw2-az4 (same single-AZ rule as baseline)
+# AZ     : usw2-az3 (us-west-2c) — switched from az4 after 2026-05-03 SPS:
+#          p5en az4 score=1 (cold), az3 score=8 (only AZ >=6 at scan time)
 # Subnet : pinned via ASG VPCZoneIdentifier (matches baseline)
 #
 # Naming to avoid collision with baseline (c1p1d-*):
@@ -284,7 +285,7 @@ spec:
             nodeSelectorTerms:
               - matchExpressions:
                   - { key: node.kubernetes.io/instance-type, operator: In, values: [p5en.48xlarge] }
-                  - { key: topology.kubernetes.io/zone, operator: In, values: [us-west-2d] }
+                  - { key: topology.kubernetes.io/zone, operator: In, values: [us-west-2c] }
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector: { matchLabels: { app: k25-r1 } }
@@ -418,7 +419,7 @@ spec:
             nodeSelectorTerms:
               - matchExpressions:
                   - { key: node.kubernetes.io/instance-type, operator: In, values: [p5en.48xlarge] }
-                  - { key: topology.kubernetes.io/zone, operator: In, values: [us-west-2d] }
+                  - { key: topology.kubernetes.io/zone, operator: In, values: [us-west-2c] }
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector: { matchLabels: { app: k25-r1 } }
