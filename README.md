@@ -74,8 +74,8 @@ See [RUNBOOK.md](./RUNBOOK.md) for how the original run was wired up.
 
 ## Related sibling repos
 
-- `../uccl/` — `KevinZhao/uccl` fork (upstream `uccl-project/uccl`), source of the UCCL library + UCCL-EP
 - `../uccl-ep-optimization/` — UCCL-EP on EFA optimization research (split from this repo 2026-05-03): 34 design docs, 3 upstream PR workspaces (warmup-cpu-timeout / combine-signal-api / efa-caps-dump), Hopper mem-ordering microbench. efa-validation now keeps only measurement data + positioning (`UCCL_VS_NCCL.md`) + Stage 2 validation manifests.
+- `../uccl-ep-optimization/uccl/` — `KevinZhao/uccl` fork (upstream `uccl-project/uccl`), nested inside the sibling repo as of 2026-05-03; still an independent git repo (own `.git`, `.gitignore`-excluded by parent).
 
 ## Getting started
 
