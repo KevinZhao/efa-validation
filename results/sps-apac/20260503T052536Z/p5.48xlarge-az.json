@@ -1,0 +1,44 @@
+{
+    "SpotPlacementScores": [
+        {
+            "Region": "ap-south-1",
+            "AvailabilityZoneId": "aps1-az3",
+            "Score": 1
+        },
+        {
+            "Region": "ap-southeast-2",
+            "AvailabilityZoneId": "apse2-az2",
+            "Score": 1
+        },
+        {
+            "Region": "ap-southeast-2",
+            "AvailabilityZoneId": "apse2-az3",
+            "Score": 1
+        },
+        {
+            "Region": "ap-south-1",
+            "AvailabilityZoneId": "aps1-az1",
+            "Score": 2
+        },
+        {
+            "Region": "ap-northeast-1",
+            "AvailabilityZoneId": "apne1-az4",
+            "Score": 1
+        },
+        {
+            "Region": "ap-northeast-1",
+            "AvailabilityZoneId": "apne1-az1",
+            "Score": 1
+        },
+        {
+            "Region": "ap-south-1",
+            "AvailabilityZoneId": "aps1-az2",
+            "Score": 1
+        },
+        {
+            "Region": "ap-southeast-2",
+            "AvailabilityZoneId": "apse2-az1",
+            "Score": 1
+        }
+    ]
+}
