@@ -7,7 +7,9 @@
 # Target: AWS p5 / p5en (H100 / H200, sm_90) with EFA.
 #
 # Shared components (both variants, identical bytes):
-#   - Mooncake Transfer Engine (KV over EFA, Henan 5 PRs via upstream @634b7097)
+#   - Mooncake Transfer Engine (KV over EFA, PR #2023 tip @4a306de8 —
+#     DP>1 root fix "key peer_map_ by full host:port@nic"; supersedes
+#     the prior @634b7097 base + race-fix patch approach)
 #   - SGLang 0.5.10 with `--disaggregation-transfer-backend mooncake`
 #   - EFA installer 1.47 + libfabric + NCCL 2.23.4 + aws-ofi-nccl 1.19
 #   - PyTorch 2.9.1+cu128, CUDA 13 runtime
@@ -41,7 +43,19 @@ ARG EFA_INSTALLER_VERSION=1.47.0
 ARG NCCL_VERSION=v2.23.4-1
 ARG AWS_OFI_NCCL_VERSION=v1.19.0
 ARG MOONCAKE_REPO=https://github.com/kvcache-ai/Mooncake.git
-ARG MOONCAKE_REF=634b7097
+# PR #2023 tip (not yet merged to main) — contains the DP>1 root fix
+# `4a306de8 fix(efa): key peer_map_ by full host:port@nic to handle
+# multi-worker peers`.  Henan confirmed this unblocks DP=16 on sglang
+# 2P2D GLM-5.1.  Supersedes the old 634b7097 base + patch approach.
+# Includes PR #2023's other commits (f421bad0 read-lock race fix,
+# fc0a30e8 log classification) and ~14 unrelated post-634b7097 bug
+# fixes (Store / TENT / DMA-BUF / CI).  Bump this to the merge commit
+# once PR #2023 lands on main.
+ARG MOONCAKE_REF=4a306de823819fa42036fdcd7c8bde78f22f25b5
+# Mooncake PR number whose tip MOONCAKE_REF points at — checked out
+# via `git fetch origin refs/pull/${MOONCAKE_PR}/head`. Leave empty to
+# treat MOONCAKE_REF as a main-branch commit.
+ARG MOONCAKE_PR=2023
 ARG UCCL_REPO=https://github.com/uccl-project/uccl.git
 ARG UCCL_REF=8ac850bd
 ARG SGLANG_VERSION=0.5.10
@@ -70,6 +84,7 @@ ARG NCCL_VERSION
 ARG AWS_OFI_NCCL_VERSION
 ARG MOONCAKE_REPO
 ARG MOONCAKE_REF
+ARG MOONCAKE_PR
 ARG UCCL_REPO
 ARG UCCL_REF
 ARG SGLANG_VERSION
@@ -199,32 +214,44 @@ RUN MC_PY=/usr/local/lib/python3.10/dist-packages/sglang/srt/distributed/device_
     rm -f /usr/local/lib/python3.10/dist-packages/sglang/srt/distributed/device_communicators/__pycache__/mooncake_transfer_engine.cpython-310.pyc 2>/dev/null || true && \
     echo "[patch] sglang mooncake_transfer_engine.py: rdma -> efa applied"
 
-# ---- Mooncake Transfer Engine (Henan 5 PRs baked in via @634b7097) ----
+# ---- Mooncake Transfer Engine (PR #2023 tip @4a306de8) ----
 # TE-only build: WITH_EP=OFF (Mooncake-EP is mlx5-IBGDA only, incompatible
 # with EFA), WITH_STORE=OFF (customer uses PD-disagg TE, no store layer).
+#
+# Checkout logic:
+#   - When MOONCAKE_PR is set, fetch that GitHub PR's head ref and
+#     checkout its tip. Required while PR #2023 (DP>1 root fix) has not
+#     yet landed on main.
+#   - When MOONCAKE_PR is empty, MOONCAKE_REF is treated as a main
+#     commit SHA and checked out directly.
+#
+# Why PR #2023 tip: commit `4a306de8 fix(efa): key peer_map_ by full
+# host:port@nic` changes EfaContext::endpoint() to key by full
+# "host:port@nic" instead of normalizeNicPath. Under sglang DP>1 every
+# DP worker shares the same host+NIC but has a distinct P2PHANDSHAKE
+# port; the old normalized key collapsed all DP workers onto one
+# EfaEndPoint slot, causing fi_av_remove + fi_av_insert thrashing on
+# every KV transfer ("Re-establish" log flood, decode #running → 1,
+# prefill #inflight pinned). Henan confirmed 4a306de8 unblocks DP=16
+# on 2P2D GLM-5.1. Also carries f421bad0 (submitPostSend read-lock
+# race fix) and fc0a30e8 (passive handshake log classification).
+# Drop MOONCAKE_PR once merged and bump MOONCAKE_REF to the merge SHA.
 RUN git clone --recursive ${MOONCAKE_REPO} /opt/mooncake && \
-    cd /opt/mooncake && git checkout ${MOONCAKE_REF} && \
+    cd /opt/mooncake && \
+    if [ -n "${MOONCAKE_PR}" ]; then \
+        git fetch origin "refs/pull/${MOONCAKE_PR}/head:refs/pr/${MOONCAKE_PR}" && \
+        echo "[mooncake] fetched PR #${MOONCAKE_PR} head" ; \
+    fi && \
+    git checkout ${MOONCAKE_REF} && \
     git submodule update --init --recursive && \
-    if [ -x dependencies.sh ]; then yes | ./dependencies.sh || ./dependencies.sh -y || true; fi
-
-# ---- Apply Mooncake EFA patches (upstream PRs not yet merged) ----
-# PR #2023: [EFA] Fix segfault race between setPeerNicPath and in-flight
-# submitPostSend. Holds a read lock across the entire submitSlicesOnPeer
-# call so disconnect() / setPeerNicPath() (write lock) cannot fi_av_remove
-# our AV slot while an fi_write() is still in flight.
-# Reproduced on SGLang 2P2D GLM-5.1-FP8 PP=2/TP=8/CP=8/EP=8 with
-# moe_a2a=deepep — peer reshuffles RPC port on restart, CONNECTED branch
-# of setPeerNicPath fires while sender threads still have fi_write calls
-# in flight → libfabric segfault on stale fi_addr_t.
-# Remove this block + the COPY above once MOONCAKE_REF is bumped past merge.
-COPY patches/mooncake-pr-2023-efa-reconnect-race.patch /tmp/mooncake-pr-2023.patch
-RUN cd /opt/mooncake && \
-    git apply --check /tmp/mooncake-pr-2023.patch && \
-    git apply /tmp/mooncake-pr-2023.patch && \
+    grep -q "Key the peer map by the full" \
+      mooncake-transfer-engine/src/transport/efa_transport/efa_context.cpp || \
+      { echo "ERROR: PR #2023 root-fix sentinel (4a306de8) not in checkout" >&2; exit 1; } && \
     grep -q "Hold a read lock for the entire submit window" \
       mooncake-transfer-engine/src/transport/efa_transport/efa_endpoint.cpp || \
-      { echo "ERROR: PR #2023 sentinel comment not found after apply" >&2; exit 1; } && \
-    echo "[patch] Mooncake PR #2023 (setPeerNicPath race) applied"
+      { echo "ERROR: PR #2023 race fix sentinel (f421bad0) not in checkout" >&2; exit 1; } && \
+    echo "[mooncake] checkout ${MOONCAKE_REF} — PR #2023 root + race fixes present" && \
+    if [ -x dependencies.sh ]; then yes | ./dependencies.sh || ./dependencies.sh -y || true; fi
 
 ENV PATH="/usr/local/go/bin:${PATH}"
 

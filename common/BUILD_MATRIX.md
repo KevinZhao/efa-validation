@@ -162,7 +162,7 @@ tag left in place for forensics but deprecated.
 | OpenMPI | 5.0.x (from EFA installer) | amazonaws.com | — |
 | Python | 3.10 | ubuntu22.04 | — |
 | PyTorch | 2.9.1+cu128 | Implicitly pulled by sglang[all] | Wheel ABI dictates CUDA 12.8 toolchain for downstream builds |
-| Mooncake TE | `634b7097` (= #1944 merge head) | kvcache-ai/Mooncake | Contains Henan 5 EFA PRs (#1509/#1523/#1821/#1912/#1944) — all upstreamed; no patching needed |
+| Mooncake TE | `4a306de8` (= PR #2023 tip, not yet merged) | kvcache-ai/Mooncake | Includes #1509/#1523/#1821/#1912/#1944 (upstreamed) + PR #2023 DP>1 root fix (`key peer_map_ by full host:port@nic`). Fetched via `refs/pull/2023/head`; bump to merge SHA once PR #2023 lands. Henan confirmed unblocks DP=16 on 2P2D. |
 | Mooncake build flags | `USE_EFA=ON, USE_CUDA=ON, WITH_TE=ON, WITH_EP=OFF` | — | **WITH_EP=OFF intentional**: Mooncake-EP is Mellanox IBGDA-only (mlx5dv_* direct), does not run on AWS EFA |
 | SGLang | 0.5.10 | sglang[all] PyPI | Customer's production version |
 | UCCL | `8ac850bd` (upstream main 2026-04-27) | uccl-project/uccl | Contains PR #904 (UCCL_EP_CPU_TIMEOUT_SECS) merged as 5e15ad9d |

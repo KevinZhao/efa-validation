@@ -46,7 +46,12 @@ case "${VARIANT}" in
   *) echo "ERROR: VARIANT must be uccl or nccl (got: ${VARIANT})" >&2 ; exit 2 ;;
 esac
 
-MOONCAKE_REF="${MOONCAKE_REF:-634b7097}"
+# Default: PR #2023 tip `4a306de8` (DP>1 root fix `key peer_map_ by full
+# host:port@nic`). Henan confirmed this unblocks DP=16 on sglang 2P2D.
+# Once PR #2023 merges to main, set MOONCAKE_REF to the merge SHA and
+# unset MOONCAKE_PR (will fall through to the main-branch checkout path).
+MOONCAKE_REF="${MOONCAKE_REF:-4a306de823819fa42036fdcd7c8bde78f22f25b5}"
+MOONCAKE_PR="${MOONCAKE_PR:-2023}"
 UCCL_REF="${UCCL_REF:-8ac850bd}"
 SGLANG_VERSION="${SGLANG_VERSION:-0.5.10}"
 
@@ -76,11 +81,12 @@ PUBLIC_REG="public.ecr.aws/${ECR_PUBLIC_ALIAS}"
 PUBLIC_IMAGE="${PUBLIC_REG}/${IMAGE_NAME}"
 
 # ---- Sanity: pin values match BUILD_MATRIX.md ----
+# Accept either the legacy "<sha> (= #1944 merge head)" style or the
+# current "<sha> (= PR #<N> tip)" style. Validation is advisory only.
 MATRIX_FILE="${REPO_ROOT}/common/BUILD_MATRIX.md"
 if [ -f "${MATRIX_FILE}" ]; then
-  # Tolerate no-match (grep returns 1) and head SIGPIPE under pipefail
-  expected_mooncake=$( (grep -oE '\`[0-9a-f]{7,40}\` \(= #1944' "${MATRIX_FILE}" || true) | head -1 | tr -d '`' | awk '{print $1}' || true)
-  if [ -n "${expected_mooncake}" ] && [ "${expected_mooncake}" != "${MOONCAKE_REF}" ]; then
+  expected_mooncake=$( (grep -oE '\`[0-9a-f]{7,40}\` \(= (#1944|PR #[0-9]+)' "${MATRIX_FILE}" || true) | head -1 | tr -d '`' | awk '{print $1}' || true)
+  if [ -n "${expected_mooncake}" ] && [ "${MOONCAKE_REF}" != "${expected_mooncake}" ] && [[ "${MOONCAKE_REF}" != ${expected_mooncake}* ]]; then
     log "WARN: MOONCAKE_REF=${MOONCAKE_REF} != BUILD_MATRIX.md (${expected_mooncake}). Continuing."
   fi
 fi
@@ -89,7 +95,7 @@ log "=== customer release build ==="
 log "  variant    : ${VARIANT} (WITH_UCCL=${WITH_UCCL})"
 log "  image      : ${IMAGE_NAME}"
 log "  tags       : ${TAG_PRIMARY}  ${TAG_MONTHLY}  ${TAG_LATEST}"
-log "  mooncake   : ${MOONCAKE_REF}"
+log "  mooncake   : ${MOONCAKE_REF}${MOONCAKE_PR:+  (PR #${MOONCAKE_PR} head)}"
 log "  uccl       : ${UCCL_REF} (used only if WITH_UCCL=true)"
 log "  sglang     : ${SGLANG_VERSION}"
 log "  arch       : ${ARCH} (TORCH_CUDA_ARCH_LIST=9.0)"
@@ -118,8 +124,9 @@ aws s3 cp "${REPO_ROOT}/${DOCKERFILE_REL}" "s3://${S3_BUCKET}/${DOCKERFILE_S3_KE
 aws s3 cp "${REPO_ROOT}/${MATRIX_REL}"     "s3://${S3_BUCKET}/${MATRIX_S3_KEY}" --quiet
 
 # Enumerate patch files (only the ones actually referenced by Dockerfile COPY).
-# Today: patches/mooncake-pr-2023-efa-reconnect-race.patch. Glob keeps the
-# script stable if we add more later (same naming convention).
+# Currently no patches — Mooncake PR #2023 is pulled directly by SHA via the
+# MOONCAKE_PR fetch path in Dockerfile.customer-h200. The glob + S3 sync is
+# kept so future overlay patches drop in without touching this script.
 PATCH_FILES=()
 if [ -d "${REPO_ROOT}/${PATCH_DIR_REL}" ]; then
   while IFS= read -r f; do
@@ -158,6 +165,7 @@ BUILD_CMD="${BUILD_CMD} --build-arg IMAGE_VERSION=${TAG_PRIMARY}"
 BUILD_CMD="${BUILD_CMD} --build-arg BUILD_DATE=${BUILD_DATE}"
 BUILD_CMD="${BUILD_CMD} --build-arg VCS_REF=${VCS_REF}"
 BUILD_CMD="${BUILD_CMD} --build-arg MOONCAKE_REF=${MOONCAKE_REF}"
+BUILD_CMD="${BUILD_CMD} --build-arg MOONCAKE_PR=${MOONCAKE_PR}"
 BUILD_CMD="${BUILD_CMD} --build-arg UCCL_REF=${UCCL_REF}"
 BUILD_CMD="${BUILD_CMD} --build-arg SGLANG_VERSION=${SGLANG_VERSION}"
 BUILD_CMD="${BUILD_CMD} --build-arg WITH_UCCL=${WITH_UCCL}"
