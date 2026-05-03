@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AWS Account Team <noreply@amazon.com>
+Date: Fri, 1 May 2026 03:00:00 +0000
+Subject: [PATCH] Fix bench_serving sglang-oai streaming chunk parser
+
+The OpenAI /v1/completions streaming parser in
+async_request_openai_completions has three latent bugs that surface when
+benchmarking sglang 0.5.10 with --backend sglang-oai:
+
+1. `data["choices"][0]` IndexError on usage-only chunks.
+   sglang (and vLLM with include_usage=true) emits a trailing
+   {"choices": [], "usage": {...}} chunk to report final token counts.
+   The current code does data["choices"][0]["text"] unconditionally,
+   which raises IndexError → the request is marked failed. sglang-oai-chat
+   does not hit this because the chat parser checks choices truthiness
+   before indexing. Fix: guard with `if data.get("choices")`.
+
+2. `choices[0]["text"]` may be None (not "") on some reasoning-content
+   paths. `None` still fails the truthiness test so no crash, but it
+   silently drops the text chunk. Guard with `text or ""`.
+
+3. TTFT chunk text was never appended to output.text_chunks (only the
+   decode-phase chunks are). generated_text catches it via +=, but any
+   consumer that iterates text_chunks (e.g. per-chunk latency analysis)
+   misses the first token. Move the append out of the else branch so
+   both TTFT and decode chunks are recorded.
+
+Upstream-ref: observed on sglang==0.5.10 bench_serving.py
+              async_request_openai_completions around L275-L318.
+---
+ sglang/bench_serving.py | 24 +++++++++++++-----------
+ 1 file changed, 13 insertions(+), 11 deletions(-)
+
+diff --git a/sglang/bench_serving.py b/sglang/bench_serving.py
+index 0000000..1111111 100644
+--- a/sglang/bench_serving.py
++++ b/sglang/bench_serving.py
+@@ -297,22 +297,24 @@ async def async_request_openai_completions(
+                         else:
+                             data = json.loads(chunk)
+
+-                            # NOTE: Some completion API might have a last
+-                            # usage summary response without a token so we
+-                            # want to check a token was generated
+-                            if data["choices"][0]["text"]:
++                            # usage-only chunks (choices==[] with usage) must
++                            # not index [0]; text may be None on reasoning
++                            # paths; treat both as "no token this chunk".
++                            choices = data.get("choices") or []
++                            text = (choices[0].get("text") if choices else None) or ""
++                            if text:
+                                 timestamp = time.perf_counter()
+                                 # First token
+                                 if ttft == 0.0:
+                                     ttft = time.perf_counter() - st
+                                     output.ttft = ttft
+-
+-                                # Decoding phase
++                                # Decoding phase — record ITL only (first
++                                # token's latency is TTFT, not an ITL).
+                                 else:
+-                                    output.text_chunks.append(
+-                                        data["choices"][0]["text"]
+-                                    )
+                                     output.itl.append(timestamp - most_recent_timestamp)
+
++                                # Both TTFT and decode chunks contribute to
++                                # text_chunks (bug: original only appended
++                                # in the decode branch, dropping first token).
++                                output.text_chunks.append(text)
+                                 most_recent_timestamp = timestamp
+-                                generated_text += data["choices"][0]["text"]
++                                generated_text += text
+                                 output_len = (data.get("usage") or {}).get(
+                                     "completion_tokens", output_len
+                                 )
+--
+2.40.0
