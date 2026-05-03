@@ -1,0 +1,79 @@
+version: '3.4'
+# Stage 6 R1 decode compose — Kimi-K2.5 PD-1P1D with Mooncake KV + UCCL-EP a2a.
+# P0: image = public ECR 2026.05.02-h200.dp16 uccl (Mooncake PR #2023 tip).
+# L5: SGLANG_MOONCAKE_CUSTOM_MEM_POOL / FI_EFA_ENABLE_SHM_TRANSFER / FI_EFA_FORK_SAFE.
+# L4: rail split — UCCL_IB_HCA / FI_EFA_IFACE = high 8; --disaggregation-ib-device = all 16 (in entrypoint).
+services:
+  k2-5-pd-decode:
+    image: public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.05.02-h200.dp16
+    privileged: true
+    restart: "no"
+    pull_policy: always
+    deploy:
+      resources:
+        reservations:
+          devices:
+          - driver: nvidia
+            device_ids: ['0','1','2','3','4','5','6','7']
+            capabilities: [gpu]
+    shm_size: 8192gb
+    ipc: host
+    environment:
+      - KV_BACKEND=mooncake
+
+      - NVIDIA_SPARSE_ENABLE=1
+      - OMP_NUM_THREADS=16
+      - SGLANG_SET_CPU_AFFINITY=1
+      - SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
+      - SGLANG_MOE_PADDING=1
+      - SGLANG_ENABLE_JIT_DEEPGEMM=1
+      - SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS=32
+      - SGLANG_DG_CACHE_DIR=/sglang/deep_gemm
+      - SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD=16384
+      - SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL=10
+      - SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=181
+      - SGLANG_DISAGGREGATION_WAITING_TIMEOUT=179
+      - PYTHONUNBUFFERED=1
+      - SGLANG_HEALTH_CHECK_MEM_FREE=50
+
+      # --- L5: 3 missing env (Stage 6 addition) -----------------------------
+      - SGLANG_MOONCAKE_CUSTOM_MEM_POOL=1
+      - FI_EFA_ENABLE_SHM_TRANSFER=1
+      - FI_EFA_FORK_SAFE=1
+
+      - GLOO_SOCKET_IFNAME=enp71s0
+      - NCCL_DEBUG=WARN
+      - NCCL_SOCKET_IFNAME=enp71s0
+      - FI_PROVIDER=efa
+      - FI_EFA_USE_DEVICE_RDMA=1
+      - FI_MR_CACHE_MAX_COUNT=524288
+      - FI_MR_CACHE_MERGE_REGIONS=1
+
+      - MOONCAKE_PROTOCOL=efa
+      - MC_NUM_CQ_PER_CTX=4
+      - MC_MAX_WR=16384
+      - MC_MAX_CQ_PER_CTX=65536
+
+      # --- L4: UCCL-EP rail split (high 8 of 16) ----------------------------
+      - UCCL_SOCKET_IFNAME=enp
+      - UCCL_IB_HCA=rdmap87s0,rdmap88s0,rdmap112s0,rdmap113s0,rdmap137s0,rdmap138s0,rdmap162s0,rdmap163s0
+      - FI_EFA_IFACE=rdmap87s0,rdmap88s0,rdmap112s0,rdmap113s0,rdmap137s0,rdmap138s0,rdmap162s0,rdmap163s0
+      - UCCL_IB_MAX_INFLIGHT_LOW_LATENCY=128
+      - SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
+
+      - NVSHMEM_REMOTE_TRANSPORT=libfabric
+      - NVSHMEM_LIBFABRIC_PROVIDER=efa
+    network_mode: host
+    volumes:
+      - /data:/data
+      - /data/models/Kimi-K2.5:/models/model:ro
+      - /data/logs:/sglang/logs
+      - /data/sglang/pd_k2.5/tp8_pd_decode/torch-compile:/sglang/torch-compile
+      - /data/sglang/pd_k2.5/tp8_pd_decode/deep_gemm:/sglang/deep_gemm
+      - ${ENTRYPOINT_DIR:-/data/entrypoints-s6}:/entrypoints:ro
+    entrypoint: /bin/bash /entrypoints/decode_entrypoint.sh
+    logging:
+      driver: json-file
+      options:
+        max-size: "5g"
+        max-file: "3"

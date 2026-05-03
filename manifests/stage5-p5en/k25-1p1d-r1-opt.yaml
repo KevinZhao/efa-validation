@@ -1,0 +1,565 @@
+# =============================================================================
+# Stage 6 R1 / PD-1P1D K2.5 — Mooncake KV + UCCL-EP (DeepEP) a2a, 3 opts stacked
+# Model : Kimi-K2.5 INT4 (~555 GiB, 64 shards)
+# Image : public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.05.02-h200.dp16
+#         (Mooncake PR #2023 tip 4a306de8 DP>1 fix; sglang 0.5.10; Henan 5 PRs)
+# Cluster: gpu-cluster-oregon (us-west-2)
+# AZ     : usw2-az4 (same single-AZ rule as baseline)
+# Subnet : pinned via ASG VPCZoneIdentifier (matches baseline)
+#
+# Naming to avoid collision with baseline (c1p1d-*):
+#   Deployments: k25-r1-prefill / k25-r1-decode / k25-r1-lb
+#   Services   : k25-r1-prefill / k25-r1-decode / k25-r1-lb
+#   ConfigMap  : k25-r1-opt-launcher
+#   Labels     : app=k25-r1, role=prefill|decode  (lb: app=k25-r1-lb)
+#
+# Stacked optimizations vs pd-1p1d-mc-vs-nixl-k25-int4-usw2.yaml:
+#   P0 public ECR image with Mooncake PR #2023 DP>1 root fix
+#   L5 SGLANG_MOONCAKE_CUSTOM_MEM_POOL + FI_EFA_ENABLE_SHM_TRANSFER + FI_EFA_FORK_SAFE
+#   L4 --moe-a2a-backend deepep + --deepep-mode {normal|low_latency}
+#      + UCCL-EP rail split (UCCL_IB_HCA / FI_EFA_IFACE = high 8 of 16)
+#
+# Apply sequence (from bastion i-081b2b010b6af530c):
+#   1. kubectl -n yanxi-validation get cm,deploy | grep c1p1d   # confirm baseline down
+#   2. kubectl apply -f manifests/stage5-p5en/k25-1p1d-r1-opt.yaml
+#   3. Wait for /get_model_info on prefill + decode (240s initialDelay)
+#   4. Prime: 2K/256 short request via LB (see router-prime note in MEMORY)
+#   5. Bench against k25-r1-lb  ->  raw/stage6-r1/<scenario>-rN.json
+# =============================================================================
+
+---
+apiVersion: v1
+kind: Namespace
+metadata: { name: yanxi-validation }
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k25-r1-opt-launcher
+  namespace: yanxi-validation
+data:
+  prefetch.sh: |
+    #!/usr/bin/env bash
+    # Same S3->NVMe prefetch as baseline; shared NVMe path is idempotent.
+    set -eux
+    MODEL_ID="${MODEL_ID:-moonshotai/Kimi-K2.5}"
+    S3_BUCKET="${S3_BUCKET:-yanxi-validation-788668107894-oregon}"
+    S3_REGION="${S3_REGION:-us-west-2}"
+    DST=/host-nvme/models/${MODEL_ID}
+    SENTINEL="$DST/.s3-prefetch-done"
+
+    if [ -f "$SENTINEL" ]; then
+      echo "[prefetch] sentinel exists, skip: $DST"
+      du -sh "$DST" 2>/dev/null || true
+      exit 0
+    fi
+
+    command -v s5cmd >/dev/null 2>&1 || {
+      echo "[prefetch] installing s5cmd"
+      curl -sL https://github.com/peak/s5cmd/releases/download/v2.2.2/s5cmd_2.2.2_Linux-64bit.tar.gz \
+        | tar -xz -C /usr/local/bin s5cmd
+    }
+
+    aws s3api head-object --region "${S3_REGION}" \
+      --bucket "${S3_BUCKET}" \
+      --key "models/${MODEL_ID}/.prefetch-complete" \
+      >/dev/null || { echo "[prefetch] upstream sentinel missing -- refuse to pull"; exit 1; }
+
+    mkdir -p "$DST"
+    echo "[prefetch] s5cmd cp s3://${S3_BUCKET}/models/${MODEL_ID}/ -> ${DST}"
+    time AWS_REGION="${S3_REGION}" s5cmd --endpoint-url "https://s3.${S3_REGION}.amazonaws.com" \
+      cp --concurrency 64 \
+      "s3://${S3_BUCKET}/models/${MODEL_ID}/*" "${DST}/"
+    touch "$SENTINEL"
+    echo "[prefetch] done"
+    du -sh "$DST"
+
+  prefill_entrypoint.sh: |
+    #!/bin/bash
+    # Stage 6 R1 prefill: Mooncake KV (all 16 rails) + DeepEP-normal via UCCL-EP (high 8 rails).
+    set -eu
+    KV_BACKEND="${KV_BACKEND:-mooncake}"
+    echo "[launcher] Stage 6 R1 prefill (KV=${KV_BACKEND}, a2a=deepep/normal via UCCL-EP)"
+
+    TORCH_LIB=$(python3 -c 'import torch, os; print(os.path.join(os.path.dirname(torch.__file__), "lib"))')
+    export LD_LIBRARY_PATH="${TORCH_LIB}:${LD_LIBRARY_PATH:-}"
+
+    python3 - <<'PYEOF'
+    import os
+    p = '/usr/local/lib/python3.10/dist-packages/sglang/srt/entrypoints/http_server.py'
+    if os.path.exists(p):
+        s = open(p).read()
+        old = 'if is_vlm and not server_args.skip_tokenizer_init:'
+        new = 'if is_vlm and not server_args.skip_tokenizer_init and server_args.disaggregation_mode == "null":'
+        if old in s:
+            open(p,'w').write(s.replace(old,new))
+            pyc = '/usr/local/lib/python3.10/dist-packages/sglang/srt/entrypoints/__pycache__/http_server.cpython-310.pyc'
+            if os.path.exists(pyc): os.remove(pyc)
+            print('[launcher] patched http_server.py')
+        else:
+            print('[launcher] http_server.py already patched or pattern missing')
+    PYEOF
+
+    ALL_RAILS_DEFAULT="rdmap110s0,rdmap111s0,rdmap112s0,rdmap113s0,rdmap135s0,rdmap136s0,rdmap137s0,rdmap138s0,rdmap160s0,rdmap161s0,rdmap162s0,rdmap163s0,rdmap85s0,rdmap86s0,rdmap87s0,rdmap88s0"
+    IB_DEVICE="${IB_DEVICE:-}"
+    if [ -z "${IB_DEVICE}" ] && command -v fi_info >/dev/null 2>&1; then
+        IB_DEVICE=$(fi_info -p efa 2>/dev/null | awk '/domain:/ {print $2}' | sed 's/-rdm$//;s/-dgrm$//' | sort -u | paste -sd, -)
+    fi
+    FINAL_IB_DEVICE="${IB_DEVICE:-$ALL_RAILS_DEFAULT}"
+    echo "[launcher] Mooncake KV rails (all 16): ${FINAL_IB_DEVICE}"
+    echo "[launcher] UCCL-EP rails (high 8, from env): UCCL_IB_HCA=${UCCL_IB_HCA:-unset} FI_EFA_IFACE=${FI_EFA_IFACE:-unset}"
+
+    exec python3 -m sglang.launch_server \
+        --model-path "${MODEL_PATH:?}" \
+        --served-model-name kimi-k2-5-pd \
+        --watchdog-timeout 3600 \
+        --enable-metrics \
+        --log-requests-level 3 \
+        --collect-tokens-histogram \
+        --show-time-cost \
+        --disaggregation-mode prefill \
+        --disaggregation-transfer-backend "${KV_BACKEND}" \
+        --disaggregation-ib-device "${FINAL_IB_DEVICE}" \
+        --disaggregation-bootstrap-port "${BOOTSTRAP_PORT:-8998}" \
+        --host 0.0.0.0 --port "${PORT:-30000}" \
+        --trust-remote-code \
+        --tp-size "${TP:-8}" \
+        --chunked-prefill-size 16384 \
+        --mem-fraction-static "${MEM_FRAC_STATIC:-0.85}" \
+        --disable-cuda-graph \
+        --max-running-requests 256 \
+        --context-length "${CONTEXT_LEN:-262144}" \
+        --attention-backend fa3 \
+        --page-size 64 \
+        --tool-call-parser kimi_k2 \
+        --reasoning-parser kimi_k2 \
+        --tokenizer-worker-num 8 \
+        --enable-dynamic-batch-tokenizer \
+        --dynamic-batch-tokenizer-batch-size 8 \
+        --ep-dispatch-algorithm dynamic \
+        --eplb-algorithm deepseek \
+        --disable-shared-experts-fusion \
+        --moe-dense-tp-size 1 \
+        --moe-a2a-backend deepep \
+        --deepep-mode normal \
+        --enable-multimodal \
+        --mm-enable-dp-encoder \
+        --skip-server-warmup
+
+  decode_entrypoint.sh: |
+    #!/bin/bash
+    # Stage 6 R1 decode: Mooncake KV (all 16 rails) + DeepEP-low_latency via UCCL-EP (high 8 rails).
+    set -eu
+    KV_BACKEND="${KV_BACKEND:-mooncake}"
+    echo "[launcher] Stage 6 R1 decode (KV=${KV_BACKEND}, a2a=deepep/low_latency via UCCL-EP)"
+
+    TORCH_LIB=$(python3 -c 'import torch, os; print(os.path.join(os.path.dirname(torch.__file__), "lib"))')
+    export LD_LIBRARY_PATH="${TORCH_LIB}:${LD_LIBRARY_PATH:-}"
+
+    python3 - <<'PYEOF'
+    import os
+    p = '/usr/local/lib/python3.10/dist-packages/sglang/srt/entrypoints/http_server.py'
+    if os.path.exists(p):
+        s = open(p).read()
+        old = 'if is_vlm and not server_args.skip_tokenizer_init:'
+        new = 'if is_vlm and not server_args.skip_tokenizer_init and server_args.disaggregation_mode == "null":'
+        if old in s:
+            open(p,'w').write(s.replace(old,new))
+            pyc = '/usr/local/lib/python3.10/dist-packages/sglang/srt/entrypoints/__pycache__/http_server.cpython-310.pyc'
+            if os.path.exists(pyc): os.remove(pyc)
+            print('[launcher] patched http_server.py')
+        else:
+            print('[launcher] http_server.py already patched or pattern missing')
+    PYEOF
+
+    ALL_RAILS_DEFAULT="rdmap110s0,rdmap111s0,rdmap112s0,rdmap113s0,rdmap135s0,rdmap136s0,rdmap137s0,rdmap138s0,rdmap160s0,rdmap161s0,rdmap162s0,rdmap163s0,rdmap85s0,rdmap86s0,rdmap87s0,rdmap88s0"
+    IB_DEVICE="${IB_DEVICE:-}"
+    if [ -z "${IB_DEVICE}" ] && command -v fi_info >/dev/null 2>&1; then
+        IB_DEVICE=$(fi_info -p efa 2>/dev/null | awk '/domain:/ {print $2}' | sed 's/-rdm$//;s/-dgrm$//' | sort -u | paste -sd, -)
+    fi
+    FINAL_IB_DEVICE="${IB_DEVICE:-$ALL_RAILS_DEFAULT}"
+    echo "[launcher] Mooncake KV rails (all 16): ${FINAL_IB_DEVICE}"
+    echo "[launcher] UCCL-EP rails (high 8, from env): UCCL_IB_HCA=${UCCL_IB_HCA:-unset} FI_EFA_IFACE=${FI_EFA_IFACE:-unset}"
+
+    exec python3 -m sglang.launch_server \
+        --model-path "${MODEL_PATH:?}" \
+        --served-model-name kimi-k2-5-pd \
+        --watchdog-timeout 1200 \
+        --enable-metrics \
+        --log-requests-level 3 \
+        --decode-log-interval 50 \
+        --collect-tokens-histogram \
+        --show-time-cost \
+        --disaggregation-mode decode \
+        --disaggregation-transfer-backend "${KV_BACKEND}" \
+        --disaggregation-ib-device "${FINAL_IB_DEVICE}" \
+        --disaggregation-bootstrap-port "${BOOTSTRAP_PORT:-8998}" \
+        --host 0.0.0.0 --port "${PORT:-30000}" \
+        --trust-remote-code \
+        --tp-size "${TP:-8}" \
+        --moe-dense-tp-size 1 \
+        --ep-dispatch-algorithm dynamic \
+        --eplb-algorithm deepseek \
+        --disable-shared-experts-fusion \
+        --moe-a2a-backend deepep \
+        --deepep-mode low_latency \
+        --mem-fraction-static "${MEM_FRAC_STATIC:-0.85}" \
+        --cuda-graph-max-bs 32 \
+        --max-running-requests 256 \
+        --context-length "${CONTEXT_LEN:-262144}" \
+        --attention-backend fa3 \
+        --prefill-round-robin-balance \
+        --tokenizer-worker-num 8 \
+        --enable-dynamic-batch-tokenizer \
+        --dynamic-batch-tokenizer-batch-size 8 \
+        --page-size 64 \
+        --tool-call-parser kimi_k2 \
+        --reasoning-parser kimi_k2 \
+        --skip-server-warmup
+
+  lb_entrypoint.sh: |
+    #!/usr/bin/env bash
+    set -eu
+    : "${PREFILL_URL:?need PREFILL_URL}"
+    : "${DECODE_URL:?need DECODE_URL}"
+    LB_PORT="${LB_PORT:-8000}"
+    if ! python3 -c "import sglang_router" 2>/dev/null; then
+      pip install --no-cache-dir "sglang-router==0.3.2" || exit 3
+    fi
+    PA=(); for u in ${PREFILL_URL//,/ }; do PA+=(--prefill "$u"); done
+    DA=(); for u in ${DECODE_URL//,/ }; do DA+=(--decode "$u"); done
+    exec python3 -m sglang_router.launch_router \
+      --pd-disaggregation \
+      "${PA[@]}" "${DA[@]}" \
+      --host 0.0.0.0 --port "${LB_PORT}"
+
+---
+apiVersion: v1
+kind: Service
+metadata: { name: k25-r1-prefill, namespace: yanxi-validation }
+spec:
+  selector: { app: k25-r1, role: prefill }
+  ports:
+    - { name: http, port: 30000, targetPort: 30000 }
+    - { name: bootstrap, port: 8998, targetPort: 8998 }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: k25-r1-decode, namespace: yanxi-validation }
+spec:
+  selector: { app: k25-r1, role: decode }
+  ports:
+    - { name: http, port: 30000, targetPort: 30000 }
+    - { name: bootstrap, port: 8998, targetPort: 8998 }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: k25-r1-lb, namespace: yanxi-validation }
+spec:
+  selector: { app: k25-r1-lb }
+  ports:
+    - { name: http, port: 8000, targetPort: 8000 }
+
+---
+# ==== Prefill pod ====
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k25-r1-prefill
+  namespace: yanxi-validation
+  labels: { app: k25-r1, role: prefill }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: k25-r1, role: prefill } }
+  template:
+    metadata:
+      labels: { app: k25-r1, role: prefill }
+    spec:
+      tolerations:
+        - { key: nvidia.com/gpu, operator: Equal, value: "true", effect: NoSchedule }
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - { key: node.kubernetes.io/instance-type, operator: In, values: [p5en.48xlarge] }
+                  - { key: topology.kubernetes.io/zone, operator: In, values: [us-west-2d] }
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector: { matchLabels: { app: k25-r1 } }
+              topologyKey: kubernetes.io/hostname
+      initContainers:
+        - name: s3-prefetch
+          image: public.ecr.aws/amazonlinux/amazonlinux:2023
+          command: ["/bin/bash","-lc","dnf install -y -q tar gzip awscli; exec /scripts/prefetch.sh"]
+          env:
+            - { name: MODEL_ID, value: "moonshotai/Kimi-K2.5" }
+            - { name: S3_BUCKET, value: "yanxi-validation-788668107894-oregon" }
+            - { name: S3_REGION, value: "us-west-2" }
+          volumeMounts:
+            - { name: local-nvme, mountPath: /host-nvme }
+            - { name: scripts, mountPath: /scripts }
+          resources:
+            requests: { cpu: "4", memory: "8Gi" }
+            limits:   { cpu: "32", memory: "64Gi" }
+      containers:
+        - name: server
+          image: public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.05.02-h200.dp16
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: ROLE, value: "prefill" }
+            - { name: MODEL_PATH, value: "/models/moonshotai/Kimi-K2.5" }
+            - { name: TP, value: "8" }
+            - { name: CONTEXT_LEN, value: "262144" }
+            - { name: MEM_FRAC_STATIC, value: "0.85" }
+            - { name: KV_BACKEND, value: "mooncake" }
+
+            # --- SGLang internals (verbatim from baseline) -----------------
+            - { name: NVIDIA_SPARSE_ENABLE, value: "1" }
+            - { name: OMP_NUM_THREADS, value: "16" }
+            - { name: SGLANG_SET_CPU_AFFINITY, value: "1" }
+            - { name: SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN, value: "1" }
+            - { name: SGLANG_MOE_PADDING, value: "1" }
+            - { name: SGLANG_ENABLE_JIT_DEEPGEMM, value: "1" }
+            - { name: SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS, value: "32" }
+            - { name: SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD, value: "16384" }
+            - { name: SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL, value: "10" }
+            - { name: SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT, value: "181" }
+            - { name: SGLANG_DISAGGREGATION_WAITING_TIMEOUT, value: "179" }
+            - { name: PYTHONUNBUFFERED, value: "1" }
+            - { name: SGLANG_HEALTH_CHECK_MEM_FREE, value: "50" }
+
+            # --- L5: 3 missing env (Stage 6 addition) ----------------------
+            - { name: SGLANG_MOONCAKE_CUSTOM_MEM_POOL, value: "1" }
+            - { name: FI_EFA_ENABLE_SHM_TRANSFER, value: "1" }
+            - { name: FI_EFA_FORK_SAFE, value: "1" }
+
+            # --- Networking ------------------------------------------------
+            - { name: FI_PROVIDER, value: "efa" }
+            - { name: FI_EFA_USE_DEVICE_RDMA, value: "1" }
+            - { name: FI_MR_CACHE_MAX_COUNT, value: "524288" }
+            - { name: FI_MR_CACHE_MERGE_REGIONS, value: "1" }
+            - { name: NCCL_DEBUG, value: "WARN" }
+
+            # --- Mooncake KV (all 16 rails via --disaggregation-ib-device) --
+            - { name: MOONCAKE_PROTOCOL, value: "efa" }
+            - { name: MC_NUM_CQ_PER_CTX, value: "4" }
+            - { name: MC_MAX_WR, value: "16384" }
+            - { name: MC_MAX_CQ_PER_CTX, value: "65536" }
+
+            # --- L4: UCCL-EP rail split (high 8 of 16) ---------------------
+            - { name: UCCL_SOCKET_IFNAME, value: "enp" }
+            - { name: UCCL_IB_HCA,   value: "rdmap87s0,rdmap88s0,rdmap112s0,rdmap113s0,rdmap137s0,rdmap138s0,rdmap162s0,rdmap163s0" }
+            - { name: FI_EFA_IFACE,  value: "rdmap87s0,rdmap88s0,rdmap112s0,rdmap113s0,rdmap137s0,rdmap138s0,rdmap162s0,rdmap163s0" }
+            - { name: UCCL_IB_MAX_INFLIGHT_LOW_LATENCY, value: "128" }
+            - { name: SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK, value: "128" }
+
+            # --- NVSHMEM kept for symmetry (deepep via UCCL-EP does not need it) --
+            - { name: NVSHMEM_REMOTE_TRANSPORT, value: "libfabric" }
+            - { name: NVSHMEM_LIBFABRIC_PROVIDER, value: "efa" }
+          command: ["/bin/bash", "-lc"]
+          args: ["exec /scripts/prefill_entrypoint.sh"]
+          readinessProbe:
+            httpGet: { path: /get_model_info, port: 30000 }
+            initialDelaySeconds: 240
+            periodSeconds: 15
+            failureThreshold: 120
+          ports:
+            - { containerPort: 30000, name: http }
+            - { containerPort: 8998, name: bootstrap }
+          securityContext: { capabilities: { add: [IPC_LOCK] } }
+          resources:
+            limits:
+              nvidia.com/gpu: 8
+              vpc.amazonaws.com/efa: 16
+              hugepages-2Mi: 5120Mi
+              memory: 1000Gi
+            requests:
+              nvidia.com/gpu: 8
+              vpc.amazonaws.com/efa: 16
+              hugepages-2Mi: 5120Mi
+              memory: 500Gi
+          volumeMounts:
+            - { name: local-nvme, mountPath: /models, subPath: models }
+            - { name: shm, mountPath: /dev/shm }
+            - { name: scripts, mountPath: /scripts }
+            - { name: crash-dumps, mountPath: /sglang/logs }
+      volumes:
+        - name: local-nvme
+          hostPath: { path: /data, type: Directory }
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 64Gi }
+        - name: scripts
+          configMap: { name: k25-r1-opt-launcher, defaultMode: 0755 }
+        - name: crash-dumps
+          emptyDir: {}
+
+---
+# ==== Decode pod ====
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k25-r1-decode
+  namespace: yanxi-validation
+  labels: { app: k25-r1, role: decode }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: k25-r1, role: decode } }
+  template:
+    metadata:
+      labels: { app: k25-r1, role: decode }
+    spec:
+      tolerations:
+        - { key: nvidia.com/gpu, operator: Equal, value: "true", effect: NoSchedule }
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - { key: node.kubernetes.io/instance-type, operator: In, values: [p5en.48xlarge] }
+                  - { key: topology.kubernetes.io/zone, operator: In, values: [us-west-2d] }
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector: { matchLabels: { app: k25-r1 } }
+              topologyKey: kubernetes.io/hostname
+      initContainers:
+        - name: s3-prefetch
+          image: public.ecr.aws/amazonlinux/amazonlinux:2023
+          command: ["/bin/bash","-lc","dnf install -y -q tar gzip awscli; exec /scripts/prefetch.sh"]
+          env:
+            - { name: MODEL_ID, value: "moonshotai/Kimi-K2.5" }
+            - { name: S3_BUCKET, value: "yanxi-validation-788668107894-oregon" }
+            - { name: S3_REGION, value: "us-west-2" }
+          volumeMounts:
+            - { name: local-nvme, mountPath: /host-nvme }
+            - { name: scripts, mountPath: /scripts }
+          resources:
+            requests: { cpu: "4", memory: "8Gi" }
+            limits:   { cpu: "32", memory: "64Gi" }
+      containers:
+        - name: server
+          image: public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.05.02-h200.dp16
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: ROLE, value: "decode" }
+            - { name: MODEL_PATH, value: "/models/moonshotai/Kimi-K2.5" }
+            - { name: TP, value: "8" }
+            - { name: CONTEXT_LEN, value: "262144" }
+            - { name: MEM_FRAC_STATIC, value: "0.85" }
+            - { name: KV_BACKEND, value: "mooncake" }
+
+            - { name: NVIDIA_SPARSE_ENABLE, value: "1" }
+            - { name: OMP_NUM_THREADS, value: "16" }
+            - { name: SGLANG_SET_CPU_AFFINITY, value: "1" }
+            - { name: SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN, value: "1" }
+            - { name: SGLANG_MOE_PADDING, value: "1" }
+            - { name: SGLANG_ENABLE_JIT_DEEPGEMM, value: "1" }
+            - { name: SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS, value: "32" }
+            - { name: SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD, value: "16384" }
+            - { name: SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL, value: "10" }
+            - { name: SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT, value: "181" }
+            - { name: SGLANG_DISAGGREGATION_WAITING_TIMEOUT, value: "179" }
+            - { name: PYTHONUNBUFFERED, value: "1" }
+            - { name: SGLANG_HEALTH_CHECK_MEM_FREE, value: "50" }
+
+            # --- L5: 3 missing env (Stage 6 addition) ----------------------
+            - { name: SGLANG_MOONCAKE_CUSTOM_MEM_POOL, value: "1" }
+            - { name: FI_EFA_ENABLE_SHM_TRANSFER, value: "1" }
+            - { name: FI_EFA_FORK_SAFE, value: "1" }
+
+            - { name: FI_PROVIDER, value: "efa" }
+            - { name: FI_EFA_USE_DEVICE_RDMA, value: "1" }
+            - { name: FI_MR_CACHE_MAX_COUNT, value: "524288" }
+            - { name: FI_MR_CACHE_MERGE_REGIONS, value: "1" }
+            - { name: NCCL_DEBUG, value: "WARN" }
+
+            - { name: MOONCAKE_PROTOCOL, value: "efa" }
+            - { name: MC_NUM_CQ_PER_CTX, value: "4" }
+            - { name: MC_MAX_WR, value: "16384" }
+            - { name: MC_MAX_CQ_PER_CTX, value: "65536" }
+
+            # --- L4: UCCL-EP rail split (high 8 of 16) ---------------------
+            - { name: UCCL_SOCKET_IFNAME, value: "enp" }
+            - { name: UCCL_IB_HCA,   value: "rdmap87s0,rdmap88s0,rdmap112s0,rdmap113s0,rdmap137s0,rdmap138s0,rdmap162s0,rdmap163s0" }
+            - { name: FI_EFA_IFACE,  value: "rdmap87s0,rdmap88s0,rdmap112s0,rdmap113s0,rdmap137s0,rdmap138s0,rdmap162s0,rdmap163s0" }
+            - { name: UCCL_IB_MAX_INFLIGHT_LOW_LATENCY, value: "128" }
+            - { name: SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK, value: "128" }
+
+            - { name: NVSHMEM_REMOTE_TRANSPORT, value: "libfabric" }
+            - { name: NVSHMEM_LIBFABRIC_PROVIDER, value: "efa" }
+          command: ["/bin/bash", "-lc"]
+          args: ["exec /scripts/decode_entrypoint.sh"]
+          readinessProbe:
+            httpGet: { path: /get_model_info, port: 30000 }
+            initialDelaySeconds: 240
+            periodSeconds: 15
+            failureThreshold: 120
+          ports:
+            - { containerPort: 30000, name: http }
+            - { containerPort: 8998, name: bootstrap }
+          securityContext: { capabilities: { add: [IPC_LOCK] } }
+          resources:
+            limits:
+              nvidia.com/gpu: 8
+              vpc.amazonaws.com/efa: 16
+              hugepages-2Mi: 5120Mi
+              memory: 1000Gi
+            requests:
+              nvidia.com/gpu: 8
+              vpc.amazonaws.com/efa: 16
+              hugepages-2Mi: 5120Mi
+              memory: 500Gi
+          volumeMounts:
+            - { name: local-nvme, mountPath: /models, subPath: models }
+            - { name: shm, mountPath: /dev/shm }
+            - { name: scripts, mountPath: /scripts }
+            - { name: crash-dumps, mountPath: /sglang/logs }
+      volumes:
+        - name: local-nvme
+          hostPath: { path: /data, type: Directory }
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 64Gi }
+        - name: scripts
+          configMap: { name: k25-r1-opt-launcher, defaultMode: 0755 }
+        - name: crash-dumps
+          emptyDir: {}
+
+---
+# ==== Router (sglang-router LB) ====
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k25-r1-lb
+  namespace: yanxi-validation
+  labels: { app: k25-r1-lb }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: k25-r1-lb } }
+  template:
+    metadata:
+      labels: { app: k25-r1-lb }
+    spec:
+      tolerations:
+        - { key: nvidia.com/gpu, operator: Equal, value: "true", effect: NoSchedule }
+      containers:
+        - name: lb
+          image: public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.05.02-h200.dp16
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: PREFILL_URL, value: "http://k25-r1-prefill.yanxi-validation.svc:30000" }
+            - { name: DECODE_URL,  value: "http://k25-r1-decode.yanxi-validation.svc:30000" }
+          command: ["/bin/bash", "-lc"]
+          args: ["exec /scripts/lb_entrypoint.sh"]
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 30
+          ports:
+            - { containerPort: 8000, name: http }
+          volumeMounts:
+            - { name: scripts, mountPath: /scripts }
+      volumes:
+        - name: scripts
+          configMap: { name: k25-r1-opt-launcher, defaultMode: 0755 }
