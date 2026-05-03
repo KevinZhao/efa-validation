@@ -1,0 +1,16 @@
+{
+    "SpotPlacementScores": [
+        {
+            "Region": "ap-southeast-2",
+            "Score": 1
+        },
+        {
+            "Region": "ap-northeast-1",
+            "Score": 1
+        },
+        {
+            "Region": "ap-south-1",
+            "Score": 2
+        }
+    ]
+}

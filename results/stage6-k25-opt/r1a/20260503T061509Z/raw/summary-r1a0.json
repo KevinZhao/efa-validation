@@ -1,0 +1,64 @@
+{
+  "r1a0_s2_means": {
+    "duration": 401.7658039053331,
+    "completed": 200.0,
+    "mean_ttft_ms": 5359.611365076665,
+    "median_ttft_ms": 1266.5378806668741,
+    "p99_ttft_ms": 26523.165303716887,
+    "mean_itl_ms": 114.53586739720599,
+    "median_itl_ms": 120.43979350013008,
+    "p99_itl_ms": 142.7764285831472,
+    "mean_e2e_latency_ms": 122531.16135088833,
+    "p99_e2e_latency_ms": 152750.5776157567,
+    "input_throughput": 4078.002110886285,
+    "output_throughput": 509.75026386078565,
+    "request_throughput": 0.4978029920515485
+  },
+  "r1a0_s2_rounds": [
+    {
+      "duration": 401.845370518,
+      "completed": 200,
+      "mean_ttft_ms": 5539.696184519985,
+      "median_ttft_ms": 1917.8958719999173,
+      "p99_ttft_ms": 26296.77619976064,
+      "mean_itl_ms": 114.36541867778108,
+      "median_itl_ms": 120.11640900027487,
+      "p99_itl_ms": 142.43128213042837,
+      "mean_e2e_latency_ms": 122536.94785232998,
+      "p99_e2e_latency_ms": 151728.02224744065,
+      "input_throughput": 4077.1901835972767,
+      "output_throughput": 509.6487729496596,
+      "request_throughput": 0.49770387983365194
+    },
+    {
+      "duration": 402.23655815999973,
+      "completed": 200,
+      "mean_ttft_ms": 5236.812082450019,
+      "median_ttft_ms": 931.4577040004224,
+      "p99_ttft_ms": 26642.978393080153,
+      "mean_itl_ms": 114.79454406297658,
+      "median_itl_ms": 120.7152255001347,
+      "p99_itl_ms": 143.44902440957412,
+      "mean_e2e_latency_ms": 122673.01892185502,
+      "p99_e2e_latency_ms": 153186.72198161975,
+      "input_throughput": 4073.224988535938,
+      "output_throughput": 509.15312356699224,
+      "request_throughput": 0.49721984723339085
+    },
+    {
+      "duration": 401.21548303799955,
+      "completed": 200,
+      "mean_ttft_ms": 5302.325828259991,
+      "median_ttft_ms": 950.2600660002827,
+      "p99_ttft_ms": 26629.74131830987,
+      "mean_itl_ms": 114.44763945086027,
+      "median_itl_ms": 120.48774599998069,
+      "p99_itl_ms": 142.44897920943913,
+      "mean_e2e_latency_ms": 122383.51727848001,
+      "p99_e2e_latency_ms": 153336.98861820975,
+      "input_throughput": 4083.5911605256406,
+      "output_throughput": 510.4488950657051,
+      "request_throughput": 0.4984852490876026
+    }
+  ]
+}

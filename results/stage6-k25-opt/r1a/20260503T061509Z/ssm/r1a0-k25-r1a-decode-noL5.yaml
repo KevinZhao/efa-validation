@@ -1,0 +1,220 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: '{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"annotations":{},"labels":{"app":"k25-r1a","role":"decode"},"name":"k25-r1a-decode","namespace":"yanxi-validation"},"spec":{"replicas":1,"selector":{"matchLabels":{"app":"k25-r1a","role":"decode"}},"template":{"metadata":{"labels":{"app":"k25-r1a","role":"decode"}},"spec":{"affinity":{"nodeAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"node.kubernetes.io/instance-type","operator":"In","values":["p5en.48xlarge"]},{"key":"topology.kubernetes.io/zone","operator":"In","values":["us-west-2c"]}]}]}},"podAntiAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":[{"labelSelector":{"matchLabels":{"app":"k25-r1a"}},"topologyKey":"kubernetes.io/hostname"}]}},"containers":[{"args":["exec
+      /scripts/decode_entrypoint.sh"],"command":["/bin/bash","-lc"],"env":[{"name":"ROLE","value":"decode"},{"name":"MODEL_PATH","value":"/models/moonshotai/Kimi-K2.5"},{"name":"TP","value":"8"},{"name":"CONTEXT_LEN","value":"262144"},{"name":"MEM_FRAC_STATIC","value":"0.85"},{"name":"KV_BACKEND","value":"mooncake"},{"name":"NVIDIA_SPARSE_ENABLE","value":"1"},{"name":"OMP_NUM_THREADS","value":"16"},{"name":"SGLANG_SET_CPU_AFFINITY","value":"1"},{"name":"SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN","value":"1"},{"name":"SGLANG_MOE_PADDING","value":"1"},{"name":"SGLANG_ENABLE_JIT_DEEPGEMM","value":"1"},{"name":"SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS","value":"32"},{"name":"SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD","value":"16384"},{"name":"SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL","value":"10"},{"name":"SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT","value":"181"},{"name":"SGLANG_DISAGGREGATION_WAITING_TIMEOUT","value":"179"},{"name":"PYTHONUNBUFFERED","value":"1"},{"name":"SGLANG_HEALTH_CHECK_MEM_FREE","value":"50"},{"name":"SGLANG_MOONCAKE_CUSTOM_MEM_POOL","value":"1"},{"name":"FI_EFA_ENABLE_SHM_TRANSFER","value":"1"},{"name":"FI_EFA_FORK_SAFE","value":"1"},{"name":"FI_PROVIDER","value":"efa"},{"name":"FI_EFA_USE_DEVICE_RDMA","value":"1"},{"name":"FI_MR_CACHE_MAX_COUNT","value":"524288"},{"name":"FI_MR_CACHE_MERGE_REGIONS","value":"1"},{"name":"NCCL_DEBUG","value":"WARN"},{"name":"MOONCAKE_PROTOCOL","value":"efa"},{"name":"MC_NUM_CQ_PER_CTX","value":"4"},{"name":"MC_MAX_WR","value":"16384"},{"name":"MC_MAX_CQ_PER_CTX","value":"65536"},{"name":"NVSHMEM_REMOTE_TRANSPORT","value":"libfabric"},{"name":"NVSHMEM_LIBFABRIC_PROVIDER","value":"efa"}],"image":"public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.05.02-h200.dp16","imagePullPolicy":"IfNotPresent","name":"server","ports":[{"containerPort":30000,"name":"http"},{"containerPort":8998,"name":"bootstrap"}],"readinessProbe":{"failureThreshold":120,"httpGet":{"path":"/get_model_info","port":30000},"initialDelaySeconds":240,"periodSeconds":15},"resources":{"limits":{"hugepages-2Mi":"5120Mi","memory":"1000Gi","nvidia.com/gpu":8,"vpc.amazonaws.com/efa":16},"requests":{"hugepages-2Mi":"5120Mi","memory":"500Gi","nvidia.com/gpu":8,"vpc.amazonaws.com/efa":16}},"securityContext":{"capabilities":{"add":["IPC_LOCK"]}},"volumeMounts":[{"mountPath":"/models","name":"local-nvme","subPath":"models"},{"mountPath":"/dev/shm","name":"shm"},{"mountPath":"/scripts","name":"scripts"},{"mountPath":"/sglang/logs","name":"crash-dumps"}]}],"initContainers":[{"command":["/bin/bash","-lc","dnf
+      install -y -q tar gzip awscli; exec /scripts/prefetch.sh"],"env":[{"name":"MODEL_ID","value":"moonshotai/Kimi-K2.5"},{"name":"S3_BUCKET","value":"yanxi-validation-788668107894-oregon"},{"name":"S3_REGION","value":"us-west-2"}],"image":"public.ecr.aws/amazonlinux/amazonlinux:2023","name":"s3-prefetch","resources":{"limits":{"cpu":"32","memory":"64Gi"},"requests":{"cpu":"4","memory":"8Gi"}},"volumeMounts":[{"mountPath":"/host-nvme","name":"local-nvme"},{"mountPath":"/scripts","name":"scripts"}]}],"tolerations":[{"effect":"NoSchedule","key":"nvidia.com/gpu","operator":"Equal","value":"true"}],"volumes":[{"hostPath":{"path":"/data","type":"Directory"},"name":"local-nvme"},{"emptyDir":{"medium":"Memory","sizeLimit":"64Gi"},"name":"shm"},{"configMap":{"defaultMode":493,"name":"k25-r1a-opt-launcher"},"name":"scripts"},{"emptyDir":{},"name":"crash-dumps"}]}}}}
+
+      '
+  labels:
+    app: k25-r1a
+    role: decode
+  name: k25-r1a-decode
+  namespace: yanxi-validation
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: k25-r1a
+      role: decode
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: k25-r1a
+        role: decode
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: node.kubernetes.io/instance-type
+                operator: In
+                values:
+                - p5en.48xlarge
+              - key: topology.kubernetes.io/zone
+                operator: In
+                values:
+                - us-west-2c
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app: k25-r1a
+            topologyKey: kubernetes.io/hostname
+      containers:
+      - args:
+        - exec /scripts/decode_entrypoint.sh
+        command:
+        - /bin/bash
+        - -lc
+        env:
+        - name: ROLE
+          value: decode
+        - name: MODEL_PATH
+          value: /models/moonshotai/Kimi-K2.5
+        - name: TP
+          value: '8'
+        - name: CONTEXT_LEN
+          value: '262144'
+        - name: MEM_FRAC_STATIC
+          value: '0.85'
+        - name: KV_BACKEND
+          value: mooncake
+        - name: NVIDIA_SPARSE_ENABLE
+          value: '1'
+        - name: OMP_NUM_THREADS
+          value: '16'
+        - name: SGLANG_SET_CPU_AFFINITY
+          value: '1'
+        - name: SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN
+          value: '1'
+        - name: SGLANG_MOE_PADDING
+          value: '1'
+        - name: SGLANG_ENABLE_JIT_DEEPGEMM
+          value: '1'
+        - name: SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS
+          value: '32'
+        - name: SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD
+          value: '16384'
+        - name: SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL
+          value: '10'
+        - name: SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT
+          value: '181'
+        - name: SGLANG_DISAGGREGATION_WAITING_TIMEOUT
+          value: '179'
+        - name: PYTHONUNBUFFERED
+          value: '1'
+        - name: SGLANG_HEALTH_CHECK_MEM_FREE
+          value: '50'
+        - name: FI_PROVIDER
+          value: efa
+        - name: FI_EFA_USE_DEVICE_RDMA
+          value: '1'
+        - name: FI_MR_CACHE_MAX_COUNT
+          value: '524288'
+        - name: FI_MR_CACHE_MERGE_REGIONS
+          value: '1'
+        - name: NCCL_DEBUG
+          value: WARN
+        - name: MOONCAKE_PROTOCOL
+          value: efa
+        - name: MC_NUM_CQ_PER_CTX
+          value: '4'
+        - name: MC_MAX_WR
+          value: '16384'
+        - name: MC_MAX_CQ_PER_CTX
+          value: '65536'
+        - name: NVSHMEM_REMOTE_TRANSPORT
+          value: libfabric
+        - name: NVSHMEM_LIBFABRIC_PROVIDER
+          value: efa
+        image: public.ecr.aws/n3l4x8f3/sglang-mooncake-uccl:2026.05.02-h200.dp16
+        imagePullPolicy: IfNotPresent
+        name: server
+        ports:
+        - containerPort: 30000
+          name: http
+          protocol: TCP
+        - containerPort: 8998
+          name: bootstrap
+          protocol: TCP
+        readinessProbe:
+          failureThreshold: 120
+          httpGet:
+            path: /get_model_info
+            port: 30000
+            scheme: HTTP
+          initialDelaySeconds: 240
+          periodSeconds: 15
+          successThreshold: 1
+          timeoutSeconds: 1
+        resources:
+          limits:
+            hugepages-2Mi: 5Gi
+            memory: 1000Gi
+            nvidia.com/gpu: '8'
+            vpc.amazonaws.com/efa: '16'
+          requests:
+            hugepages-2Mi: 5Gi
+            memory: 500Gi
+            nvidia.com/gpu: '8'
+            vpc.amazonaws.com/efa: '16'
+        securityContext:
+          capabilities:
+            add:
+            - IPC_LOCK
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /models
+          name: local-nvme
+          subPath: models
+        - mountPath: /dev/shm
+          name: shm
+        - mountPath: /scripts
+          name: scripts
+        - mountPath: /sglang/logs
+          name: crash-dumps
+      dnsPolicy: ClusterFirst
+      initContainers:
+      - command:
+        - /bin/bash
+        - -lc
+        - dnf install -y -q tar gzip awscli; exec /scripts/prefetch.sh
+        env:
+        - name: MODEL_ID
+          value: moonshotai/Kimi-K2.5
+        - name: S3_BUCKET
+          value: yanxi-validation-788668107894-oregon
+        - name: S3_REGION
+          value: us-west-2
+        image: public.ecr.aws/amazonlinux/amazonlinux:2023
+        imagePullPolicy: IfNotPresent
+        name: s3-prefetch
+        resources:
+          limits:
+            cpu: '32'
+            memory: 64Gi
+          requests:
+            cpu: '4'
+            memory: 8Gi
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /host-nvme
+          name: local-nvme
+        - mountPath: /scripts
+          name: scripts
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+      tolerations:
+      - effect: NoSchedule
+        key: nvidia.com/gpu
+        operator: Equal
+        value: 'true'
+      volumes:
+      - hostPath:
+          path: /data
+          type: Directory
+        name: local-nvme
+      - emptyDir:
+          medium: Memory
+          sizeLimit: 64Gi
+        name: shm
+      - configMap:
+          defaultMode: 493
+          name: k25-r1a-opt-launcher
+        name: scripts
+      - emptyDir: {}
+        name: crash-dumps
