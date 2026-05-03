@@ -1,6 +1,6 @@
 # p5en/p6 EFA Device Capability Dumps
 
-**Purpose**: Archive of `efadv_query_device()` output across AWS EFA-enabled GPU instances. Used by Phase 0 instrumentation to unblock Sprint A/B/D optimization decisions (see `docs/FINAL_EXECUTION_CHECKLIST.md` §1).
+**Purpose**: Archive of `efadv_query_device()` output across AWS EFA-enabled GPU instances. Used by Phase 0 instrumentation to unblock Sprint A/B/D optimization decisions (see `FINAL_EXECUTION_CHECKLIST.md` §1 in the sibling repo `../../../../uccl-ep-optimization/docs/` — moved out of efa-validation on 2026-05-03).
 
 ## File naming
 

@@ -61,6 +61,9 @@ apply -f -`.
 
 ## Model prefetch on FSx
 
-See `../../stage4-p5en/model-prefetch-fsx.yaml` — one-shot Job that downloads a
-HF model into the FSx PVC. Only needs to run **once per model per region**,
-because the PVC is `ReadOnlyMany` from every pod afterwards.
+See `../../archive/stage1-4/stage4-p5en/model-prefetch-fsx.yaml` — one-shot Job
+that downloads a HF model into the FSx PVC.
+
+> ⚠️ **Deprecated**: Stage 5 起所有模型权重走 S3 → 节点本地 NVMe，不再用 FSx
+> （见 `reference_s3_model_cache.md` / `feedback_load_models_from_s3.md`）。
+> 本 manifest 仅作历史参考。

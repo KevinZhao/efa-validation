@@ -3,6 +3,11 @@
 Reference: [`../EFA_Validation_Plan.md`](../EFA_Validation_Plan.md) §4.2
 Runbook: [`../RUNBOOK.md`](../RUNBOOK.md)
 
+> **UCCL-EP optimization research split** (2026-05-03): all optimization design
+> docs, upstream PR workspaces, and Hopper mem-ordering microbench have moved
+> to sibling repo `../../uccl-ep-optimization/`. This directory now holds only
+> the Stage 2 validation bench manifests.
+
 ## Layout
 
 | File | Purpose |

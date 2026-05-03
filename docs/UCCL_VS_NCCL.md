@@ -97,7 +97,7 @@ UCCL-EP 的方案：
 
 这也是为什么 UCCL-EP 在 SGLang decode 延迟测试里 combine both 占 326.7 µs（post-PR #745 p5en 2-node 16-GPU benchmark）——"GPU 写 FIFO → CPU proxy poll → NIC DMA" 这段是不可避免的软件路径。[^baseline]
 
-[^baseline]: 以前本文档称 "600 µs"，是 stage2 p5 BF16 test_internode 非-LL 数字。2026-04-26 订正为 p5en LL post-PR #745 实际 326.7 µs；基线来源见 `docs/ALLTOALL_DEEP_DIVE.md`。
+[^baseline]: 以前本文档称 "600 µs"，是 stage2 p5 BF16 test_internode 非-LL 数字。2026-04-26 订正为 p5en LL post-PR #745 实际 326.7 µs；基线来源见 `ALLTOALL_DEEP_DIVE.md`（已移至 sibling repo `../../uccl-ep-optimization/docs/`）。
 
 ---
 
@@ -204,7 +204,7 @@ SGLang 0.5.10 main 的选项：`{none, deepep, mori}`，**不含 uccl**。
 - 已 fork `KevinZhao/uccl`（见 memory `reference_uccl_fork.md`）
 - upstream PR #904（`UCCL_EP_CPU_TIMEOUT_SECS` env）OPEN
 - 正在推进 **P0 combine signal API**（给 `low_latency_combine` 加 `comp_signal` / `overlap` / `num_sms` 参数，解锁 SGLang SBO overlap）[^api]
-- 预期收益：p5en decode mean ITL **-5~-8%**（锚 SGLang PR #9660 H20 实测 -7.9%；详见 `docs/EXPECTED_PERFORMANCE_GAINS.md`）
+- 预期收益：p5en decode mean ITL **-5~-8%**（锚 SGLang PR #9660 H20 实测 -7.9%；详见 sibling repo `../../uccl-ep-optimization/docs/UCCL_EP_OPTIMIZATION_V2.md`，取代了旧版 `EXPECTED_PERFORMANCE_GAINS.md`）
 
 [^api]: 2026-04-26 订正：Hopper 走 `comp_signal`（DeepEP antgroup-opt PR #483 / DeepGemm PR #183），Blackwell 走 `src_signals`（FlashInfer CuteDSL）。之前说 `src_signals` 是错的 API 选型。
 

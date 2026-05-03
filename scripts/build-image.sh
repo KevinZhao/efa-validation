@@ -2,12 +2,18 @@
 # Build a Docker image on yanxi-builder and push to ECR.
 # Usage:
 #   ./build-image.sh <dockerfile-rel-path-in-repo> <ecr-repo-short> <tag> [--build-arg=KEY=VAL ...] [--context=FILE_REL_PATH ...]
-# Examples:
-#   ./build-image.sh common/Dockerfile.base-cuda-efa base-cuda-efa v1
-#   ./build-image.sh common/Dockerfile.nccl-tests-v2 nccl-tests v1 --build-arg=BASE_IMAGE=$ECR_BASE:v1
+# Examples (current):
 #   ./build-image.sh common/Dockerfile.mooncake-nixl-v6 mooncake-nixl v6 --context=common/patch-mooncake-bench-v6.py
 #     -> uploads the patch file into build context alongside Dockerfile so
 #        `COPY common/patch-mooncake-bench-v6.py ...` in Dockerfile works.
+#   ./build-image.sh common/Dockerfile.uccl-ep uccl-ep v2
+#   ./build-image.sh common/Dockerfile.sglang-mooncake-uccl sglang-mooncake v5-uccl
+#
+# Historical (Stage 1-4) Dockerfiles archived under archive/stage1-4/common/
+# (base-cuda-efa, nccl-tests-v2, mooncake-nixl, sglang-mooncake). The frozen
+# ECR tags built from them (base-cuda-efa:v1, nccl-tests:v2, mooncake-nixl:v5,
+# sglang-mooncake:v5) are still referenced by current images; rebuilding them
+# would require restoring the Dockerfile path.
 set -euo pipefail
 source "$(dirname "$0")/lib.sh"
 
