@@ -16,7 +16,7 @@ Stage 1-4 已于 2026-04-22/23 在 p5 / p5en 上完成执行，结论见 `../../
 | `stage4-sglang-mooncake/` | 4 | p5 上 SGLang 0.4.10 + Mooncake PD 实测 manifest |
 | `stage4-p5en/` | 4 | p5en 上 SGLang 0.5.10 + Kimi-K2 1P:2D；**`KIMI_K2_SETUP_GUIDE.md` 对外可复现指南** |
 | `common/` | 1-4 | 历史 Dockerfile：`base-cuda-efa`、`nccl-tests-v2`、`mooncake-nixl`、`sglang-mooncake` |
-| `ssm-payloads/` | 1-4 | 历史 build SSM payload（一次性固化，已不复用） |
+| `ssm-payloads/` | 1-4 | 历史 build SSM payload + Stage 1-4 apply/debug/状态查询 payload（`stage[1-4]-*` / `s[1-4]-*` / `nccl-mpijob-spec` 前缀，共 75 份）|
 
 ### Dockerfile 归档说明
 
