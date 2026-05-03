@@ -61,11 +61,15 @@ RUN git clone --depth 1 -b ${DEEPEP_REF} ${DEEPEP_REPO} /opt/deepep && \
 # ---- UCCL-EP ----
 # Source: github.com/uccl-project/uccl, subpackage 'ep'.
 # Exposes Python package `uccl.ep` after install.
+#
+# PER_EXPERT_BATCHING=1: enables UCCL PR #745 dispatch optimization
+# (dispatch p50 -20% on p5en; combine unchanged; correctness-neutral).
 RUN git clone --recursive --depth 1 -b ${UCCL_REF} ${UCCL_REPO} /opt/uccl && \
     cd /opt/uccl/ep && \
     NCCL_HOME=/usr/local/cuda \
     MPI_HOME=/opt/amazon/openmpi \
     CUDA_HOME=/usr/local/cuda \
+    PER_EXPERT_BATCHING=1 \
     python setup.py install
 
 # ---- sanity imports ----

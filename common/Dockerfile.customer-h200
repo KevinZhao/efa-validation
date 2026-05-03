@@ -316,6 +316,11 @@ RUN cd /opt/mooncake && \
 # ---- UCCL-EP (uccl variant only) ----
 # Upstream main + deep_ep drop-in wrapper. Builds with CUDA 12.8 toolchain
 # (torch cu128 ABI); runtime uses CUDA 13 driver.
+#
+# PER_EXPERT_BATCHING=1: enables UCCL PR #745 dispatch optimization.
+# Effect: dispatch p50 218→175 µs (-20%) on p5en 2-node DSv3 shape.
+# Combine unchanged. Global decode ITL -2~-4%. Correctness-neutral.
+# Without it we fall back to per-token RDMA send, losing PR #745's win.
 RUN if [ "${WITH_UCCL}" = "true" ]; then \
       git clone --recursive ${UCCL_REPO} /opt/uccl && \
       cd /opt/uccl && git checkout ${UCCL_REF} && \
@@ -326,6 +331,7 @@ RUN if [ "${WITH_UCCL}" = "true" ]; then \
       LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:${LD_LIBRARY_PATH} \
       NCCL_HOME=/usr/local \
       MPI_HOME=/opt/amazon/openmpi \
+      PER_EXPERT_BATCHING=1 \
       python setup.py install && \
       cd /opt/uccl/ep/deep_ep_wrapper && python setup.py install ; \
     else \

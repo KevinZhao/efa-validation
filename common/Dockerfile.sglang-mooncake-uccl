@@ -75,6 +75,10 @@ RUN pip install --no-cache-dir "nanobind>=2.0" "pybind11>=2.11" ninja packaging
 # Clone fork + branch, build + install Python binding `uccl.ep`.
 # Use CUDA 12.8 toolchain (matches torch 2.9.1+cu128 ABI); CUDA_HOME override
 # is scoped to this RUN layer only — runtime still uses /usr/local/cuda → 13.0.
+#
+# PER_EXPERT_BATCHING=1: enables UCCL PR #745 dispatch optimization.
+# Effect: dispatch p50 218→175 µs (-20%) on p5en 2-node DSv3 shape.
+# Combine unchanged. Correctness-neutral. Opt-in via env var at build time.
 RUN git clone --recursive ${UCCL_REPO} /opt/uccl && \
     cd /opt/uccl && git checkout ${UCCL_REF} && \
     git submodule update --init --recursive && \
@@ -84,6 +88,7 @@ RUN git clone --recursive ${UCCL_REPO} /opt/uccl && \
     export LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:${LD_LIBRARY_PATH:-} && \
     NCCL_HOME=/usr/local/cuda \
     MPI_HOME=/opt/amazon/openmpi \
+    PER_EXPERT_BATCHING=1 \
     python setup.py install
 
 # ---- DeepEP drop-in wrapper ----
