@@ -1,0 +1,31 @@
+
+=== Grid A (static num_sms) median p99 (µs) ===
+  ntok         22        48        96      best
+   128        448        559        600        448
+   256       1136       1061       1150       1061
+   384       1517       1537       1557       1517
+   512       2010       2053       1973       1973
+   768       3330       3121       2856       2856
+  1024       4425       4195       3720       3720
+
+=== Grid B (adaptive num_sms) median p99 (µs) ===
+  ntok   resolved        p50        p99      p99.9      n
+   128         22        330        445        448    288
+   256         22        699       1142       1131    288
+   384         22        931       1558       1506    288
+   512         48       1187       2033       2062    288
+   768         48       1791       3090       3080    288
+  1024         48       2517       4177       4569    288
+
+=== Gate evaluation ===
+G1 ntok=128: adaptive=445 best_static=448 ratio=0.995 → PASS
+G1 ntok=256: adaptive=1142 best_static=1061 ratio=1.076 → FAIL
+G1 ntok=384: adaptive=1558 best_static=1517 ratio=1.027 → PASS
+G1 ntok=512: adaptive=2033 best_static=1973 ratio=1.030 → FAIL
+G1 ntok=768: adaptive=3090 best_static=2856 ratio=1.082 → FAIL
+G1 ntok=1024: adaptive=4177 best_static=3720 ratio=1.123 → FAIL
+G2 ntok=128: adaptive=445 static_96=600 ratio=0.742 (target ≤0.75) → PASS
+G3 ntok=512: adaptive=2033 static_22=2010 ratio=1.011 (target ≤1.00) → FAIL
+G4 ntok=384: adaptive=1558 best(22,48)=1517 ratio=1.027 (target 0.95-1.05) → PASS
+
+Wrote /home/ec2-user/workspace/efa-validation/results/stage5-p5en/sprint-b-adaptive-probev2-20260506T023000Z/adaptive-grid.csv
